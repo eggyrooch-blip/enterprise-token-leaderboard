@@ -158,6 +158,10 @@
   .dpop-d.end{border-radius:0 8px 8px 0}
   .dpop-d.start.end{border-radius:8px}
   .dpop-d.start:hover,.dpop-d.end:hover{background:var(--green);color:#fff}
+  .dpop-ft{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--div)}
+  .dpop-ft button{height:28px;padding:0 11px;border:0;border-radius:999px;background:var(--bg);color:var(--t2);font:600 12px var(--font);cursor:pointer;transition:background .12s,color .12s}
+  .dpop-ft button:hover{background:var(--green-soft);color:#0B8D60}
+  .dpop-ft button.on{background:var(--green);color:#fff}
   @media (max-width:760px){
     .fs-quota{grid-template-columns:1fr}
     .hd .row{align-items:flex-start;flex-wrap:wrap}
@@ -553,6 +557,12 @@ function presetDays(n){
   $('from').value=fmtDate(from); $('to').value=fmtDate(to);
   RANGE_FROM=$('from').value; RANGE_TO=$('to').value; load();
 }
+// 单日:0=今天,1=昨天。起止同一天。
+function presetSingle(daysAgo){
+  var d=new Date(); d.setDate(d.getDate()-daysAgo);
+  $('from').value=fmtDate(d); $('to').value=fmtDate(d);
+  RANGE_FROM=$('from').value; RANGE_TO=$('to').value; load();
+}
 function markRange(id){['r7','r30','reset'].forEach(function(x){var e=$(x);if(e)e.classList.toggle('on',x===id);});}
 $('r7').onclick=function(){presetDays(7);markRange('r7');};
 $('r30').onclick=function(){presetDays(30);markRange('r30');};
@@ -587,11 +597,17 @@ function dpRender(){
   }).join('');
   $('rangePop').innerHTML='<div class="dpop-hd"><span class="dpop-mon">'+y+'年'+(m+1)+'月</span>'+
     '<span class="dpop-nav"><button data-n="-1">‹</button><button data-n="1">›</button></span></div>'+
-    '<div class="dpop-wk">'+wk+'</div><div class="dpop-grid">'+grid+'</div>';
+    '<div class="dpop-wk">'+wk+'</div><div class="dpop-grid">'+grid+'</div>'+
+    '<div class="dpop-ft"><button data-q="0">今天</button><button data-q="1">昨天</button>'+
+    '<button data-q="d7">近 7 天</button><button data-q="d30">近 30 天</button><button data-q="d90">近 90 天</button></div>';
   $('rangePop').querySelectorAll('.dpop-nav button').forEach(function(b){
     b.onclick=function(ev){ev.stopPropagation();DP_VIEW.setMonth(DP_VIEW.getMonth()+(+b.getAttribute('data-n')));dpRender();};});
   $('rangePop').querySelectorAll('.dpop-d:not(.mute)').forEach(function(el){
     el.onclick=function(ev){ev.stopPropagation();dpPick(dpParse(el.getAttribute('data-d')));};});
+  $('rangePop').querySelectorAll('.dpop-ft button').forEach(function(b){
+    b.onclick=function(ev){ev.stopPropagation();var q=b.getAttribute('data-q');
+      if(q==='0'||q==='1'){presetSingle(+q);}else{presetDays(+q.slice(1));}
+      markRange(null);dpClose();};});
 }
 function dpPick(d){
   if(!DP_S||(DP_S&&DP_E)){DP_S=d;DP_E=null;dpRender();}        // 起点(或重选)
