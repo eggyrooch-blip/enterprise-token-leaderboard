@@ -192,8 +192,6 @@
         </span>
         <button class="rg solid" id="apply">应用</button>
         <button class="rg" id="reset">全部</button>
-        <button class="rg" id="r7" title="最近 7 天">近 7 天</button>
-        <button class="rg" id="r30" title="最近 30 天">近 30 天</button>
         <button class="rg" id="depToggle" title="把已离职的人也纳入榜单">显示离职</button>
         <a class="rg" href="/help" title="数据来源 / 刷新周期 / 手工补报" style="text-decoration:none;display:inline-flex;align-items:center;gap:5px"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>数据说明</a>
       </div>
@@ -563,9 +561,8 @@ function presetSingle(daysAgo){
   $('from').value=fmtDate(d); $('to').value=fmtDate(d);
   RANGE_FROM=$('from').value; RANGE_TO=$('to').value; load();
 }
-function markRange(id){['r7','r30','reset'].forEach(function(x){var e=$(x);if(e)e.classList.toggle('on',x===id);});}
-$('r7').onclick=function(){presetDays(7);markRange('r7');};
-$('r30').onclick=function(){presetDays(30);markRange('r30');};
+// 区间高亮:仅「全部」按钮(近 7/30/90 天等快捷已并入日历预设,不再有顶栏独立按钮)
+function markRange(id){var e=$('reset');if(e)e.classList.toggle('on',id==='reset');}
 // ===== 自定义 Keep 区间日历(替代原生 input[type=date])=====
 var DP_VIEW=null, DP_S=null, DP_E=null;
 function dpParse(s){return s?new Date(s+'T00:00:00'):null;}

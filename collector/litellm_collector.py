@@ -64,6 +64,28 @@ PERSONAL_KEY_ALIASES = set(
     a.strip() for a in os.environ.get(
         "LITELLM_PERSONAL_KEY_ALIASES", "cursor,zhaobo03_coding").split(",")
     if a.strip())
+# 归属覆盖表:个别 key 在 LiteLLM 里既无 user_id 也无 created_by(裸 admin/探针 key),
+# 但运营上确知归属人时,在此手工钉死 alias→邮箱。格式 "alias1:a@x.com,alias2:b@x.com"。
+# 兜底优先级:user_id → created_by → 本覆盖表 → 合成 litellm-key:<alias>。
+KEY_OWNER_OVERRIDES = {}
+for _pair in os.environ.get("LITELLM_KEY_OWNER_MAP", "").split(","):
+    if ":" in _pair:
+        _a, _e = _pair.split(":", 1)
+        if _a.strip() and _e.strip():
+            KEY_OWNER_OVERRIDES[_a.strip()] = _e.strip()
+# 探针/测试 key 别名前缀:命中即从所有榜单剔除(无真人 owner 的调试噪音)。逗号分隔。
+PROBE_ALIAS_PREFIXES = tuple(
+    p.strip() for p in os.environ.get("LITELLM_PROBE_ALIAS_PREFIXES", "tmp-").split(",")
+    if p.strip())
+# 身份合并表:把同一人的分身/外部邮箱归并到规范真人邮箱(如 vendor 账号 xxx_v@、个人 gmail
+# → 员工 @公司邮箱)。格式 "alias1@x:real@x,gmail@gmail.com:real@x"。值含真实员工邮箱,
+# 故只在生产 env 配置, 绝不写进代码默认值(否则触发开源泄露闸)。键大小写不敏感。
+EMAIL_MERGE_MAP = {}
+for _pair in os.environ.get("LITELLM_EMAIL_MERGE_MAP", "").split(","):
+    if ":" in _pair:
+        _src, _dst = _pair.split(":", 1)
+        if _src.strip() and _dst.strip():
+            EMAIL_MERGE_MAP[_src.strip().lower()] = _dst.strip()
 HISTORY_START = os.environ.get("LITELLM_HISTORY_START", "2025-01-01")
 CLIENT_LABEL = os.environ.get("LITELLM_CLIENT_LABEL", "LiteLLM")
 DB = os.environ.get("DEV_DB", "/tmp/tok.db")
@@ -139,6 +161,7 @@ def fetch_key_map():
                 "team_id": k.get("team_id"),
                 "key_alias": k.get("key_alias") or (k.get("key_name") or tok[:8]),
                 "user_email": k.get("user_email"),  # 部分 key 直接带, 作 /user/list 的兜底
+                "created_by": k.get("created_by"),   # 创建该 key 的 user_id, 无 owner 时的归属兜底
                 "expires": k.get("expires"),         # agent 判定依据: 无过期(None/空)=agent
             }
         total = (data.get("total_count") if isinstance(data, dict) else None) or 0
@@ -196,7 +219,9 @@ def fetch_daily_activity():
         results.extend(rs)
         meta = (data.get("metadata") if isinstance(data, dict) else None) or {}
         total_pages = meta.get("total_pages")
-        if len(rs) < size or (total_pages and page >= total_pages) or page > 50:
+        # 翻到 total_pages 为准 —— 该端点每页只回少量「天聚合」条目(远小于 page_size),
+        # 绝不能用 len(rs) < size 判停, 否则第 1 页就 break, 只吃到最近 1-2 天(老数据全丢)。
+        if not rs or (total_pages and page >= total_pages) or page > 200:
             break
         page += 1
     return results
@@ -252,7 +277,11 @@ def build_rows(results, key_map, users, agent_team_id, alias_by_id):
     names = {}      # email -> (name, is_agent)
     agent_owner = {}  # 'agent:<alias>' -> (owner_email, owner_name)  归属人
     seen_personal = set(); seen_agent = set(); unknown = set()
+    probe_skipped = set()
     days = set()
+    # 规范邮箱 → 真人记录(取合并目标的中文名)
+    users_by_email = {(u.get("email") or "").lower(): u
+                      for u in users.values() if u.get("email")}
 
     def bkey(b):
         return (b.email, b.source, b.client, b.provider, b.model)
@@ -291,6 +320,18 @@ def build_rows(results, key_map, users, agent_team_id, alias_by_id):
                 team_id = meta.get("team_id")
                 alias = meta.get("key_alias") or tok[:8]
 
+                # 探针/测试 key 过滤: tmp-* 这类是调试时打的一次性 key(master key 创建、无真人
+                # owner、用完即删),只在历史 activity 留下 token 噪音。直接跳过,不进任何榜、不进未归类。
+                if PROBE_ALIAS_PREFIXES and any(alias.startswith(pfx) for pfx in PROBE_ALIAS_PREFIXES):
+                    probe_skipped.add(alias)
+                    continue
+                # 同类无别名孤儿: 已从 /key/list 删除、当初连 key_alias 都没设(alias 退化成 token
+                # 前缀)、且无任何 owner —— 裸 /key/generate 调试 key, 不可能是已入职员工, 一并剔除。
+                if (not from_keylist and alias == tok[:8]
+                        and not meta.get("user_id") and not meta.get("user_email")):
+                    probe_skipped.add(alias)
+                    continue
+
                 # agent 判定(2026-06-08 修正): agent key 的特征是「无过期时间」。
                 # 只有 /key/list 里确实存在、且 expires 为空的 key 才算 agent;
                 # 未知 key(可能已删)一律按个人, 绝不污染 agent 榜。
@@ -316,9 +357,26 @@ def build_rows(results, key_map, users, agent_team_id, alias_by_id):
                     uid = meta.get("user_id")
                     urec = users.get(uid) if uid else None
                     email = (urec or {}).get("email") or meta.get("user_email")
+                    pname = (urec or {}).get("name") or ""
+                    # 归属兜底①: key 自身无 owner 时, 用「创建该 key 的 user」(created_by)→ users 表
+                    if not email:
+                        cb = meta.get("created_by")
+                        cbrec = users.get(cb) if cb else None
+                        if cbrec and cbrec.get("email"):
+                            email = cbrec["email"]
+                            pname = pname or cbrec.get("name") or ""
+                    # 归属兜底②: 运营手工钉死的 alias→邮箱 覆盖表
+                    if not email and alias in KEY_OWNER_OVERRIDES:
+                        email = KEY_OWNER_OVERRIDES[alias]
+                    # 都没有 → 合成身份(裸 key/探针, 确无真人 owner)
                     if not email:
                         email = ("litellm-user:" + uid) if uid else ("litellm-key:" + alias)
-                    pname = (urec or {}).get("name") or email.split("@")[0]
+                    # 身份合并: 分身/外部邮箱归并到规范真人邮箱, 用目标的中文名(不带分身旧名)
+                    merged = EMAIL_MERGE_MAP.get((email or "").lower())
+                    if merged:
+                        email = merged
+                        pname = users_by_email.get(merged.lower(), {}).get("name") or ""
+                    pname = pname or email.split("@")[0]
                     dept = alias_by_id.get(team_id) or "unknown"
                     source = "litellm"
                     names.setdefault(email, (pname, False))
@@ -366,6 +424,7 @@ def build_rows(results, key_map, users, agent_team_id, alias_by_id):
         "personal_identities": len(seen_personal),
         "agent_identities": len(seen_agent),
         "unknown_keys": len(unknown),
+        "probe_skipped": len(probe_skipped),
         "days": len(days),
         "rows": len(rows),
     }
