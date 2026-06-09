@@ -589,9 +589,9 @@ function dpRender(){
     '<span class="dpop-nav"><button data-n="-1">‹</button><button data-n="1">›</button></span></div>'+
     '<div class="dpop-wk">'+wk+'</div><div class="dpop-grid">'+grid+'</div>';
   $('rangePop').querySelectorAll('.dpop-nav button').forEach(function(b){
-    b.onclick=function(){DP_VIEW.setMonth(DP_VIEW.getMonth()+(+b.getAttribute('data-n')));dpRender();};});
+    b.onclick=function(ev){ev.stopPropagation();DP_VIEW.setMonth(DP_VIEW.getMonth()+(+b.getAttribute('data-n')));dpRender();};});
   $('rangePop').querySelectorAll('.dpop-d:not(.mute)').forEach(function(el){
-    el.onclick=function(){dpPick(dpParse(el.getAttribute('data-d')));};});
+    el.onclick=function(ev){ev.stopPropagation();dpPick(dpParse(el.getAttribute('data-d')));};});
 }
 function dpPick(d){
   if(!DP_S||(DP_S&&DP_E)){DP_S=d;DP_E=null;dpRender();}        // 起点(或重选)
