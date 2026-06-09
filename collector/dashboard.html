@@ -158,6 +158,8 @@
         <input type="date" id="to" class="dt" onclick="this.showPicker&&this.showPicker()">
         <button class="rg solid" id="apply">应用</button>
         <button class="rg" id="reset">全部</button>
+        <button class="rg" id="r7" title="最近 7 天">近 7 天</button>
+        <button class="rg" id="r30" title="最近 30 天">近 30 天</button>
         <button class="rg" id="depToggle" title="把已离职的人也纳入榜单">显示离职</button>
         <a class="rg" href="/help" title="数据来源 / 刷新周期 / 手工补报" style="text-decoration:none;display:inline-flex;align-items:center;gap:5px"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>数据说明</a>
       </div>
@@ -513,7 +515,16 @@ function applyRange(){
   load();
 }
 $('apply').onclick=applyRange;
-$('reset').onclick=function(){RANGE_FROM='';RANGE_TO='';$('from').value='';$('to').value='';load();};
+$('reset').onclick=function(){RANGE_FROM='';RANGE_TO='';$('from').value='';$('to').value='';markRange('reset');load();};
+// 快捷区间:近 N 天 = [今天-(N-1), 今天],填进日期框并 load。含首尾两天与日均口径一致。
+function presetDays(n){
+  var to=new Date(), from=new Date(); from.setDate(from.getDate()-(n-1));
+  $('from').value=fmtDate(from); $('to').value=fmtDate(to);
+  RANGE_FROM=$('from').value; RANGE_TO=$('to').value; load();
+}
+function markRange(id){['r7','r30','reset'].forEach(function(x){var e=$(x);if(e)e.classList.toggle('on',x===id);});}
+$('r7').onclick=function(){presetDays(7);markRange('r7');};
+$('r30').onclick=function(){presetDays(30);markRange('r30');};
 load();                     // load() 内部已 await fillMeta(),meta 就绪后再发榜单请求
 setInterval(load, 30000);   // 30s 自动刷新
 </script>
