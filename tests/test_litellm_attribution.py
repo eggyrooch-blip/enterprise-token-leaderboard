@@ -60,6 +60,53 @@ def test_aliasless_orphan_key_is_filtered_out(L):
     assert stats["probe_skipped"] == 1
 
 
+def test_tmp_prefix_filtered_even_with_real_owner(L):
+    # 策略固化(应 Codex review): tmp-* 是无条件剔除, 哪怕 key 绑了真人 owner —— 探针就是探针。
+    users = {"u-li": {"email": "li@example.com", "name": "李四"}}
+    key_map = {"tok-tmp-li": {"user_id": "u-li", "team_id": None, "key_alias": "tmp-li",
+                              "user_email": None, "created_by": None, "expires": "2027-01-01"}}
+    rows, _n, _a, stats = L.build_rows([_activity("tmp-li")], key_map, users, "", {})
+    assert _lifetime_emails(rows) == set(), "tmp-* 无条件剔除, 即便绑了真人 owner"
+    assert stats["probe_skipped"] == 1
+
+
+def test_fetch_daily_activity_reads_all_pages(L, monkeypatch):
+    """回归(应 Codex review): 该端点每页只回少量条目, 必须翻到 total_pages, 不能 len<size 提前停。"""
+    pages = {
+        1: {"results": [{"date": "2026-06-09"}], "metadata": {"total_pages": 3}},
+        2: {"results": [{"date": "2026-06-08"}], "metadata": {"total_pages": 3}},
+        3: {"results": [{"date": "2026-06-07"}], "metadata": {"total_pages": 3}},
+    }
+    seen = []
+
+    def fake_get(path, params=None):
+        seen.append(params["page"])
+        return pages[params["page"]]
+
+    monkeypatch.setattr(L, "_get", fake_get)
+    res = L.fetch_daily_activity()
+    assert seen == [1, 2, 3], "必须翻完全部 3 页(旧 bug 会在第 1 页就停)"
+    assert {e["date"] for e in res} == {"2026-06-07", "2026-06-08", "2026-06-09"}
+
+
+def test_fetch_daily_activity_stops_on_empty_page_without_total_pages(L, monkeypatch):
+    """无 total_pages 时靠空页判停, 不会死循环/拉到 200 页上限。"""
+    pages = {
+        1: {"results": [{"date": "2026-06-09"}], "metadata": {}},
+        2: {"results": [], "metadata": {}},
+    }
+    seen = []
+
+    def fake_get(path, params=None):
+        seen.append(params["page"])
+        return pages.get(params["page"], {"results": [], "metadata": {}})
+
+    monkeypatch.setattr(L, "_get", fake_get)
+    res = L.fetch_daily_activity()
+    assert seen == [1, 2], "空页即停, 不应继续翻"
+    assert len(res) == 1
+
+
 def test_created_by_resolves_owner_when_key_has_no_user(L):
     # key 无 user_id, 但 /key/list 记录了 created_by → 用创建者归属
     users = {"u-admin": {"email": "admin@example.com", "name": "管理员"}}

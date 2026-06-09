@@ -219,10 +219,15 @@ def fetch_daily_activity():
         results.extend(rs)
         meta = (data.get("metadata") if isinstance(data, dict) else None) or {}
         total_pages = meta.get("total_pages")
-        # 翻到 total_pages 为准 —— 该端点每页只回少量「天聚合」条目(远小于 page_size),
+        # 翻页判停 —— 该端点每页只回少量「天聚合」条目(远小于 page_size),
         # 绝不能用 len(rs) < size 判停, 否则第 1 页就 break, 只吃到最近 1-2 天(老数据全丢)。
-        if not rs or (total_pages and page >= total_pages) or page > 200:
-            break
+        if not rs:
+            break                                          # 空页 = 翻完
+        if total_pages is not None:
+            if page >= total_pages:
+                break                                      # 有总页数: 翻到末页停
+        elif page >= 200:
+            break                                          # 无总页数(异常端点)的安全上限
         page += 1
     return results
 
