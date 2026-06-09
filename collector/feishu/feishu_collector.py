@@ -15,9 +15,10 @@ HTTPS 上报给看板,绝不直连 DB。每天跑的心跳让会话滚动续期;
 
 环境变量:
   FEISHU_CDP        必填,如 http://127.0.0.1:9223
-  COLLECTOR_URL     看板上报地址,如 https://tokscale.gotokeep.com(默认 http://127.0.0.1:8000)
+  COLLECTOR_URL     看板上报地址,如 https://collector.example.com(默认 http://127.0.0.1:8000)
   COLLECTOR_TOKEN   Bearer token(对应 COLLECTOR_API_TOKENS 之一)
-  FEISHU_EMAIL_DOMAIN  默认 keep.com
+  FEISHU_EMAIL_DOMAIN  默认 example.com
+  FEISHU_HOST        你的飞书企业域名,默认 your-tenant.feishu.cn
   FEILIAN_*         飞连凭证(选填;缺了就用飞书自带姓名/部门叶子)
   FEISHU_PRESET     日期预设,默认 近一月
   FEISHU_DRY_RUN    =1 只抓不报,打印归一化结果
@@ -44,10 +45,11 @@ for cand in (os.path.join(HERE, ".env"), os.path.join(PARENT, ".env"),
 CDP = os.environ.get("FEISHU_CDP", "http://127.0.0.1:9223")
 COLLECTOR_URL = os.environ.get("COLLECTOR_URL", "http://127.0.0.1:8000").rstrip("/")
 COLLECTOR_TOKEN = os.environ.get("COLLECTOR_TOKEN", "")
-EMAIL_DOMAIN = os.environ.get("FEISHU_EMAIL_DOMAIN", "keep.com")
+EMAIL_DOMAIN = os.environ.get("FEISHU_EMAIL_DOMAIN", "example.com")
 PRESET = os.environ.get("FEISHU_PRESET", "近一月")
 DRY = os.environ.get("FEISHU_DRY_RUN") == "1"
-BASE = "https://keep.feishu.cn/admin/aibilling"
+FEISHU_HOST = os.environ.get("FEISHU_HOST", "your-tenant.feishu.cn")  # 你的飞书企业域名
+BASE = f"https://{FEISHU_HOST}/admin/aibilling"
 PAGE_LIMIT = int(os.environ.get("FEISHU_PAGE_LIMIT", "100"))
 
 
@@ -99,7 +101,7 @@ def collect():
 
         def on_resp(resp):
             u = resp.url
-            if "keep.feishu.cn/suite/admin/ai_center" not in u:
+            if f"{FEISHU_HOST}/suite/admin/ai_center" not in u:
                 return
             try:
                 body = resp.json()
@@ -167,7 +169,7 @@ def collect():
             off = 0
             while off < (total or 1):
                 base["offset"] = off
-                r = ctx.request.post(f"https://keep.feishu.cn/suite/admin/ai_center/usage_detail/entity",
+                r = ctx.request.post(f"https://{FEISHU_HOST}/suite/admin/ai_center/usage_detail/entity",
                                      data=json.dumps(base), headers=h)
                 if r.status != 200:
                     log(f"翻页 offset={off} HTTP {r.status},停止"); break
@@ -196,7 +198,7 @@ def collect():
             for fk in fkeys:
                 try:
                     r = ctx.request.get(
-                        "https://keep.feishu.cn/suite/admin/ai_center/overview/feature?featureKey=" + fk,
+                        f"https://{FEISHU_HOST}/suite/admin/ai_center/overview/feature?featureKey=" + fk,
                         headers=hg)
                     if r.status == 200:
                         jd = r.json()

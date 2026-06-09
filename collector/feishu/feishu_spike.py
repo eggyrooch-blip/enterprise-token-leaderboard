@@ -17,7 +17,7 @@
   python feishu_spike.py     # 再真抓
 
 环境变量:
-  FEISHU_STATE    登录态 json(默认 ~/.feishu/keep_state.json)— 此脚本优先用同目录 profile
+  FEISHU_STATE    登录态 json(默认 ~/.feishu/feishu_state.json)— 此脚本优先用同目录 profile
   FEISHU_PROFILE  持久化 profile 目录(默认 = STATE 同级 _login_profile)
   FEISHU_OUT      原始响应 dump 路径(默认 ./feishu_capture_raw.json)
 """
@@ -28,10 +28,10 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-STATE = os.environ.get("FEISHU_STATE", str(Path.home() / ".feishu" / "keep_state.json"))
+STATE = os.environ.get("FEISHU_STATE", str(Path.home() / ".feishu" / "feishu_state.json"))
 PROFILE = os.environ.get("FEISHU_PROFILE", str(Path(STATE).parent / "_login_profile"))
 OUT = os.environ.get("FEISHU_OUT", "feishu_capture_raw.json")
-BASE = "https://keep.feishu.cn/admin/aibilling"
+BASE = f"https://{os.environ.get('FEISHU_HOST', 'your-tenant.feishu.cn')}/admin/aibilling"
 
 # 我们关心的内部接口(子串匹配)
 WANT = ("ai_center/homepage/ai_product_info",

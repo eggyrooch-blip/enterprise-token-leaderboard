@@ -4,18 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI 编程 Token 看板 · Keep</title>
-<!-- 浏览器标签页 favicon：Keep 绿圆角方块 + 白色 K(与顶栏 brand-mark 一致)。内联 SVG 保证一定渲染。 -->
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='9'%20fill='%2324C789'/%3E%3Ctext%20x='16'%20y='23'%20font-family='Arial,Helvetica,sans-serif'%20font-size='21'%20font-weight='800'%20fill='white'%20text-anchor='middle'%3EK%3C/text%3E%3C/svg%3E">
+<!-- 浏览器标签页 favicon：品牌色圆角方块 + 白色首字母(与顶栏 brand-mark 一致)。内联 SVG 保证一定渲染。 -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='9'%20fill='%2324C789'/%3E%3Ctext%20x='16'%20y='23'%20font-family='Arial,Helvetica,sans-serif'%20font-size='21'%20font-weight='800'%20fill='white'%20text-anchor='middle'%3EE%3C/text%3E%3C/svg%3E">
 <style>
-  /* KeepSans 展示字体 — Keep 数字视觉锤(KPI 大数 / 排名 / 榜单数字)。 */
-  @font-face{font-family:"KeepSans";src:url("/assets/fonts/KeepSans-ExtraBold.otf") format("opentype");font-weight:800;font-style:normal;font-display:swap}
-  @font-face{font-family:"KeepSans";src:url("/assets/fonts/KeepSans-Bold.otf") format("opentype");font-weight:700;font-style:normal;font-display:swap}
-  @font-face{font-family:"KeepSans";src:url("/assets/fonts/KeepSans-Medium.otf") format("opentype");font-weight:500;font-style:normal;font-display:swap}
+  /* 展示字体(数字视觉锤:KPI 大数 / 排名 / 榜单数字)。缺省走系统字体,可换装你自己的展示字体。 */
+
+
   :root{
     --green:#24C789; --green-bd:#A2F2D1; --green-soft:#E0FDF0; --purple:#3A3340; --purple-700:#584F60;
     --ink:#000; --t1:#333; --t2:#666; --t3:#999; --t4:#CCC; --div:#F2F2F2; --bg:#F7F7F7; --bg2:#FAFAFA;
     --font:"PingFang SC","Noto Sans SC",-apple-system,"Helvetica Neue","Microsoft YaHei",sans-serif;
-    --display:"KeepSans","PingFang SC",-apple-system,sans-serif;
+    --display:"PingFang SC",-apple-system,system-ui,"Helvetica Neue",sans-serif;
     --shadow:0 1px 2px rgba(58,51,64,.04),0 4px 16px rgba(58,51,64,.06);
     --shadow-hero:0 6px 24px rgba(58,51,64,.18);
   }
@@ -181,10 +180,10 @@
   <div class="hd">
     <div class="row">
       <div class="brand-shell">
-        <img class="brand-logo" src="/assets/keep-logo.svg" alt="Keep" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
-        <div class="brand-mark" aria-label="Keep">K</div>
+        <img class="brand-logo" src="/assets/company-logo.svg" alt="Logo" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+        <div class="brand-mark" aria-label="Logo">ET</div>
       </div>
-      <div class="ttl"><div class="t">AI 编程 Token 看板</div><div class="s" id="sub">tokscale 采集 · 飞连 MDM 身份 · 实时</div></div>
+      <div class="ttl"><div class="t">AI 编程 Token 看板</div><div class="s" id="sub">tokscale 采集 · MDM 身份 · 实时</div></div>
       <div class="hdrange">
         <span class="rglab">时间范围</span>
         <span class="dwrap">

@@ -9,7 +9,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"          # worktree / repo 根
 VENV="$ROOT/.venv-feishu"
 ENVF="$HOME/.feishu/collector.env"
-PLIST="$HOME/Library/LaunchAgents/com.keep.feishu-collector.plist"
+PLIST="$HOME/Library/LaunchAgents/com.example.feishu-collector.plist"
 mkdir -p "$HOME/.feishu" "$HOME/Library/LaunchAgents"
 
 echo "1/4 venv + playwright + chromium…"
@@ -35,7 +35,7 @@ cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.keep.feishu-collector</string>
+  <key>Label</key><string>com.example.feishu-collector</string>
   <key>ProgramArguments</key>
   <array><string>/bin/bash</string><string>$HERE/run_collector.sh</string></array>
   <key>StartCalendarInterval</key><dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>
@@ -45,7 +45,7 @@ cat > "$PLIST" <<PLIST
 </dict></plist>
 PLIST
 launchctl unload "$PLIST" 2>/dev/null || true
-launchctl load "$PLIST" && echo "   已加载: com.keep.feishu-collector"
+launchctl load "$PLIST" && echo "   已加载: com.example.feishu-collector"
 
 echo
 echo "✅ 部署完成。手动试跑一次:  bash $HERE/run_collector.sh"

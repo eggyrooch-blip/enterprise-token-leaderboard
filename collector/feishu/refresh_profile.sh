@@ -4,7 +4,7 @@
 # cookie——只有你日常 profile 的完整会话才工作。拷一份独立目录即可带调试端口跑、headless。
 #
 # 何时跑:首次部署一次;之后采集器报 LOGIN_EXPIRED 时,你在日常 Chrome 里确认飞书后台
-# 还登着(打开 keep.feishu.cn/admin 看一眼),再跑本脚本刷新拷贝即可。绝不天天跑。
+# 还登着(打开 your-tenant.feishu.cn/admin 看一眼),再跑本脚本刷新拷贝即可。绝不天天跑。
 #
 # 用法: ./refresh_profile.sh [Profile 名(默认自动探测含 feishu cookie 最多的)]
 set -euo pipefail

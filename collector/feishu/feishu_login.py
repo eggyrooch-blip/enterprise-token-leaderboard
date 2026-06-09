@@ -10,11 +10,11 @@
 用法(在你 Mac 上,有界面):
     python feishu_login.py
 会弹出一个浏览器窗口 → 你正常登录飞书 → 进到"AI 使用管理 > 用量概览"页 →
-回到终端按回车 → 登录态写到 FEISHU_STATE(默认 ~/.feishu/keep_state.json)。
+回到终端按回车 → 登录态写到 FEISHU_STATE(默认 ~/.feishu/feishu_state.json)。
 
 环境变量:
-    FEISHU_STATE   登录态文件路径(默认 ~/.feishu/keep_state.json)
-    FEISHU_URL     后台用量页(默认 https://keep.feishu.cn/admin/aibilling/usage-overview)
+    FEISHU_STATE   登录态文件路径(默认 ~/.feishu/feishu_state.json)
+    FEISHU_URL     后台用量页(默认 https://<FEISHU_HOST>/admin/aibilling/usage-overview)
 """
 import os
 import sys
@@ -22,8 +22,8 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-STATE = os.environ.get("FEISHU_STATE", str(Path.home() / ".feishu" / "keep_state.json"))
-URL = os.environ.get("FEISHU_URL", "https://keep.feishu.cn/admin/aibilling/usage-overview")
+STATE = os.environ.get("FEISHU_STATE", str(Path.home() / ".feishu" / "feishu_state.json"))
+URL = os.environ.get("FEISHU_URL", f"https://{os.environ.get('FEISHU_HOST', 'your-tenant.feishu.cn')}/admin/aibilling/usage-overview")
 
 
 def main() -> int:

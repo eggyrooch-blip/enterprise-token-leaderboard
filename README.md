@@ -34,13 +34,13 @@
 中性、可治理、不做个人监控的 AI 编程用量看板。
 
 - 📊 **两路全采** —— API 网关流量（有真实 \$）+ 订阅制本地用量（Claude Pro/Max、Codex 订阅，**不经过网关**），两路合并出榜。
-- 🧩 **零绑定、可插拔** —— 不绑定飞连/MDM，采集源、身份解析、存储、看板每一处都是可替换的「扩展缝」。
+- 🧩 **零绑定、可插拔** —— 不绑定任何 MDM，采集源、身份解析、存储、看板每一处都是可替换的「扩展缝」。
 - 🤫 **员工弱感知 / 无感知** —— 身份自动解析（零录入），后台静默上报，无弹窗无打扰。
 - 🔐 **隐私优先** —— 只采 token 计数 / 成本 / 模型 / 时间，**结构上根本没有 prompt 或代码字段**。
 - 🏢 **借鉴大厂治理** —— Meta（Scribe / Scuba / PAI 按目的限制）、Google/DORA、Google SRE、Tesla 遥测；并刻意**不做个人绩效式排行榜**（默认团队维度）。
 
 > [!NOTE]
-> 截图均为 `seed_demo.py` 生成的**合成 mock 数据**（`zhangsan@example.com` 等），不含任何真实姓名、头像、Logo 或公司信息。开源仓库默认中性可运行。
+> 截图均为合成 mock 数据（`zhangsan@example.com` 等），不含任何真实姓名、头像、Logo 或公司信息。开源仓库默认中性可运行。
 
 ---
 
@@ -48,13 +48,14 @@
 
 | | 特性 | 说明 |
 |---|---|---|
-| 📈 | **多维度榜单** | 个人榜 / 部门榜 / 工具榜 / 模型榜 / Cursor 榜 / Agent 榜，`?days=7\|30\|90` 任意切窗 |
+| 📈 | **多维度榜单** | 个人 / 部门 / 工具 / 模型 / Cursor / Claude / Codex / LiteLLM / Agent 榜，`?days=7\|30\|90` 任意切窗 |
 | 🔀 | **两路数据源** | LiteLLM `/spend/logs`（API 计费）+ [tokscale](https://github.com/junhoyeo/tokscale) 读本地日志（订阅制），统一落 `usage_daily` |
+| 🟦 | **SaaS AI 权益板块** | 把没有官方 API 的 SaaS 后台 AI 用量（如飞书 AI 权益）也拉进同一看板，作为**独立板块**（单位「点」，不与编程 token 加总）—— 见「飞书采集器」 |
 | 🧮 | **第二指标族** | 代码**采纳率 / 有效代码行**（Cursor Admin API + Claude Code OTEL + git 存活分析）→ `code_daily`，与 token 榜并排 |
 | 🛡️ | **大厂治理指标** | 成本效率 / 覆盖健康 / 隐私目的限制 / 交付质量 / 错误预算 …… 七个治理槽位 |
-| 🪪 | **零输入身份归属** | `EMPLOYEE_EMAIL`（MDM）→ `git config user.email` → 登录名@域名，逐级兜底 |
+| 🪪 | **可插拔身份归属** | `EMPLOYEE_EMAIL`（MDM/SSO 下发）→ 设备序列号（收集端反解目录）→ 登录名@域名，逐级兜底；另含可选 git-email 解析器（默认关闭） |
 | ♻️ | **幂等上报** | 按 `(email, date, source, tool, model)` upsert，补传 / 重跑 / 离线追报都不会重复计数 |
-| 🚀 | **5 分钟起步** | `docker compose up` + 一条 seed 命令，先看到东西再铺开 |
+| 🚀 | **1 分钟起步** | 零依赖 SQLite demo，一条 seed + 一条启动命令 |
 
 ---
 
@@ -71,7 +72,7 @@ DEV_DB=/tmp/tok-demo.db python3 seed_dev_demo.py
 # 2) 起看板（标准库，Python 3.6+ 即可）
 DEV_DB=/tmp/tok-demo.db COLLECTOR_API_TOKENS=devtoken PORT=8090 python3 dev_collector.py &
 
-open http://localhost:8090/           # ← 个人/部门/工具/模型/Cursor/Agent 榜 + 大厂治理指标
+open http://localhost:8090/           # ← 个人/部门/工具/模型/Cursor/Claude/Codex/LiteLLM/Agent 榜 + 大厂治理指标 + 飞书 AI 权益
 ```
 
 ### 生产部署（Postgres + Docker）
@@ -126,14 +127,19 @@ flowchart LR
 | 订阅制本地用量 | `subscription` | 每台机器 `agent/tokreport.py`（读 tokscale `--json`） | 每日静默上报 | Claude Pro/Max、Codex 订阅等本地工具的 token |
 | AI 网关流量 | `api` | `collector/litellm_sync.py`（拉 LiteLLM `/spend/logs`） | cron / CronJob | 走 API key 的真实计费用量 |
 | 代码采纳 | `cursor` 等 | `collector/cursor_admin_sync.py` | 每日 | 采纳率、有效行、suggestion 接受率 |
+| SaaS AI 权益 | `feishu` 板块 | `collector/feishu/`（无官方 API → 拷 Chrome profile + CDP 旁路抓后台） | 每日 | 飞书 AI 权益额度 / 趋势 / 全员逐人用量（单位「点」，独立板块） |
 
-三路都**幂等回看几天**，收集端按主键 upsert，离线补传 / 重复跑都不会翻倍。
+各路都**幂等回看几天**，收集端按主键 upsert，离线补传 / 重复跑都不会翻倍。
+
+> **飞书 AI 权益采集器**（`collector/feishu/`）：飞书没有官方 AI 权益用量 API，方案是拷一份已登录的
+> Chrome profile → headless 起调试端口 → Playwright 经 CDP 连上去，让页面用自己的鉴权在**网络层旁路抓响应**
+> （对防篡改不可见），归一化后 HTTPS 上报，**绝不直连 DB / 不存 cookie 到库**。详见 `collector/feishu/README.md`。
 
 ---
 
 ## 📦 下发客户端（三选一，不绑定 MDM）
 
-**A. 有 MDM / 飞连**（root，按设备下发身份，最稳）
+**A. 有 MDM**（root，按设备下发身份，最稳）
 
 ```bash
 agent/package_mdm.sh ./tokscale https://<collector> <token> ./dist
@@ -149,16 +155,20 @@ curl -fsSL https://intranet/tok/bootstrap.sh | \
 
 **C. 随装机 / dotfiles 捆绑** —— 把 B 的步骤并进你现有的开发环境初始化脚本即可。
 
-身份留空即自动用 `git config user.email`，员工零操作。采集源由 `COLLECTORS=` 控制
+身份默认走 MDM 下发的 `EMPLOYEE_EMAIL` 或设备序列号（收集端反解目录），员工零操作；无 MDM 的团队可启用内置 git-email 解析器（`agent/identity.py`，默认关闭）。采集源由 `COLLECTORS=` 控制
 （`tokscale` 一把覆盖 25+ 工具，需二进制；`claude_code` 零依赖参考实现）。
 
 ---
 
 ## 📸 更多看板
 
-| 部门榜 | 工具 / 模型榜 | 大厂治理指标 |
+| 部门榜 | 工具 / 模型榜 | LiteLLM 榜 |
 |---|---|---|
-| ![部门榜](docs/img/dashboard-team.png) | ![工具榜](docs/img/dashboard-tool.png) | ![治理指标](docs/img/dashboard-governance.png) |
+| ![部门榜](docs/img/dashboard-team.png) | ![工具榜](docs/img/dashboard-tool.png) | ![LiteLLM 榜](docs/img/dashboard-litellm.png) |
+
+| 大厂治理指标 | 飞书 AI 权益（独立板块，单位「点」） |
+|---|---|
+| ![治理指标](docs/img/dashboard-governance.png) | ![飞书 AI 权益](docs/img/dashboard-feishu.png) |
 
 ---
 

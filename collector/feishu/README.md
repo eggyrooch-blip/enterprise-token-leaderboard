@@ -1,6 +1,6 @@
 # 飞书 AI 权益用量采集器
 
-把飞书管理后台 `keep.feishu.cn/admin/aibilling`(AI 权益用量)的数据,**可持续、无人值守**地采集进现有 Token 看板,作为**独立板块**展示(单位是「点」，不与 AI 编程 token 加总)。
+把飞书管理后台 `your-tenant.feishu.cn/admin/aibilling`(AI 权益用量)的数据,**可持续、无人值守**地采集进现有 Token 看板,作为**独立板块**展示(单位是「点」，不与 AI 编程 token 加总)。
 
 ## 为什么这么做(关键约束)
 
@@ -21,7 +21,7 @@
 | 趋势(按天按功能点数) | `ai_center/overview/trend` | `feishu_ai_trend` |
 | **全员逐人**(姓名/工号/部门/逐功能点数) | `ai_center/usage_detail/entity`(POST,根部门=全员,offset 翻页) | `feishu_ai_member` |
 
-身份:飞书 `externalID` = 飞连 `user_id` → email = `user_id@keep.com`,部门走飞连 `department_path`(缺飞连凭证则用飞书自带姓名/叶子部门兜底)。
+身份:飞书 `externalID` = 飞连 `user_id` → email = `user_id@yourcompany.com`,部门走飞连 `department_path`(缺飞连凭证则用飞书自带姓名/叶子部门兜底)。
 
 ## 部署(在你 Mac 上一次)
 
@@ -36,7 +36,7 @@ bash run_collector.sh      # 手动试跑一次,确认上报 OK
 ## 日常运维(几乎零维护)
 
 - 每天 08:30 launchd 自动跑;这次访问的心跳让登录态滚动续期 → 长期不用重登。
-- **登录态真失效时**(采集器退出码 3 + 飞书告警):在日常 Chrome 里打开 `keep.feishu.cn/admin` 确认还登着 → `bash refresh_profile.sh` 刷新拷贝即可。几周一次,告警驱动。
+- **登录态真失效时**(采集器退出码 3 + 飞书告警):在日常 Chrome 里打开 `your-tenant.feishu.cn/admin` 确认还登着 → `bash refresh_profile.sh` 刷新拷贝即可。几周一次,告警驱动。
 - 日志:`~/.feishu/collector.log`
 
 ## 手动/调试

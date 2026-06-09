@@ -3,7 +3,7 @@
 
 -- 1) 全员逐人:某计费周期内每人每功能消耗的「点数」。一周期一快照,按主键 upsert 覆盖。
 CREATE TABLE IF NOT EXISTS feishu_ai_member (
-    email         TEXT          NOT NULL,            -- 工号@keep.com(externalID 拼接)
+    email         TEXT          NOT NULL,            -- 工号@yourcompany.com(externalID 拼接)
     name          TEXT          NOT NULL DEFAULT '',
     dept          TEXT          NOT NULL DEFAULT 'unknown',
     feature_key   TEXT          NOT NULL,            -- AI_credits | aily_credits
