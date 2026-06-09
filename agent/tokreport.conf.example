@@ -1,0 +1,22 @@
+# 客户端配置。三种上线方式都读它（MDM 下发 / bootstrap 写入 / 手动放置）。
+# 路径默认 /etc/tokreport.conf，可用环境变量 TOKREPORT_CONF 覆盖。
+
+# --- 必填 ---
+COLLECTOR_URL=https://collector.example.com
+COLLECTOR_TOKEN=replace-with-the-bearer-token-from-collector
+
+# --- 身份（按弱感知程度三选一）---
+# 强归属：有 MDM/飞连时按设备下发，最稳
+EMPLOYEE_EMAIL=
+DEPT=infra
+# 零输入：留空 EMPLOYEE_EMAIL，则自动用 git config user.email；
+# 若想用「登录名@域名」兜底，填这个域名
+EMAIL_DOMAIN=example.com
+
+# --- 采集源（可插拔，逗号分隔，按 collectors/REGISTRY 的名字）---
+# tokscale = 一把覆盖 25+ 工具(需分发二进制)；claude_code = 零依赖仅 Claude Code
+COLLECTORS=tokscale
+TOKSCALE_BIN=/usr/local/bin/tokscale
+
+# 回看天数（幂等重传窗口）
+LOOKBACK_DAYS=3

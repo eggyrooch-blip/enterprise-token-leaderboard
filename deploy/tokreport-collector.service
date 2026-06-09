@@ -1,0 +1,22 @@
+[Unit]
+Description=Token Leaderboard Collector (dev_collector)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=it
+WorkingDirectory=__REMOTE_DIR__
+EnvironmentFile=__REMOTE_DIR__/.env
+# PORT 和 DEV_DB 也可在 EnvironmentFile 里覆盖；这里给默认值
+Environment=PORT=__PORT__
+Environment=DEV_DB=__REMOTE_DIR__/tok.db
+ExecStart=__PYTHON__ __REMOTE_DIR__/dev_collector.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=__SERVICE_NAME__
+
+[Install]
+WantedBy=multi-user.target

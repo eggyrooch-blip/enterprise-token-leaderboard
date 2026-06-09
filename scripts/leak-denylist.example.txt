@@ -1,0 +1,19 @@
+# Org-specific leak denylist (TEMPLATE).
+#
+# Copy this file to `scripts/leak-denylist.private.txt` (git-ignored) and fill in
+# your organization's private identifiers. The open-source guard
+# (scripts/open_source_guard.py) loads it and flags any of these terms in
+# files about to be committed — so you don't accidentally publish real employee
+# names or internal domains.
+#
+# Format: one entry per line. `#` comments and blank lines are ignored.
+#   domain: <a private domain to flag in emails/hostnames>
+#   name:   <a real employee name / handle to flag>
+#
+# The public repo ships only this example. Without a local denylist the guard
+# still catches generic leaks (private IPs, secrets, UUIDs, internal TLDs).
+
+domain: yourcompany.com
+domain: internal.yourcompany.com
+name: john.doe
+name: 张三

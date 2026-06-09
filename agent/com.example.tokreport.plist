@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LaunchAgent：装在登录用户域，才能读到该用户的 ~/.claude、~/.codex 等本地日志。
+     跑的是 tokscale 采集 shell 脚本（打 /v1/tokscale/report，与线上 collector 对齐）——
+     不是旧的 tokreport.py（那个打 /v1/usage/report，线上不收，会上报失败）。
+     每隔 1 小时跑一次；加载时也跑一次。日志见 /tmp/tokreport.* 。
+     由 mdm_bootstrap.sh 幂等安装/更新，重复下发不会重建。 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.tokreport</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/usr/local/lib/tokreport/tokreport.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 每隔 3600s 跑一次；以各机加载时刻为锚，天然错峰，不会全员整点齐打 collector -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- 后台低优先级：CPU/IO 让路给用户前台，尽量零感知 -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/tokreport.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/tokreport.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,73 @@
+{
+  "title": "Token 消耗排行榜",
+  "tags": ["tokens", "ai-agent"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30m",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "postgres",
+        "current": {}
+      },
+      {
+        "name": "days",
+        "type": "custom",
+        "query": "7,30,90",
+        "current": { "text": "30", "value": "30" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "title": "个人总榜",
+      "type": "table",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 12, "w": 14, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "format": "table",
+          "rawSql": "SELECT email, dept, SUM(total_tokens) AS total_tokens, SUM(total_tokens) FILTER (WHERE source='api') AS api_tokens, SUM(total_tokens) FILTER (WHERE source='subscription') AS sub_tokens, ROUND(SUM(cost_usd),2) AS cost_usd FROM usage_daily WHERE usage_date >= current_date - (${days}::int - 1) GROUP BY email, dept ORDER BY total_tokens DESC LIMIT 100"
+        }
+      ]
+    },
+    {
+      "title": "部门榜",
+      "type": "barchart",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 12, "w": 10, "x": 14, "y": 0 },
+      "targets": [
+        {
+          "format": "table",
+          "rawSql": "SELECT dept, SUM(total_tokens) AS total_tokens FROM usage_daily WHERE usage_date >= current_date - (${days}::int - 1) GROUP BY dept ORDER BY total_tokens DESC"
+        }
+      ]
+    },
+    {
+      "title": "工具维度",
+      "type": "piechart",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "format": "table",
+          "rawSql": "SELECT tool, SUM(total_tokens) AS total_tokens FROM usage_daily WHERE usage_date >= current_date - (${days}::int - 1) GROUP BY tool ORDER BY total_tokens DESC"
+        }
+      ]
+    },
+    {
+      "title": "每日总量(按来源)",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "format": "time_series",
+          "rawSql": "SELECT usage_date AS time, source AS metric, SUM(total_tokens) AS tokens FROM usage_daily WHERE usage_date >= current_date - (${days}::int - 1) GROUP BY usage_date, source ORDER BY usage_date"
+        }
+      ]
+    }
+  ]
+}

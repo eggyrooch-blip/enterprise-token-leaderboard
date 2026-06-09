@@ -1,0 +1,18 @@
+[Unit]
+Description=LiteLLM gateway token sync → tokreport SQLite (个人榜 merge + agent 榜拆分)
+After=network-online.target tokreport-collector.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=it
+WorkingDirectory=__REMOTE_DIR__
+EnvironmentFile=__REMOTE_DIR__/.env
+# 与 collector 写同一个库; HISTORY_START 可在 .env 覆盖
+Environment=DEV_DB=__REMOTE_DIR__/tok.db
+ExecStart=__PYTHON__ __REMOTE_DIR__/litellm_collector.py
+# 拉全量 + 写库一次, 失败由 timer 下个整点重试
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=litellm-sync

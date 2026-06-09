@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>数据说明 & 手工上报 · Enterprise AI Token 看板</title>
+<style>
+  :root{
+    --green:#24C789; --green-bd:#A2F2D1; --green-soft:#E0FDF0; --purple:#3A3340; --purple-700:#584F60;
+    --ink:#000; --t1:#333; --t2:#666; --t3:#999; --t4:#CCC; --div:#F2F2F2; --bg:#F7F7F7; --bg2:#FAFAFA;
+    --font:"PingFang SC","Noto Sans SC",-apple-system,"Helvetica Neue","Microsoft YaHei",sans-serif;
+    --display:"PingFang SC",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:var(--font);background:var(--bg);color:var(--t1);-webkit-font-smoothing:antialiased;line-height:1.5}
+  .ic{width:1em;height:1em;display:inline-block;vertical-align:-0.15em;flex:none;stroke:currentColor;fill:none}
+  /* header */
+  .hd{background:var(--purple);color:#fff;padding:18px 24px}
+  .hd .row{max-width:880px;margin:0 auto;display:flex;align-items:center;gap:14px}
+  .brand-shell{width:32px;height:32px;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+  .brand-logo{max-width:32px;max-height:32px;display:block}
+  .brand-mark{width:28px;height:28px;border-radius:8px;background:var(--green);color:#fff;
+    display:flex;align-items:center;justify-content:center;font:800 12px var(--display);letter-spacing:0}
+  .hd .t{font-size:16px;font-weight:600}
+  .hd .s{font-size:12px;color:rgba(255,255,255,.6);margin-top:2px}
+  .hd .back{margin-left:auto;height:32px;padding:0 16px;border-radius:999px;background:var(--green);color:#fff;font:600 13px var(--font);display:inline-flex;align-items:center;gap:6px;text-decoration:none}
+  .wrap{max-width:880px;margin:0 auto;padding:0 24px 60px}
+  /* section */
+  .sec{margin-top:28px}
+  .sec-h{display:flex;align-items:center;gap:8px;margin:0 0 12px 2px;font-size:15px;font-weight:600;color:var(--ink)}
+  .sec-h i{color:var(--green);font-size:18px}
+  .sec-h .n{font-family:var(--display);font-weight:800;color:var(--green);margin-right:2px}
+  .card{background:#fff;border-radius:8px;padding:20px 22px}
+  .lead{color:var(--t2);font-size:13px;margin:-4px 0 16px 2px}
+  /* source grid */
+  .srcs{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+  .src{background:#fff;border-radius:8px;padding:16px 18px;border:.5px solid var(--div)}
+  .src .top{display:flex;align-items:center;gap:8px}
+  .dot{width:9px;height:9px;border-radius:3px;flex:0 0 auto}
+  .src .nm{font-weight:600;font-size:14px;color:var(--ink)}
+  .src .desc{font-size:12.5px;color:var(--t2);margin-top:8px}
+  .freq{display:inline-flex;align-items:center;gap:5px;margin-top:12px;padding:3px 10px;border-radius:999px;background:var(--green-soft);color:#10805a;font:600 11.5px var(--font)}
+  .freq i{font-size:12px}
+  /* refresh table */
+  .tb{width:100%;border-collapse:collapse;font-size:13px}
+  .tb th,.tb td{text-align:left;padding:11px 8px;border-bottom:.5px solid var(--div)}
+  .tb th{color:var(--t3);font-weight:600;font-size:12px}
+  .tb tr:last-child td{border-bottom:0}
+  .tb .src-cell{font-weight:600;color:var(--ink)}
+  .tb .big{font-family:var(--display);font-weight:700;color:var(--ink)}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;background:var(--bg);color:var(--t2);font:500 11.5px var(--font)}
+  /* steps */
+  .step{display:flex;gap:14px;padding:14px 0;border-bottom:.5px solid var(--div)}
+  .step:last-child{border-bottom:0}
+  .step .i{width:26px;height:26px;border-radius:999px;background:var(--purple);color:#fff;font:800 13px var(--display);display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+  .step .bd{flex:1;min-width:0}
+  .step .bt{font-weight:600;font-size:14px;color:var(--ink)}
+  .step .bs{font-size:12.5px;color:var(--t2);margin-top:3px}
+  /* code */
+  .code{position:relative;margin-top:10px;background:#2B2630;border-radius:8px;padding:14px 44px 14px 16px;overflow-x:auto}
+  .code code{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:12.5px;color:#E8E4EE;white-space:pre;line-height:1.7}
+  .cp{position:absolute;top:9px;right:9px;height:26px;padding:0 11px;border:0;border-radius:6px;background:var(--green);color:#fff;font:600 11.5px var(--font);cursor:pointer}
+  .cp.done{background:var(--purple-700)}
+  /* note */
+  .note{display:flex;gap:10px;margin-top:14px;padding:13px 16px;background:var(--green-soft);border-radius:8px;font-size:12.5px;color:#10805a}
+  .note i{font-size:16px;flex:0 0 auto}
+  .warn{background:#FFF4E5;color:#8a5a13}
+  .foot{margin-top:28px;text-align:center;font-size:11px;color:var(--t3);line-height:1.7}
+  @media(max-width:640px){.srcs{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+  <div class="hd">
+    <div class="row">
+      <div class="brand-shell">
+        <img class="brand-logo" src="/assets/company-logo.svg" alt="Company logo" onload="this.nextElementSibling.style.display='none'" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+        <div class="brand-mark" aria-label="Enterprise token leaderboard">ET</div>
+      </div>
+      <div><div class="t">数据说明 &amp; 手工上报</div><div class="s">这些数字从哪来、多久更新、没有你的数据怎么办</div></div>
+      <a class="back" href="/"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"/><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"/><path d="M4 22h16"/><path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"/><path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"/><path d="M18 2H6v7a6 6 0 0 0 12 0V2Z"/></svg>返回看板</a>
+    </div>
+  </div>
+
+  <div class="wrap">
+
+    <!-- 1. 数据来源 -->
+    <div class="sec">
+      <div class="sec-h"><span class="n">1</span><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>数据从哪来</div>
+      <p class="lead">看板把三类来源的用量统一去重后汇总；身份（你是谁、哪个部门）由飞连 MDM 按设备序列号反解，机器侧零配置。</p>
+      <div class="srcs">
+        <div class="src">
+          <div class="top"><span class="dot" style="background:#24C789"></span><span class="nm">订阅制 · 本地工具</span></div>
+          <div class="desc">Claude Code / Codex CLI / Gemini CLI / Kimi / OpenCode 等。由飞连 MDM 下发采集脚本（tokscale）读取你 Mac 上的本地用量日志后上报。</div>
+          <span class="freq"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>飞连 MDM 下发 · 每日 19:00 兜底</span>
+        </div>
+        <div class="src">
+          <div class="top"><span class="dot" style="background:#FFB15A"></span><span class="nm">LiteLLM 网关 · API</span></div>
+          <div class="desc">走公司 LiteLLM 网关的 API key 用量（个人 key 进个人榜，无过期的 agent key 进 Agent 榜）。服务端直连网关管理 API 拉取。</div>
+          <span class="freq"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>每个整点同步</span>
+        </div>
+        <div class="src">
+          <div class="top"><span class="dot" style="background:#6D51F4"></span><span class="nm">Cursor · 企业 Admin</span></div>
+          <div class="desc">Cursor 企业版 Admin API 的真实 token 与花费，按邮箱归属到个人，无需你做任何操作。</div>
+          <span class="freq"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>每 2 小时同步</span>
+        </div>
+        <div class="src">
+          <div class="top"><span class="dot" style="background:#3A3340"></span><span class="nm">身份 · 飞连 MDM</span></div>
+          <div class="desc">按设备序列号反解归属人、邮箱、完整部门路径与头像。机器转手时取「当前在用者」，不会再算到前任头上。</div>
+          <span class="freq"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>上报时实时反解</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. 刷新周期 -->
+    <div class="sec">
+      <div class="sec-h"><span class="n">2</span><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>多久更新一次</div>
+      <div class="card">
+        <table class="tb">
+          <thead><tr><th>来源</th><th>更新周期</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td class="src-cell">订阅制（本地工具）</td><td><span class="big">飞连下发</span></td><td>IT 通过飞连 MDM 批量执行采集脚本；装了常驻 agent 的机器每天 19:00 自动跑一次</td></tr>
+            <tr><td class="src-cell">LiteLLM 网关</td><td><span class="big">每整点</span></td><td>服务端定时任务，停机期间漏掉的会自动补</td></tr>
+            <tr><td class="src-cell">Cursor</td><td><span class="big">每 2 小时</span></td><td>滚动近 30 天窗口</td></tr>
+            <tr><td class="src-cell">看板页面本身</td><td><span class="big">30 秒</span></td><td>前端自动刷新，无需手动 F5</td></tr>
+          </tbody>
+        </table>
+        <div class="note"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg><div>所有上报都是<b>幂等快照</b>：同一天重复上报只覆盖、不累加，所以补报、重跑都不会让你的数字翻倍。</div></div>
+      </div>
+    </div>
+
+    <!-- 3. 手工补报 -->
+    <div class="sec">
+      <div class="sec-h"><span class="n">3</span><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></svg>看板里没有我 / 数据停更了 — 手工补报</div>
+      <p class="lead">通常是飞连 MDM 的采集脚本没推到你的机器、或那次执行失败。你可以自己在终端补跑一次，几十秒后刷新看板就能看到自己。</p>
+      <div class="card">
+        <div class="step">
+          <div class="i">1</div>
+          <div class="bd">
+            <div class="bt">打开「终端」(Terminal)，粘贴并回车</div>
+            <div class="bs">脚本会按你 Mac 的序列号自动认出你是谁，无需填邮箱、部门。需要输入一次开机密码（sudo）。</div>
+            <div class="code"><button class="cp" data-cp="curl -fsSL https://collector.example.com/tokreport.sh -o /tmp/tokreport.sh && sudo bash /tmp/tokreport.sh manual">复制</button><code>curl -fsSL https://collector.example.com/tokreport.sh -o /tmp/tokreport.sh && sudo bash /tmp/tokreport.sh manual</code></div>
+          </div>
+        </div>
+        <div class="step">
+          <div class="i">2</div>
+          <div class="bd">
+            <div class="bt">看到 <code style="font-family:monospace">tokreport OK</code> 即上报成功</div>
+            <div class="bs">如果提示没装 tokscale，脚本会自动用 npx 临时拉起，首次可能多等十几秒。整段最多跑 3 分钟会自动结束，不会卡住。</div>
+          </div>
+        </div>
+        <div class="step">
+          <div class="i">3</div>
+          <div class="bd">
+            <div class="bt">回到看板刷新，在「个人榜」找自己</div>
+            <div class="bs">前端每 30 秒自动刷新；也可直接 <a href="/" style="color:#10805a">返回看板</a>。仍然没有？大概率是这台机器在飞连里序列号没登记或归属人是空，把序列号发给 IT 核对。</div>
+          </div>
+        </div>
+      </div>
+      <div class="note"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg><div><b>隐私：</b>采集脚本<b>纯只读</b>，只统计 token 数量与花费，<b>绝不读取或上传你的 prompt、对话内容或代码</b>。源码就是上面这个 <code style="font-family:monospace">tokreport.sh</code>，可自行查看。</div></div>
+      <div class="note warn"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg><div>手工补报的数据，会在个人榜你名字旁标一个<b>「手工」</b>角标 —— 方便和 MDM 自动采集区分、也便于事后核对。正常用不到时，等 MDM 自动采集即可。</div></div>
+    </div>
+
+    <div class="foot">
+      Keep · 企业 AI Token 看板 · 内网工具<br>
+      数据来源：tokscale 本地日志（订阅制）+ LiteLLM 网关 + Cursor 企业 Admin · 身份飞连 MDM · 去重幂等
+    </div>
+  </div>
+
+<script>
+document.querySelectorAll('.cp').forEach(function(b){
+  b.onclick=function(){
+    var t=b.getAttribute('data-cp');
+    navigator.clipboard.writeText(t).then(function(){
+      var old=b.textContent; b.textContent='已复制'; b.classList.add('done');
+      setTimeout(function(){b.textContent=old;b.classList.remove('done');},1600);
+    });
+  };
+});
+</script>
+</body>
+</html>

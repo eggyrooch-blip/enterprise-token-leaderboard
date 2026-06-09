@@ -1,0 +1,12 @@
+[Unit]
+Description=每小时触发 litellm-sync.service (LiteLLM 网关 token 周期上报)
+
+[Timer]
+# 启动后 3 分钟先跑一次, 之后每个整点跑. Persistent 补上停机期间漏掉的触发.
+OnBootSec=3min
+OnCalendar=hourly
+Persistent=true
+Unit=litellm-sync.service
+
+[Install]
+WantedBy=timers.target

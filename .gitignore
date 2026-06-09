@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv*/
+venv/
+
+# local demo/dev databases
+*.db
+
+# Secrets / local config
+.env
+*.local
+agent/tokreport.conf
+
+# OS
+.DS_Store
+
+# Tool-local state
+.omc/
+
+# ftask: per-slug runtime files (env + sim artifacts) — never committed
+.ftask/*/.env
+.ftask/*/sim_artifacts/
+agent/mdm_push_ready.sh
+.ftask/
+.claude/
+/AGENTS.md
+/CLAUDE.md
+scripts/leak-denylist.private.txt
