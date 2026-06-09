@@ -15,17 +15,9 @@ import subprocess
 
 
 def _git_email() -> str | None:
-    try:
-        # 仅在已装 Xcode 命令行工具时调 git。否则裸调 git 会弹“需要安装命令行开发者
-        # 工具”对话框，定时任务反复骚扰员工。xcode-select -p 不会触发该对话框。
-        if subprocess.run(["xcode-select", "-p"],
-                          capture_output=True).returncode != 0:
-            return None
-        out = subprocess.run(["git", "config", "--global", "user.email"],
-                             capture_output=True, text=True, timeout=5).stdout.strip()
-        return out or None
-    except (OSError, subprocess.SubprocessError):
-        return None
+    # 已停用：身份交给 collector（序列号→飞连反解）。不再调 git 取邮箱——
+    # 裸调 git 会在没装 Xcode 命令行工具的员工机上弹“安装命令行开发者工具”对话框。
+    return None
 
 
 def resolve(conf: dict) -> tuple[str, str]:
