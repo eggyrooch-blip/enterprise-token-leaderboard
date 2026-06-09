@@ -119,7 +119,19 @@
     background:var(--bg2);color:var(--t2);font:700 11px var(--font);margin-top:10px}
   .gov-card .detail{font:400 12px/1.6 var(--font);color:var(--t2);margin-top:12px}
   .gov-card .bench{font:500 11px/1.5 var(--font);color:var(--t3);margin-top:10px}
+  /* 飞书 AI 权益:额度盘 + 单位说明。复用 .card/.r/.track/.num,保持 Keep 扁平风。 */
+  .fs-quota{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:18px 0 8px}
+  .fs-q{border:1px solid var(--div);border-radius:8px;padding:14px 16px}
+  .fs-q-top{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+  .fs-q-name{font:600 14px var(--font);color:var(--ink)}
+  .fs-q-rem{font-family:var(--display);font-weight:800;font-size:15px;color:var(--green);font-variant-numeric:tabular-nums}
+  .fs-q .track{margin:11px 0 8px;flex:none}
+  .fs-q-sub{font:500 12px var(--font);color:var(--t3);font-variant-numeric:tabular-nums}
+  .fs-sec-t{display:flex;align-items:baseline;gap:10px;font:700 14px var(--font);color:var(--t2);padding:18px 0 6px;border-top:1px solid var(--div);margin-top:10px}
+  .fs-sec-t .fs-per{font:500 12px var(--font);color:var(--t3)}
+  .fs-unit{font:500 12px var(--font);color:var(--t3);padding:4px 0 0}
   @media (max-width:760px){
+    .fs-quota{grid-template-columns:1fr}
     .hd .row{align-items:flex-start;flex-wrap:wrap}
     .hdrange{margin-left:0;flex-wrap:wrap}
     .kpis{grid-template-columns:repeat(2,1fr)}
@@ -170,6 +182,7 @@
       <button class="tab" data-t="codex"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>Codex 榜</button>
       <button class="tab" data-t="agent"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>Agent 榜</button>
       <button class="tab" data-t="governance"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>大厂治理指标</button>
+      <button class="tab" data-t="feishu"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 5.4L20 8l-4 4 1 6-5-2.8L7 18l1-6-4-4 5.6-.6L12 2Z"/></svg>飞书 AI 权益</button>
       <div class="seg-ctl" id="metricCtl" title="榜单 token 数字按总量 或 除以天数(日均)显示;成本$始终为总量">
         <button data-m="total" class="on">总量</button>
         <button data-m="daily">日均</button>
@@ -248,17 +261,18 @@ async function load(){
   var qp = parts.join('&');
   var q = qp ? ('?'+qp) : '';
   var qa = qp ? ('&'+qp) : '';
-  var [lb,tm,tool,model,cur,ag,gov,cc,cx]=await Promise.all([
+  var [lb,tm,tool,model,cur,ag,gov,cc,cx,fs]=await Promise.all([
     j('/v1/leaderboard'+q), j('/v1/teams'+q),
     j('/v1/breakdown?by=client'+qa), j('/v1/breakdown?by=model'+qa), j('/v1/cursor'+q),
     j('/v1/agent_leaderboard'+q), j('/v1/governance_metrics'),
     j('/v1/leaderboard?client='+encodeURIComponent('Claude Code')+qa),
-    j('/v1/leaderboard?client='+encodeURIComponent('Codex CLI')+qa)
+    j('/v1/leaderboard?client='+encodeURIComponent('Codex CLI')+qa),
+    j('/v1/feishu'+(SHOW_DEPARTED?'?show_departed=1':''))   // 飞书 AI 权益(独立周期快照,不受 token 时间范围影响)
   ]);
   CACHE.person=lb.leaderboard||[]; CACHE.team=tm.teams||[];
   CACHE.tool=tool.breakdown||[]; CACHE.model=model.breakdown||[]; CACHE.cursor=cur.cursor||[];
   CACHE.agent=ag.agent_leaderboard||[]; CACHE.governance=gov.metrics||GOVERNANCE_METRICS;
-  CACHE.claude=cc.leaderboard||[]; CACHE.codex=cx.leaderboard||[];
+  CACHE.claude=cc.leaderboard||[]; CACHE.codex=cx.leaderboard||[]; CACHE.feishu=fs||{};
   // KPI
   var tot=CACHE.person.reduce(function(a,x){return a+(x.tokens||0)},0);
   var cost=CACHE.person.reduce(function(a,x){return a+(x.cost||0)},0);
@@ -282,6 +296,38 @@ function renderGovernance(){
       '<div class="bench">'+m.benchmark+'</div></div>';
   }).join('')+'</div>';
   $('list').innerHTML=body;
+}
+// 飞书 AI 权益:额度盘(每功能 已用/共/剩余%) + 个人消耗榜(单位「点」)。
+// 复用 .r/.av/.track/.fill/.num,与 token 榜同一视觉语言;但单位是「点」,不与 token 加总。
+function renderFeishu(){
+  var d=CACHE.feishu||{}; var q=d.quota||[], ppl=d.members||[];
+  if(!ppl.length && !q.length){$('list').innerHTML='<div class="empty">暂无飞书 AI 权益数据 — 等采集端上报后自动出现</div>';return;}
+  var FNAME={AI_credits:'AI 通用额度', aily_credits:'飞书 aily 额度'};
+  var quotaHTML=q.map(function(x){
+    var used=x.used||0, quota=x.quota||0;
+    var usedPct=quota?Math.min(100,used/quota*100):0, remPct=quota?(100-usedPct):0;
+    return '<div class="fs-q"><div class="fs-q-top"><span class="fs-q-name">'+(FNAME[x.feature_key]||x.feature_key)+
+      '</span><span class="fs-q-rem">剩余 '+remPct.toFixed(1)+'%</span></div>'+
+      '<div class="track"><div class="fill" style="width:'+usedPct.toFixed(1)+'%"></div></div>'+
+      '<div class="fs-q-sub">已用 '+compact(used)+' / 共 '+compact(quota)+' 点</div></div>';
+  }).join('');
+  var max=Math.max.apply(null, ppl.map(function(x){return x.credits||0}).concat([1]));
+  var body=ppl.map(function(x,i){
+    var name=x.name||(x.email||'').split('@')[0]||'—';
+    var fb=(name||'·').slice(-2);
+    var av=x.avatar
+      ? '<img class="av" src="'+x.avatar+'" onerror="this.outerHTML=&quot;<span class=\\&quot;av fb\\&quot;>'+fb+'</span>&quot;">'
+      : '<span class="av fb">'+fb+'</span>';
+    var pct=Math.max(2,(x.credits||0)/max*100);
+    var small=(x.aily_credits?('aily '+compact(x.aily_credits)+' · '):'')+'AI '+compact(x.ai_credits||0);
+    return '<div class="r"><span class="rk num '+(i===0?'first':'')+'">'+(i+1)+'</span>'+av+
+      '<div class="nm">'+name+'<div class="sub">'+stripKeep(x.dept||'')+'</div></div>'+
+      '<div class="track"><div class="fill" style="width:'+pct+'%"></div></div>'+
+      '<div class="val"><div class="t num">'+compact(x.credits||0)+' 点</div><div class="s num">'+small+'</div></div></div>';
+  }).join('');
+  $('list').innerHTML='<div class="fs-unit">单位：点（飞书 AI 权益消耗，与上方 token 为不同口径，不加总）</div>'+
+    '<div class="fs-quota">'+quotaHTML+'</div>'+
+    '<div class="fs-sec-t">个人消耗榜<span class="fs-per">当前周期起 '+(d.period_start||'—')+'</span></div>'+body;
 }
 // 部门榜:把扁平的 dept/depth 节点(后端已 roll-up)建成可折叠下钻树。
 // 名称只显示路径最后一段,层级靠缩进;主指标=人均(tokens/people,叠加日均口径);
@@ -358,6 +404,7 @@ function renderTeamTree(){
 }
 function render(){
   if(CUR==='governance'){renderGovernance();return;}
+  if(CUR==='feishu'){renderFeishu();return;}    // 飞书 AI 权益=额度盘+个人榜,单位「点」,独立渲染
   if(CUR==='team'){renderTeamTree();return;}   // 部门榜=可下钻树,独立渲染,不走通用行逻辑
   var rows=CACHE[CUR]||[];
   if(!rows.length){$('list').innerHTML='<div class="empty">暂无数据 — 等采集端上报后自动出现</div>';return;}

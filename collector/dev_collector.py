@@ -170,6 +170,21 @@ def db():
     # 1000 人规模:按 period_type 过滤是所有榜单的公共前缀,建索引避免全表扫
     c.execute("CREATE INDEX IF NOT EXISTS idx_usage_period ON usage(period_type, total DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_usage_dept ON usage(period_type, dept)")
+    # 飞书 AI 权益(独立三表,单位=「点」credits,与 token 不加总;一周期一快照,主键覆盖)
+    c.execute("""CREATE TABLE IF NOT EXISTS feishu_member(
+        email TEXT NOT NULL, name TEXT DEFAULT '', dept TEXT DEFAULT 'unknown',
+        feature_key TEXT NOT NULL, credits REAL NOT NULL DEFAULT 0,
+        period_start TEXT NOT NULL, period_end TEXT DEFAULT '',
+        avatar TEXT DEFAULT '', entity_id TEXT DEFAULT '',
+        PRIMARY KEY(email, feature_key, period_start))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS feishu_quota(
+        feature_key TEXT NOT NULL, quota REAL DEFAULT 0, used REAL DEFAULT 0,
+        remain REAL DEFAULT 0, period_start TEXT NOT NULL, period_end TEXT DEFAULT '',
+        PRIMARY KEY(feature_key, period_start))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS feishu_trend(
+        usage_date TEXT NOT NULL, biz_type TEXT NOT NULL, biz_name TEXT DEFAULT '',
+        credits REAL DEFAULT 0, user_count INTEGER DEFAULT 0,
+        PRIMARY KEY(usage_date, biz_type))""")
     c.commit()
     return c
 
@@ -508,7 +523,45 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path.startswith("/v1/tokscale/report"):
             return self._tokscale_report()
+        if self.path.startswith("/v1/feishu/report"):
+            return self._feishu_report()
         self._send(404, {"error": "not found"})
+
+    def _feishu_report(self):
+        """接收飞书 AI 权益采集器上报(独立三表,单位=点,不并入 token 榜)。
+        payload: {period_start, period_end, members:[{email,name,dept,avatar,entity_id,
+                  feature_key,credits}], quota:[{feature_key,quota,used,remain}],
+                  trend:[{usage_date,biz_type,biz_name,credits,user_count}]}
+        幂等:INSERT OR REPLACE 按主键覆盖(同周期重跑不翻倍)。"""
+        if not self._auth():
+            return self._send(403, {"error": "invalid token"})
+        p = self._read_body()
+        ps = p.get("period_start") or ""
+        pe = p.get("period_end") or ""
+        conn = db()
+        nm = nq = nt = 0
+        for m in p.get("members") or []:
+            conn.execute(
+                "INSERT OR REPLACE INTO feishu_member"
+                "(email,name,dept,feature_key,credits,period_start,period_end,avatar,entity_id)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (m.get("email") or "", m.get("name") or "", m.get("dept") or "unknown",
+                 m.get("feature_key") or "", float(m.get("credits") or 0), ps, pe,
+                 m.get("avatar") or "", m.get("entity_id") or "")); nm += 1
+        for q in p.get("quota") or []:
+            conn.execute(
+                "INSERT OR REPLACE INTO feishu_quota"
+                "(feature_key,quota,used,remain,period_start,period_end) VALUES(?,?,?,?,?,?)",
+                (q.get("feature_key") or "", float(q.get("quota") or 0), float(q.get("used") or 0),
+                 float(q.get("remain") or 0), ps, pe)); nq += 1
+        for t in p.get("trend") or []:
+            conn.execute(
+                "INSERT OR REPLACE INTO feishu_trend"
+                "(usage_date,biz_type,biz_name,credits,user_count) VALUES(?,?,?,?,?)",
+                (t.get("usage_date") or "", str(t.get("biz_type") or ""), t.get("biz_name") or "",
+                 float(t.get("credits") or 0), int(t.get("user_count") or 0))); nt += 1
+        conn.commit(); conn.close()
+        self._send(200, {"ok": True, "members": nm, "quota": nq, "trend": nt})
 
     def _tokscale_report(self):
         """接收 {serial, email, hostname, models:{entries:[...]}, monthly:{entries:[...]}}
@@ -590,6 +643,8 @@ class H(BaseHTTPRequestHandler):
                 return self._meta(conn)
             if path == "/v1/governance_metrics":
                 return self._governance_metrics(conn)
+            if path == "/v1/feishu":
+                return self._feishu(conn, qs)
             if path == "/v1/raw":
                 return self._raw(conn)
             self._send(200, {
@@ -607,6 +662,43 @@ class H(BaseHTTPRequestHandler):
             })
         finally:
             conn.close()
+
+    def _feishu(self, conn, qs):
+        """飞书 AI 权益(独立板块,单位=点)。返回最新周期快照:额度盘 + 全员逐人榜
+        + 部门榜 + 趋势。?show_departed=1 才纳入离职。"""
+        period = conn.execute("SELECT max(period_start) FROM feishu_member").fetchone()[0]
+        if not period:
+            return self._send(200, {"period_start": None, "quota": [], "members": [],
+                                    "dept": [], "trend": []})
+        pe = (conn.execute("SELECT max(period_end) FROM feishu_member WHERE period_start=?",
+                           (period,)).fetchone() or [""])[0]
+        sd = _show_departed(qs)
+        dep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
+        quota = [{"feature_key": r[0], "quota": r[1] or 0, "used": r[2] or 0, "remain": r[3] or 0}
+                 for r in conn.execute(
+                     "SELECT feature_key,quota,used,remain FROM feishu_quota WHERE period_start="
+                     "(SELECT max(period_start) FROM feishu_quota) ORDER BY quota DESC").fetchall()]
+        members = [{"email": r[0], "name": r[1] or (r[0] or "").split("@")[0], "dept": r[2] or "unknown",
+                    "avatar": r[3] or "", "credits": r[4] or 0,
+                    "ai_credits": r[5] or 0, "aily_credits": r[6] or 0}
+                   for r in conn.execute(
+                       "SELECT email, MAX(name), MAX(dept), MAX(avatar), SUM(credits),"
+                       " SUM(CASE WHEN feature_key='AI_credits' THEN credits ELSE 0 END),"
+                       " SUM(CASE WHEN feature_key='aily_credits' THEN credits ELSE 0 END)"
+                       " FROM feishu_member WHERE period_start=?%s"
+                       " GROUP BY email HAVING SUM(credits)>0 ORDER BY SUM(credits) DESC" % dep,
+                       (period,)).fetchall()]
+        dept = [{"dept": r[0] or "unknown", "credits": r[1] or 0, "people": r[2] or 0}
+                for r in conn.execute(
+                    "SELECT dept, SUM(credits), COUNT(DISTINCT email) FROM feishu_member"
+                    " WHERE period_start=?%s GROUP BY dept ORDER BY SUM(credits) DESC" % dep,
+                    (period,)).fetchall()]
+        trend = [{"usage_date": r[0], "biz_type": r[1], "credits": r[2] or 0, "user_count": r[3] or 0}
+                 for r in conn.execute(
+                     "SELECT usage_date,biz_type,credits,user_count FROM feishu_trend"
+                     " ORDER BY usage_date").fetchall()]
+        self._send(200, {"period_start": period, "period_end": pe,
+                         "quota": quota, "members": members, "dept": dept, "trend": trend})
 
     def _leaderboard(self, conn, qs):
         """按人聚合(区间 ?days=N 或全部),join people 取中文姓名+头像+完整部门路径。

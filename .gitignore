@@ -29,3 +29,11 @@ agent/mdm_push_ready.sh
 /AGENTS.md
 /CLAUDE.md
 scripts/leak-denylist.private.txt
+
+# feishu collector secrets/artifacts (含员工 PII / 登录态,绝不提交)
+.venv-feishu/
+collector/feishu/*_raw.json
+collector/feishu/_login_profile/
+collector/feishu/feishu_probe_*.py
+*keep_state.json
+.feishu/
