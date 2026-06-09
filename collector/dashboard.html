@@ -130,6 +130,34 @@
   .fs-sec-t{display:flex;align-items:baseline;gap:10px;font:700 14px var(--font);color:var(--t2);padding:18px 0 6px;border-top:1px solid var(--div);margin-top:10px}
   .fs-sec-t .fs-per{font:500 12px var(--font);color:var(--t3)}
   .fs-unit{font:500 12px var(--font);color:var(--t3);padding:4px 0 0}
+  /* 自定义 Keep 区间日历 */
+  .dwrap{position:relative;display:inline-flex}
+  .dtrig{height:32px;padding:0 10px;border:1px solid rgba(255,255,255,.28);border-radius:8px;background:#fff;color:var(--ink);font:600 13px var(--font);cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-variant-numeric:tabular-nums;transition:border-color .15s}
+  .dtrig:hover{border-color:var(--green)}
+  .dtrig .ic{width:14px;height:14px;color:var(--t3)}
+  .dtrig .caret{width:13px;height:13px;margin-left:1px}
+  .dpop{position:absolute;top:calc(100% + 8px);left:0;z-index:60;width:294px;background:#fff;border-radius:12px;
+    box-shadow:0 8px 30px rgba(58,51,64,.20);padding:14px;display:none}
+  .dpop.on{display:block}
+  .dpop-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+  .dpop-mon{font:700 14px var(--font);color:var(--ink)}
+  .dpop-nav{display:flex;gap:4px}
+  .dpop-nav button{width:28px;height:28px;border:0;border-radius:8px;background:var(--bg);color:var(--t2);cursor:pointer;font:600 16px var(--font);line-height:1;display:flex;align-items:center;justify-content:center;transition:background .12s,color .12s}
+  .dpop-nav button:hover{background:var(--div);color:var(--ink)}
+  .dpop-wk{display:grid;grid-template-columns:repeat(7,1fr)}
+  .dpop-wk span{text-align:center;font:500 11px var(--font);color:var(--t3);height:26px;line-height:26px}
+  .dpop-grid{display:grid;grid-template-columns:repeat(7,1fr)}
+  .dpop-d{height:34px;display:flex;align-items:center;justify-content:center;font:500 13px var(--font);color:var(--t1);cursor:pointer;font-variant-numeric:tabular-nums;border-radius:8px}
+  .dpop-d:hover{background:var(--green-soft);color:#0B8D60}
+  .dpop-d.mute{color:var(--t4);cursor:default}
+  .dpop-d.mute:hover{background:transparent;color:var(--t4)}
+  .dpop-d.today{box-shadow:inset 0 0 0 1px var(--green-bd)}
+  .dpop-d.inrange{background:var(--green-soft);border-radius:0;color:#0B8D60}
+  .dpop-d.start,.dpop-d.end{background:var(--green);color:#fff;font-weight:700}
+  .dpop-d.start{border-radius:8px 0 0 8px}
+  .dpop-d.end{border-radius:0 8px 8px 0}
+  .dpop-d.start.end{border-radius:8px}
+  .dpop-d.start:hover,.dpop-d.end:hover{background:var(--green);color:#fff}
   @media (max-width:760px){
     .fs-quota{grid-template-columns:1fr}
     .hd .row{align-items:flex-start;flex-wrap:wrap}
@@ -153,9 +181,11 @@
       <div class="ttl"><div class="t">AI 编程 Token 看板</div><div class="s" id="sub">tokscale 采集 · 飞连 MDM 身份 · 实时</div></div>
       <div class="hdrange">
         <span class="rglab">时间范围</span>
-        <input type="date" id="from" class="dt" onclick="this.showPicker&&this.showPicker()">
-        <span class="rgsep">至</span>
-        <input type="date" id="to" class="dt" onclick="this.showPicker&&this.showPicker()">
+        <span class="dwrap">
+          <button class="dtrig" id="rangeTrig"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span id="rangeLbl">选择日期</span><svg class="ic caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
+          <input type="hidden" id="from"><input type="hidden" id="to">
+          <div class="dpop" id="rangePop"></div>
+        </span>
         <button class="rg solid" id="apply">应用</button>
         <button class="rg" id="reset">全部</button>
         <button class="rg" id="r7" title="最近 7 天">近 7 天</button>
@@ -285,6 +315,7 @@ async function load(){
   $('k-cost').textContent='$'+compact(Math.round(cost));
   $('k-msg').textContent=compact(msg);
   $('k-ppl').textContent=CACHE.person.length;
+  if(typeof updTrig==='function') updTrig();   // 触发按钮显示当前区间(随 meta/预设/自定义变化)
   render();
 }
 function $(id){return document.getElementById(id)}
@@ -525,6 +556,51 @@ function presetDays(n){
 function markRange(id){['r7','r30','reset'].forEach(function(x){var e=$(x);if(e)e.classList.toggle('on',x===id);});}
 $('r7').onclick=function(){presetDays(7);markRange('r7');};
 $('r30').onclick=function(){presetDays(30);markRange('r30');};
+// ===== 自定义 Keep 区间日历(替代原生 input[type=date])=====
+var DP_VIEW=null, DP_S=null, DP_E=null;
+function dpParse(s){return s?new Date(s+'T00:00:00'):null;}
+function dpSame(a,b){return a&&b&&a.getFullYear()==b.getFullYear()&&a.getMonth()==b.getMonth()&&a.getDate()==b.getDate();}
+function updTrig(){var f=$('from').value,t=$('to').value;$('rangeLbl').textContent=(f&&t)?(f+' → '+t):'选择日期';}
+function dpOpen(){
+  DP_S=dpParse($('from').value); DP_E=dpParse($('to').value);
+  DP_VIEW=new Date(DP_E||new Date()); DP_VIEW.setDate(1); DP_VIEW.setHours(0,0,0,0);
+  $('rangePop').classList.add('on'); dpRender();
+}
+function dpClose(){$('rangePop').classList.remove('on');}
+function dpRender(){
+  var y=DP_VIEW.getFullYear(), m=DP_VIEW.getMonth();
+  var startWd=new Date(y,m,1).getDay(), dim=new Date(y,m+1,0).getDate(), prev=new Date(y,m,0).getDate();
+  var today=new Date(); today.setHours(0,0,0,0);
+  var cells=[],i,dd;
+  for(i=startWd-1;i>=0;i--) cells.push({d:new Date(y,m-1,prev-i),mute:1});
+  for(dd=1;dd<=dim;dd++) cells.push({d:new Date(y,m,dd),mute:0});
+  while(cells.length%7) cells.push({d:new Date(y,m+1,cells.length-dim-startWd+1),mute:1});
+  var wk=['日','一','二','三','四','五','六'].map(function(w){return '<span>'+w+'</span>';}).join('');
+  var grid=cells.map(function(c){
+    var d=c.d; d.setHours(0,0,0,0);
+    var cls='dpop-d'+(c.mute?' mute':'');
+    if(dpSame(d,today))cls+=' today';
+    if(DP_S&&DP_E&&d>=DP_S&&d<=DP_E)cls+=' inrange';
+    if(dpSame(d,DP_S))cls+=' start'; if(dpSame(d,DP_E))cls+=' end';
+    if(DP_S&&!DP_E&&dpSame(d,DP_S))cls+=' start end';
+    return '<div class="'+cls+'" data-d="'+fmtDate(d)+'">'+d.getDate()+'</div>';
+  }).join('');
+  $('rangePop').innerHTML='<div class="dpop-hd"><span class="dpop-mon">'+y+'年'+(m+1)+'月</span>'+
+    '<span class="dpop-nav"><button data-n="-1">‹</button><button data-n="1">›</button></span></div>'+
+    '<div class="dpop-wk">'+wk+'</div><div class="dpop-grid">'+grid+'</div>';
+  $('rangePop').querySelectorAll('.dpop-nav button').forEach(function(b){
+    b.onclick=function(){DP_VIEW.setMonth(DP_VIEW.getMonth()+(+b.getAttribute('data-n')));dpRender();};});
+  $('rangePop').querySelectorAll('.dpop-d:not(.mute)').forEach(function(el){
+    el.onclick=function(){dpPick(dpParse(el.getAttribute('data-d')));};});
+}
+function dpPick(d){
+  if(!DP_S||(DP_S&&DP_E)){DP_S=d;DP_E=null;dpRender();}        // 起点(或重选)
+  else{ if(d<DP_S){DP_E=DP_S;DP_S=d;}else DP_E=d;               // 终点(自动纠正先后)
+    $('from').value=fmtDate(DP_S);$('to').value=fmtDate(DP_E);
+    updTrig();markRange(null);applyRange();dpClose();}
+}
+$('rangeTrig').onclick=function(e){e.stopPropagation();$('rangePop').classList.contains('on')?dpClose():dpOpen();};
+document.addEventListener('click',function(e){var w=$('rangePop'),t=$('rangeTrig');if(w&&!w.contains(e.target)&&!t.contains(e.target))dpClose();});
 load();                     // load() 内部已 await fillMeta(),meta 就绪后再发榜单请求
 setInterval(load, 30000);   // 30s 自动刷新
 </script>
