@@ -58,9 +58,14 @@ run_as_user() {
 }
 
 # 兜底身份：登录用户的 git email（collector 优先用序列号反解，这里只是兜底）
-# 注意：登录 shell 的 profile 可能打印 banner 污染 stdout，故只抽取邮箱形态字符串
-EMAIL=$(run_as_user 'git config --global user.email' 2>/dev/null | grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+' | head -1)
-[ -z "$EMAIL" ] && EMAIL=""
+# 重要：仅在已装 Xcode 命令行工具时才调 git。否则在没装 CLT 的机器上裸调 git 会弹出
+# “git 命令需要命令行开发者工具，是否安装”对话框，且定时任务会反复骚扰员工。
+# xcode-select -p 只查询路径、本身不会触发该安装对话框，可安全用作前置判断。
+# 注意：登录 shell 的 profile 可能打印 banner 污染 stdout，故只抽取邮箱形态字符串。
+EMAIL=""
+if xcode-select -p >/dev/null 2>&1; then
+  EMAIL=$(run_as_user 'git config --global user.email' 2>/dev/null | grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+' | head -1)
+fi
 
 # tokscale 调用前缀：补 PATH；装了就用本地二进制,没装则【直接用 npx 运行】。
 # 注意:不能只 `npx ... --version` 再裸跑 tokscale —— 那只下到缓存,tokscale 不进 PATH,
