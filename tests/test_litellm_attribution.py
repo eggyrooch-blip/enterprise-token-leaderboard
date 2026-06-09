@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "collector"))
 @pytest.fixture()
 def L(monkeypatch):
     monkeypatch.setenv("LITELLM_PROBE_ALIAS_PREFIXES", "tmp-")
+    monkeypatch.setenv("LITELLM_PROBE_ALIASES", "服务号Agent,ss,zz")
     monkeypatch.setenv("LITELLM_KEY_OWNER_MAP", "legacy-admin:ops@example.com")
     monkeypatch.setenv("LITELLM_EMAIL_MERGE_MAP",
                        "alice_v@example.com:alice@example.com,bob123@gmail.com:bob@example.com")
@@ -58,6 +59,21 @@ def test_aliasless_orphan_key_is_filtered_out(L):
     rows, names, agent_owner, stats = L.build_rows([_orphan_noalias()], {}, {}, "", {})
     assert _lifetime_emails(rows) == set(), "无别名无主孤儿 key 不该进榜"
     assert stats["probe_skipped"] == 1
+
+
+def test_probe_aliases_exact_match_filtered(L):
+    # 精确匹配垃圾别名(服务号/短别名),整名相等才剔除。
+    results = [_activity("服务号Agent"), _activity("ss"), _activity("zz")]
+    rows, _n, _a, stats = L.build_rows(results, {}, {}, "", {})
+    assert _lifetime_emails(rows) == set(), "PROBE_ALIASES 精确命中的应被剔除"
+    assert stats["probe_skipped"] == 3
+
+
+def test_probe_aliases_does_not_overmatch_substring(L):
+    # 'ss' 在精确表里, 但 'ss-platform' 不应被误删(精确匹配, 非前缀/子串)。
+    rows, _n, _a, stats = L.build_rows([_activity("ss-platform")], {}, {}, "", {})
+    assert "litellm-key:ss-platform" in _lifetime_emails(rows), "精确匹配不得误伤近似别名"
+    assert stats["probe_skipped"] == 0
 
 
 def test_tmp_prefix_filtered_even_with_real_owner(L):

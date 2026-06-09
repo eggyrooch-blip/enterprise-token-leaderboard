@@ -22,6 +22,8 @@ import sys
 import time
 import urllib.request
 
+from email_merge import merge_email  # 同目录共享模块;惰性读 env,import 顺序无关
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 for cand in (os.path.join(HERE, ".env"), os.path.join(HERE, "..", "pipeline", ".env")):
     if os.path.exists(cand):
@@ -73,6 +75,7 @@ def main():
             email = e.get("userEmail")
             if not email:
                 continue
+            email = merge_email(email)   # 身份合并:分身/外部邮箱→规范真人邮箱(与 litellm 同表)
             ts = int(e.get("timestamp", "0"))
             day = datetime.datetime.utcfromtimestamp(ts / 1000).strftime("%Y-%m-%d")
             model = e.get("model") or "unknown"

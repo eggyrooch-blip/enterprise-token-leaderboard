@@ -77,15 +77,13 @@ for _pair in os.environ.get("LITELLM_KEY_OWNER_MAP", "").split(","):
 PROBE_ALIAS_PREFIXES = tuple(
     p.strip() for p in os.environ.get("LITELLM_PROBE_ALIAS_PREFIXES", "tmp-").split(",")
     if p.strip())
-# 身份合并表:把同一人的分身/外部邮箱归并到规范真人邮箱(如 vendor 账号 xxx_v@、个人 gmail
-# → 员工 @公司邮箱)。格式 "alias1@x:real@x,gmail@gmail.com:real@x"。值含真实员工邮箱,
-# 故只在生产 env 配置, 绝不写进代码默认值(否则触发开源泄露闸)。键大小写不敏感。
-EMAIL_MERGE_MAP = {}
-for _pair in os.environ.get("LITELLM_EMAIL_MERGE_MAP", "").split(","):
-    if ":" in _pair:
-        _src, _dst = _pair.split(":", 1)
-        if _src.strip() and _dst.strip():
-            EMAIL_MERGE_MAP[_src.strip().lower()] = _dst.strip()
+# 精确匹配的探针别名:已删、查不到任何真人 owner 的服务号/短别名垃圾 key(逗号分隔,整名相等才剔除)。
+# 区别于 PROBE_ALIAS_PREFIXES(前缀匹配);精确匹配避免误伤(如 'ss' 不会连累 'ss-platform')。
+PROBE_ALIASES = set(
+    a.strip() for a in os.environ.get("LITELLM_PROBE_ALIASES", "").split(",") if a.strip())
+# 身份合并:把同一人的分身/外部邮箱归并到规范真人邮箱。与 cursor_sync 共享同一 helper(同表同逻辑)。
+# 惰性读 env,故 import 顺序无所谓。值含真实员工邮箱,只在生产 env 配置(LITELLM_EMAIL_MERGE_MAP)。
+from email_merge import merge_email  # noqa: E402  (同目录共享模块,运行目录在 sys.path)
 HISTORY_START = os.environ.get("LITELLM_HISTORY_START", "2025-01-01")
 CLIENT_LABEL = os.environ.get("LITELLM_CLIENT_LABEL", "LiteLLM")
 DB = os.environ.get("DEV_DB", "/tmp/tok.db")
@@ -330,6 +328,10 @@ def build_rows(results, key_map, users, agent_team_id, alias_by_id):
                 if PROBE_ALIAS_PREFIXES and any(alias.startswith(pfx) for pfx in PROBE_ALIAS_PREFIXES):
                     probe_skipped.add(alias)
                     continue
+                # 精确匹配的垃圾别名(服务号/短别名,已删且查无真人 owner)。
+                if alias in PROBE_ALIASES:
+                    probe_skipped.add(alias)
+                    continue
                 # 同类无别名孤儿: 已从 /key/list 删除、当初连 key_alias 都没设(alias 退化成 token
                 # 前缀)、且无任何 owner —— 裸 /key/generate 调试 key, 不可能是已入职员工, 一并剔除。
                 if (not from_keylist and alias == tok[:8]
@@ -377,8 +379,8 @@ def build_rows(results, key_map, users, agent_team_id, alias_by_id):
                     if not email:
                         email = ("litellm-user:" + uid) if uid else ("litellm-key:" + alias)
                     # 身份合并: 分身/外部邮箱归并到规范真人邮箱, 用目标的中文名(不带分身旧名)
-                    merged = EMAIL_MERGE_MAP.get((email or "").lower())
-                    if merged:
+                    merged = merge_email(email)
+                    if merged != email:
                         email = merged
                         pname = users_by_email.get(merged.lower(), {}).get("name") or ""
                     pname = pname or email.split("@")[0]
