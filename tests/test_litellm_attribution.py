@@ -109,12 +109,12 @@ def test_fetch_daily_activity_stops_on_empty_page_without_total_pages(L, monkeyp
 
 def test_created_by_resolves_owner_when_key_has_no_user(L):
     # key 无 user_id, 但 /key/list 记录了 created_by → 用创建者归属
-    users = {"u-admin": {"email": "admin@example.com", "name": "管理员"}}
+    users = {"u-admin": {"email": "creator@example.com", "name": "管理员"}}
     key_map = {"tok-代建key": {"user_id": None, "team_id": None, "key_alias": "代建key",
                               "user_email": None, "created_by": "u-admin",
                               "expires": "2027-01-01"}}
     rows, *_ = L.build_rows([_activity("代建key")], key_map, users, "", {})
-    assert "admin@example.com" in _lifetime_emails(rows)
+    assert "creator@example.com" in _lifetime_emails(rows)
 
 
 def test_owner_override_map_pins_email(L):
