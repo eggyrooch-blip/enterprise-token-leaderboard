@@ -48,6 +48,10 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     assert "-LogonType Group" not in script
     assert "New-ScheduledTaskTrigger -AtLogOn" in script
     assert "New-ScheduledTaskTrigger -Once" in script
+    assert "-RepetitionInterval" in script
+    assert "-RepetitionDuration" in script
+    assert ".Repetition.Interval" not in script
+    assert ".Repetition.Duration" not in script
     assert "-NonInteractive" in script
     assert "-WindowStyle Hidden" in script
     assert ".version" in script

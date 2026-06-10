@@ -81,9 +81,9 @@ try {
     $actionArg = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -ConfigPath `"$configPath`" -Via mdm"
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $actionArg
     $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
-    $hourlyTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
-    $hourlyTrigger.Repetition.Interval = "PT1H"
-    $hourlyTrigger.Repetition.Duration = "P9999D"
+    $hourlyTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+        -RepetitionInterval (New-TimeSpan -Hours 1) `
+        -RepetitionDuration (New-TimeSpan -Days 9999)
     $principal = New-ScheduledTaskPrincipal -GroupId "S-1-5-32-545" -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
         -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
