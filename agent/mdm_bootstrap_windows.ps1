@@ -1,7 +1,7 @@
 param(
     [string]$Collector = $env:COLLECTOR,
     [string]$Token = $env:TOKEN,
-    [int]$Version = 2,
+    [int]$Version = 3,
     [string]$InstallDir = (Join-Path $env:ProgramData "TokReport"),
     [string]$TaskName = "TokReport"
 )
