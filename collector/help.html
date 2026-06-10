@@ -90,8 +90,8 @@
       <div class="srcs">
         <div class="src">
           <div class="top"><span class="dot" style="background:#24C789"></span><span class="nm">订阅制 · 本地工具</span></div>
-          <div class="desc">Claude Code / Codex CLI / Gemini CLI / Kimi / OpenCode 等。由MDM 下发采集脚本（tokscale）读取你 Mac 上的本地用量日志后上报。</div>
-          <span class="freq"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>MDM 下发 · 每日 19:00 兜底</span>
+          <div class="desc">Claude Code / Codex CLI / Gemini CLI / Kimi / OpenCode 等。由MDM 按系统分别下发 macOS LaunchAgent 或 Windows Task Scheduler 采集脚本，读取本机本用户的聚合用量后上报。</div>
+          <span class="freq"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>MDM 下发 · Scheduled Task / LaunchAgent</span>
         </div>
         <div class="src">
           <div class="top"><span class="dot" style="background:#FFB15A"></span><span class="nm">LiteLLM 网关 · API</span></div>
@@ -118,7 +118,7 @@
         <table class="tb">
           <thead><tr><th>来源</th><th>更新周期</th><th>说明</th></tr></thead>
           <tbody>
-            <tr><td class="src-cell">订阅制（本地工具）</td><td><span class="big">MDM下发</span></td><td>IT 通过MDM 批量执行采集脚本；装了常驻 agent 的机器每天 19:00 自动跑一次</td></tr>
+            <tr><td class="src-cell">订阅制（本地工具）</td><td><span class="big">MDM下发</span></td><td>macOS 使用 <code>agent/mdm_bootstrap.sh</code> + <code>tokreport.sh</code>；Windows 使用 <code>mdm_bootstrap_windows.ps1</code> + <code>tokreport.ps1</code>，两套推送脚本分开维护</td></tr>
             <tr><td class="src-cell">LiteLLM 网关</td><td><span class="big">每整点</span></td><td>服务端定时任务，停机期间漏掉的会自动补</td></tr>
             <tr><td class="src-cell">Cursor</td><td><span class="big">每 2 小时</span></td><td>滚动近 30 天窗口</td></tr>
             <tr><td class="src-cell">看板页面本身</td><td><span class="big">30 秒</span></td><td>前端自动刷新，无需手动 F5</td></tr>
@@ -136,7 +136,7 @@
         <div class="step">
           <div class="i">1</div>
           <div class="bd">
-            <div class="bt">打开「终端」(Terminal)，粘贴并回车</div>
+            <div class="bt">macOS 打开「终端」(Terminal)，粘贴并回车</div>
             <div class="bs">脚本会按你 Mac 的序列号自动认出你是谁，无需填邮箱、部门。需要输入一次开机密码（sudo）。</div>
             <div class="code"><button class="cp" data-cp="curl -fsSL https://collector.example.com/tokreport.sh -o /tmp/tokreport.sh && sudo bash /tmp/tokreport.sh manual">复制</button><code>curl -fsSL https://collector.example.com/tokreport.sh -o /tmp/tokreport.sh && sudo bash /tmp/tokreport.sh manual</code></div>
           </div>
@@ -144,12 +144,20 @@
         <div class="step">
           <div class="i">2</div>
           <div class="bd">
+            <div class="bt">Windows 打开 PowerShell，使用 IT 提供的 token 补报</div>
+            <div class="bs">Windows 的常驻任务由独立 Scheduled Task 安装；手工补报用 <code style="font-family:monospace">tokreport.ps1</code>，同样只上传聚合 token 计数。</div>
+            <div class="code"><button class="cp" data-cp="powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;Invoke-WebRequest -UseBasicParsing https://collector.example.com/tokreport.ps1 -OutFile $env:TEMP\tokreport.ps1; &amp; $env:TEMP\tokreport.ps1 -Collector https://collector.example.com -Token &lt;token&gt; -Via manual&quot;">复制</button><code>powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -UseBasicParsing https://collector.example.com/tokreport.ps1 -OutFile $env:TEMP\tokreport.ps1; &amp; $env:TEMP\tokreport.ps1 -Collector https://collector.example.com -Token &lt;token&gt; -Via manual"</code></div>
+          </div>
+        </div>
+        <div class="step">
+          <div class="i">3</div>
+          <div class="bd">
             <div class="bt">看到 <code style="font-family:monospace">tokreport OK</code> 即上报成功</div>
             <div class="bs">如果提示没装 tokscale，脚本会自动用 npx 临时拉起，首次可能多等十几秒。整段最多跑 3 分钟会自动结束，不会卡住。</div>
           </div>
         </div>
         <div class="step">
-          <div class="i">3</div>
+          <div class="i">4</div>
           <div class="bd">
             <div class="bt">回到看板刷新，在「个人榜」找自己</div>
             <div class="bs">前端每 30 秒自动刷新；也可直接 <a href="/" style="color:#10805a">返回看板</a>。仍然没有？大概率是这台机器在MDM里序列号没登记或归属人是空，把序列号发给 IT 核对。</div>

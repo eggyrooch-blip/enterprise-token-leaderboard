@@ -35,7 +35,7 @@ COLLECTOR_URL=http://localhost:8088 COLLECTOR_TOKEN=devtoken python3 seed_demo.p
 ## 企业接入步骤
 
 1. 部署 collector 到内网地址，例如 `https://collector.example.com`。
-2. 下发 agent 安装脚本，配置 `COLLECTOR_URL` 与 `COLLECTOR_TOKEN`。
+2. 下发 agent 安装脚本，按系统使用独立入口：macOS 用 `agent/mdm_bootstrap.sh`（LaunchAgent + `/tokreport.sh`），Windows 用 `agent/mdm_bootstrap_windows.ps1 -Collector https://<collector> -Token <token>`（Task Scheduler / Scheduled Task + `/tokreport.ps1`）。
 3. 选择身份来源：配置文件、git email、SSO、MDM 设备清单或自定义 `device_identity` 表。
 4. 可选接入 LiteLLM、Cursor Admin API、CI/CD、事故系统与审计日志，补齐治理指标。
 5. 上线前完成员工告知、安全/法务审阅、保留期配置和访问控制。

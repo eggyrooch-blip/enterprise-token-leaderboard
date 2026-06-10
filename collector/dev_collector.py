@@ -486,6 +486,21 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_repo_file(self, relpath, content_type):
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        p = os.path.normpath(os.path.join(base, relpath))
+        if not p.startswith(base + os.sep):
+            return self._send(403, {"error": "forbidden"})
+        try:
+            body = open(p, "rb").read()
+        except OSError:
+            return self._send(404, {"error": relpath + " not found"})
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _dashboard(self):
         """提供中性企业实时看板(同目录 dashboard.html,前端 fetch /v1/* 同源)。"""
         self._send_local("dashboard.html", "text/html;charset=utf-8")
@@ -498,6 +513,12 @@ class H(BaseHTTPRequestHandler):
         """手工补报脚本(与飞连 MDM 下发的同一份)。员工 `sudo bash` 运行即可，
         按序列号经飞连反解身份，机器侧零配置。仅内网可达。"""
         self._send_local("tokreport.sh", "text/x-shellscript;charset=utf-8")
+
+    def _tokreport_ps1(self):
+        """Windows 手工补报脚本。MDM 使用独立的 mdm_bootstrap_windows.ps1；
+        这里仅提供它下载/手工补报用的 reporter 源码。"""
+        self._send_repo_file(os.path.join("agent", "tokreport_windows.ps1"),
+                             "text/plain;charset=utf-8")
 
     _CT = {".otf": "font/otf", ".woff2": "font/woff2", ".woff": "font/woff",
            ".ttf": "font/ttf", ".css": "text/css;charset=utf-8", ".svg": "image/svg+xml",
@@ -638,6 +659,8 @@ class H(BaseHTTPRequestHandler):
             return self._help()
         if path == "/tokreport.sh":
             return self._tokreport_sh()
+        if path == "/tokreport.ps1":
+            return self._tokreport_ps1()
         if path.startswith("/assets/"):
             return self._static(path[len("/assets/"):])
 

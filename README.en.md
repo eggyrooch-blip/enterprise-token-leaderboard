@@ -154,7 +154,21 @@ offline catch-up and reruns never double-count.
 
 ## 📦 Rolling out the client (pick one — no MDM required)
 
-**A. With MDM** (root, device-pushed identity, most robust)
+**A. With MDM** (separate push script per OS, most robust)
+
+macOS standalone entrypoint (LaunchAgent, downloads `/tokreport.sh`):
+
+```bash
+COLLECTOR=https://<collector> bash agent/mdm_bootstrap.sh
+```
+
+Windows standalone entrypoint (Task Scheduler / Scheduled Task, downloads `/tokreport.ps1`):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File agent/mdm_bootstrap_windows.ps1 -Collector https://<collector> -Token <token>
+```
+
+For an offline macOS package, you can still use:
 
 ```bash
 agent/package_mdm.sh ./tokscale https://<collector> <token> ./dist

@@ -139,7 +139,21 @@ flowchart LR
 
 ## 📦 下发客户端（三选一，不绑定 MDM）
 
-**A. 有 MDM**（root，按设备下发身份，最稳）
+**A. 有 MDM**（按系统分开推送脚本，最稳）
+
+macOS 独立入口（LaunchAgent，下载 `/tokreport.sh`）：
+
+```bash
+COLLECTOR=https://<collector> bash agent/mdm_bootstrap.sh
+```
+
+Windows 独立入口（Task Scheduler / Scheduled Task，下载 `/tokreport.ps1`）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File agent/mdm_bootstrap_windows.ps1 -Collector https://<collector> -Token <token>
+```
+
+如需离线包，macOS 仍可使用：
 
 ```bash
 agent/package_mdm.sh ./tokscale https://<collector> <token> ./dist
