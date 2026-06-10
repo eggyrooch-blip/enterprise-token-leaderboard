@@ -37,6 +37,14 @@ def test_windows_reporter_collects_serial_and_posts_existing_tokscale_payload():
     assert "Rename-Computer" not in script
 
 
+def test_windows_reporter_writes_programdata_log_for_mdm_debugging():
+    script = REPORTER.read_text(encoding="utf-8")
+
+    assert "tokreport.log" in script
+    assert "Add-Content -LiteralPath $LogPath" in script
+    assert "New-Item -ItemType Directory -Path $LogDir" in script
+
+
 def test_windows_reporter_avoids_invalid_variable_colon_interpolation():
     script = REPORTER.read_text(encoding="utf-8")
     scoped = {"env", "script", "global", "local", "private", "using"}
@@ -53,7 +61,7 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     script = BOOTSTRAP.read_text(encoding="utf-8")
 
     assert "$env:ProgramData" in script
-    assert "[int]$Version = 3" in script
+    assert "[int]$Version = 4" in script
     assert "tokreport.ps1" in script
     assert "/tokreport.ps1" in script
     assert "Register-ScheduledTask" in script
@@ -88,6 +96,8 @@ def test_windows_bootstrap_logs_scheduled_task_diagnostics_after_start():
     script = BOOTSTRAP.read_text(encoding="utf-8")
 
     assert "Get-ScheduledTaskInfo -TaskName $TaskName" in script
+    assert "tokreport.log" in script
+    assert "Get-Content -LiteralPath $logPath -Tail" in script
     assert "LastRunTime" in script
     assert "LastTaskResult" in script
     assert "State" in script

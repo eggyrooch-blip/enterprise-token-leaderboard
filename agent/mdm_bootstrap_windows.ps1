@@ -1,7 +1,7 @@
 param(
     [string]$Collector = $env:COLLECTOR,
     [string]$Token = $env:TOKEN,
-    [int]$Version = 3,
+    [int]$Version = 4,
     [string]$InstallDir = (Join-Path $env:ProgramData "TokReport"),
     [string]$TaskName = "TokReport"
 )
@@ -32,6 +32,14 @@ function Log-TaskInfo {
         $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
         $state = if ($taskNow) { [string]$taskNow.State } else { "unknown" }
         Log "task state=$state lastRunTime=$($info.LastRunTime) lastTaskResult=$($info.LastTaskResult)"
+        $logPath = Join-Path $InstallDir "tokreport.log"
+        if (Test-Path -LiteralPath $logPath) {
+            Log "tokreport.log tail:"
+            Get-Content -LiteralPath $logPath -Tail 40 -Encoding UTF8 |
+                ForEach-Object { Log "  $_" }
+        } else {
+            Log "tokreport.log not found yet"
+        }
     } catch {
         Log "task info unavailable: $($_.Exception.Message)"
     }

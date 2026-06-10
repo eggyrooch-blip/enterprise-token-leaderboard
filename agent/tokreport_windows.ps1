@@ -15,10 +15,17 @@ $ScriptTimeoutSeconds = 600
 $CommandTimeoutSeconds = 180
 $StartedAt = Get-Date
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("tokreport-" + [guid]::NewGuid().ToString("N"))
+$LogDir = Join-Path $env:ProgramData "TokReport"
+$LogPath = Join-Path $LogDir "tokreport.log"
 
 function Log {
     param([string]$Message)
-    Write-Output "[tokreport-windows] $Message"
+    $line = "[tokreport-windows] $((Get-Date).ToString('s')) $Message"
+    Write-Output $line
+    try {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+        Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value $line
+    } catch {}
 }
 
 function Load-Config {
