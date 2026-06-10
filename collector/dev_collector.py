@@ -521,11 +521,20 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        if self.path.startswith("/v1/tokscale/report"):
-            return self._tokscale_report()
-        if self.path.startswith("/v1/feishu/report"):
-            return self._feishu_report()
-        self._send(404, {"error": "not found"})
+        # 加固:任何上报处理异常(尤其是坏 JSON body → json.loads 抛错)都优雅回 400,
+        # 绝不让单个坏 payload 把 handler 线程打挂、连接重置(那样 nginx 会回 502)。
+        try:
+            if self.path.startswith("/v1/tokscale/report"):
+                return self._tokscale_report()
+            if self.path.startswith("/v1/feishu/report"):
+                return self._feishu_report()
+            self._send(404, {"error": "not found"})
+        except Exception as e:
+            sys.stderr.write("do_POST %s error: %s\n" % (self.path, repr(e)[:300]))
+            try:
+                self._send(400, {"ok": False, "error": "bad request", "detail": str(e)[:200]})
+            except Exception:
+                pass
 
     def _feishu_report(self):
         """接收飞书 AI 权益采集器上报(独立三表,单位=点,不并入 token 榜)。

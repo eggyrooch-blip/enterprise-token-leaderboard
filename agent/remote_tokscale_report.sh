@@ -67,14 +67,21 @@ EMAIL=""
 # 会导致没装 tokscale 的机器最终命令找不到、上报 0 条。必须让 npx 直接执行子命令。
 TOKSCALE_CMD='export PATH="$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; if command -v tokscale >/dev/null 2>&1; then TS=tokscale; elif command -v npx >/dev/null 2>&1; then TS="npx -y tokscale@latest"; elif command -v bunx >/dev/null 2>&1; then TS="bunx tokscale@latest"; else TS=""; fi; [ -z "$TS" ] && exit 0; $TS'
 
-# 容错取数：--no-spinner 必带（无 TTY 时 spinner 偶发空输出）；最多重试 3 次；每次限时
-fetch_json() {  # $1 = 子命令 (models|monthly)
-  local out=""
-  local _t
+# 取数临时目录(tokscale 输出落文件,不走管道)。
+TMPD="$(mktemp -d 2>/dev/null || echo "/tmp/tokreport.$$")"
+mkdir -p "$TMPD"
+trap 'kill -9 "$WATCHDOG_PID" 2>/dev/null; rm -rf "$TMPD" 2>/dev/null' EXIT
+
+# 容错取数：tokscale 输出【重定向到文件】而非命令替换捕获 —— tokscale 是 Node/bun CLI,
+# process.exit() 在 stdout 走管道($()/| )时会把没刷完的缓冲砍掉(实测 graph >64KB 正好截到
+# 64KB → 残缺 JSON → collector json.loads 崩 → 502)。写文件不走管道,完整落盘;再用 sed 读文件
+# (sed 是 C 程序,正常 flush,$() 读它不会触发该截断)。--no-spinner 必带;最多重试 3 次。
+fetch_json() {  # $1=子命令(models|monthly) $2=输出文件
+  local out="" _t
   for _t in 1 2 3; do
-    out=$(run_as_user "$TOKSCALE_CMD $1 --json --no-spinner")
+    run_as_user "$TOKSCALE_CMD $1 --json --no-spinner > '$2' 2>/dev/null"
     # 登录 shell 可能在 JSON 前打印 banner，从第一个 '{' 起截取，剔除污染
-    out=$(printf '%s' "$out" | sed -n '/{/,$p')
+    out=$(sed -n '/{/,$p' "$2" 2>/dev/null)
     if [ -n "$out" ] && case "$out" in *'"entries"'*) true;; *) false;; esac; then
       printf '%s' "$out"
       return 0
@@ -85,18 +92,18 @@ fetch_json() {  # $1 = 子命令 (models|monthly)
 }
 
 # 取数串行(不并行):三条 tokscale 调用是扫同一批本地日志的 IO/CPU 密集型,并行只会互相抢
-# IO/CPU 反而不快(实测 97s vs 串行 107s),还会因并发把大 JSON 截断。真正的修复是上面把
-# 看门狗 SCRIPT_TIMEOUT 从 180→600s 留足余量(每条仍有 tmout 120 + curl --max-time 兜底)。
+# IO/CPU 反而不快(实测 97s vs 串行 107s)。看门狗 SCRIPT_TIMEOUT 已 180→600s 留足余量。
 # ── lifetime 快照 + 月度时间序列（两者都是可重复上报的幂等快照）───────────────
-MODELS=$(fetch_json models)
-MONTHLY=$(fetch_json monthly)
+MODELS=$(fetch_json models "$TMPD/models")
+MONTHLY=$(fetch_json monthly "$TMPD/monthly")
 
 # ── 日粒度(tokscale graph)：支持按区间(1/2/3周)看榜。只取近 100 天,够覆盖 3 周区间。──
+# 同样落文件再读 —— graph 体积最大(可达近百 KB),正是 Node 管道截断的重灾区。
 SINCE=$(date -v-100d +%Y-%m-%d 2>/dev/null || date -d '100 days ago' +%Y-%m-%d 2>/dev/null)
 GRAPH='{"contributions":[]}'
 for _t in 1 2 3; do
-  _g=$(run_as_user "$TOKSCALE_CMD graph --since $SINCE")
-  _g=$(printf '%s' "$_g" | sed -n '/{/,$p')
+  run_as_user "$TOKSCALE_CMD graph --since $SINCE > '$TMPD/graph' 2>/dev/null"
+  _g=$(sed -n '/{/,$p' "$TMPD/graph" 2>/dev/null)
   if [ -n "$_g" ] && case "$_g" in *'"contributions"'*) true;; *) false;; esac; then GRAPH="$_g"; break; fi
   sleep 2
 done
