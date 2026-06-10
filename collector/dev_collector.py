@@ -486,15 +486,15 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_repo_file(self, relpath, content_type):
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        p = os.path.normpath(os.path.join(base, relpath))
-        if not p.startswith(base + os.sep):
-            return self._send(403, {"error": "forbidden"})
+    def _send_script_file(self, local_name, fallback_relpath, content_type):
+        here = os.path.dirname(os.path.abspath(__file__))
+        local = os.path.join(here, local_name)
+        repo = os.path.normpath(os.path.join(os.path.dirname(here), fallback_relpath))
+        p = local if os.path.exists(local) else repo
         try:
             body = open(p, "rb").read()
         except OSError:
-            return self._send(404, {"error": relpath + " not found"})
+            return self._send(404, {"error": local_name + " not found"})
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -512,13 +512,14 @@ class H(BaseHTTPRequestHandler):
     def _tokreport_sh(self):
         """手工补报脚本(与飞连 MDM 下发的同一份)。员工 `sudo bash` 运行即可，
         按序列号经飞连反解身份，机器侧零配置。仅内网可达。"""
-        self._send_local("tokreport.sh", "text/x-shellscript;charset=utf-8")
+        self._send_script_file("tokreport.sh", os.path.join("agent", "remote_tokscale_report.sh"),
+                               "text/x-shellscript;charset=utf-8")
 
     def _tokreport_ps1(self):
         """Windows 手工补报脚本。MDM 使用独立的 mdm_bootstrap_windows.ps1；
         这里仅提供它下载/手工补报用的 reporter 源码。"""
-        self._send_repo_file(os.path.join("agent", "tokreport_windows.ps1"),
-                             "text/plain;charset=utf-8")
+        self._send_script_file("tokreport.ps1", os.path.join("agent", "tokreport_windows.ps1"),
+                               "text/plain;charset=utf-8")
 
     _CT = {".otf": "font/otf", ".woff2": "font/woff2", ".woff": "font/woff",
            ".ttf": "font/ttf", ".css": "text/css;charset=utf-8", ".svg": "image/svg+xml",

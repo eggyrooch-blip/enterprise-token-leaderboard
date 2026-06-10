@@ -84,7 +84,7 @@ try {
     $hourlyTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
     $hourlyTrigger.Repetition.Interval = "PT1H"
     $hourlyTrigger.Repetition.Duration = "P9999D"
-    $principal = New-ScheduledTaskPrincipal -GroupId "S-1-5-32-545" -LogonType Group -RunLevel Limited
+    $principal = New-ScheduledTaskPrincipal -GroupId "S-1-5-32-545" -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
         -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
         -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries

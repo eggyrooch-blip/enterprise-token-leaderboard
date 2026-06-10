@@ -17,7 +17,7 @@
 
 Add tests that assert:
 - `agent/tokreport_windows.ps1` exists and contains `/v1/tokscale/report`, `Get-CimInstance Win32_BIOS`, `Win32_BaseBoard`, `npx -y tokscale@latest`, `bunx tokscale@latest`, and no `Rename-Computer`.
-- `agent/mdm_bootstrap_windows.ps1` exists and contains `Register-ScheduledTask`, `New-ScheduledTaskPrincipal`, `-GroupId`, `-LogonType Group`, `%ProgramData%` equivalent path, version gate, and `/tokreport.ps1` download validation.
+- `agent/mdm_bootstrap_windows.ps1` exists and contains `Register-ScheduledTask`, `New-ScheduledTaskPrincipal`, `-GroupId`, `%ProgramData%` equivalent path, version gate, and `/tokreport.ps1` download validation.
 - macOS `agent/mdm_bootstrap.sh` remains separate and does not contain Windows Task Scheduler code.
 - `collector/dev_collector.py` serves `/tokreport.ps1`.
 - README/help/architecture docs mention separate macOS and Windows MDM entrypoints.

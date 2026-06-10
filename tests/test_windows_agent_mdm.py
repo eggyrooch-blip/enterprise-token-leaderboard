@@ -6,6 +6,7 @@ REPORTER = ROOT / "agent" / "tokreport_windows.ps1"
 BOOTSTRAP = ROOT / "agent" / "mdm_bootstrap_windows.ps1"
 MAC_BOOTSTRAP = ROOT / "agent" / "mdm_bootstrap.sh"
 COLLECTOR = ROOT / "collector" / "dev_collector.py"
+DEPLOY = ROOT / "deploy" / "deploy.sh"
 README = ROOT / "README.md"
 README_EN = ROOT / "README.en.md"
 ARCHITECTURE = ROOT / "ARCHITECTURE.md"
@@ -38,7 +39,7 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     assert "Register-ScheduledTask" in script
     assert "New-ScheduledTaskPrincipal" in script
     assert "-GroupId" in script
-    assert "-LogonType Group" in script
+    assert "-LogonType Group" not in script
     assert "New-ScheduledTaskTrigger -AtLogOn" in script
     assert "New-ScheduledTaskTrigger -Once" in script
     assert ".version" in script
@@ -58,10 +59,19 @@ def test_macos_bootstrap_remains_separate_from_windows_push_script():
 def test_collector_serves_windows_reporter_next_to_macos_reporter():
     source = COLLECTOR.read_text(encoding="utf-8")
 
-    assert 'self._send_local("tokreport.sh"' in source
+    assert "remote_tokscale_report.sh" in source
     assert "tokreport_windows.ps1" in source
     assert 'path == "/tokreport.sh"' in source
     assert 'path == "/tokreport.ps1"' in source
+
+
+def test_deploy_syncs_reporter_scripts_needed_by_static_routes():
+    script = DEPLOY.read_text(encoding="utf-8")
+
+    assert "agent/remote_tokscale_report.sh" in script
+    assert "tokreport.sh" in script
+    assert "agent/tokreport_windows.ps1" in script
+    assert "tokreport.ps1" in script
 
 
 def test_docs_describe_separate_windows_mdm_without_removing_macos_path():

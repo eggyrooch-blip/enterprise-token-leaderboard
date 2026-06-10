@@ -38,6 +38,8 @@ cd "$REPO_ROOT"
 [[ -f "$LOCAL_ENV" ]] || die "凭证文件 '$LOCAL_ENV' 不存在。请先复制 deploy/.env.example 并填写真实值。"
 [[ -f "collector/dev_collector.py" ]] || die "collector/dev_collector.py 不存在，请确认 repo 结构。"
 [[ -f "collector/feilian_client.py" ]] || die "collector/feilian_client.py 不存在。"
+[[ -f "agent/remote_tokscale_report.sh" ]] || die "agent/remote_tokscale_report.sh 不存在。"
+[[ -f "agent/tokreport_windows.ps1" ]] || die "agent/tokreport_windows.ps1 不存在。"
 command -v rsync >/dev/null 2>&1 || die "本机未安装 rsync。"
 
 info "目标: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}  port=${PORT}"
@@ -56,6 +58,16 @@ rsync -az \
     collector/litellm_collector.py \
     collector/dashboard.html \
     "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
+
+info "[2b/6] rsync reporter scripts → 远端 (/tokreport.sh, /tokreport.ps1)"
+rsync -az \
+    -e "ssh $SSH_OPTS" \
+    agent/remote_tokscale_report.sh \
+    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/tokreport.sh"
+rsync -az \
+    -e "ssh $SSH_OPTS" \
+    agent/tokreport_windows.ps1 \
+    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/tokreport.ps1"
 
 # ── 3. 上传 env 文件（含真实凭证，走加密 ssh 通道，不经明文） ──────
 info "[3/5] 上传凭证 env 文件 → 远端 ${REMOTE_DIR}/.env"
