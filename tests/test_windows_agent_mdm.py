@@ -1,4 +1,5 @@
 import pathlib
+import re
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -34,6 +35,18 @@ def test_windows_reporter_collects_serial_and_posts_existing_tokscale_payload():
     assert '"/s"' not in script
     assert "powershell.exe" in script
     assert "Rename-Computer" not in script
+
+
+def test_windows_reporter_avoids_invalid_variable_colon_interpolation():
+    script = REPORTER.read_text(encoding="utf-8")
+    scoped = {"env", "script", "global", "local", "private", "using"}
+    invalid = [
+        match.group(0)
+        for match in re.finditer(r"\$([A-Za-z_][A-Za-z0-9_]*):", script)
+        if match.group(1) not in scoped
+    ]
+
+    assert invalid == []
 
 
 def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():

@@ -217,7 +217,7 @@ function Invoke-TokscaleJson {
                 return $json
             }
         } catch {
-            Log "$Display failed on try $try: $($_.Exception.Message)"
+            Log "$Display failed on try $($try): $($_.Exception.Message)"
         }
         Start-Sleep -Seconds 2
     }
