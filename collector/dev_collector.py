@@ -160,8 +160,11 @@ def db():
     # 可被伪造/出人为坏数据的来源(LiteLLM/Cursor 是服务端拉,无客户端输入),
     # 故留痕用于回溯 + 给看板打「手工」角标。INSERT OR REPLACE 只保最近一次。
     c.execute("""CREATE TABLE IF NOT EXISTS report_log(
-        serial TEXT PRIMARY KEY, email TEXT, hostname TEXT, ip TEXT,
+        serial TEXT PRIMARY KEY, email TEXT, hostname TEXT, os TEXT, ip TEXT,
         via TEXT NOT NULL DEFAULT 'mdm', reported_at TEXT)""")
+    _report_log_cols = {r[1] for r in c.execute("PRAGMA table_info(report_log)").fetchall()}
+    if "os" not in _report_log_cols:
+        c.execute("ALTER TABLE report_log ADD COLUMN os TEXT")
     c.execute("CREATE INDEX IF NOT EXISTS idx_report_log_email ON report_log(email)")
     # 离职名单:被标记离职的 email。所有「按人」聚合(个人榜/Cursor/部门榜)默认
     # 排除这些人(token 与人数都剔除);仅 ?show_departed=1 时才纳入。手工维护。
@@ -663,9 +666,9 @@ class H(BaseHTTPRequestHandler):
              ident.get("avatar") or "", dept))
         # 上报审计:记这台机器最近一次上报的来源/主机/IP/时间(回溯坏数据用)
         conn.execute(
-            "INSERT OR REPLACE INTO report_log(serial,email,hostname,ip,via,reported_at)"
-            " VALUES(?,?,?,?,?,?)",
-            (serial, email, p.get("hostname") or "", p.get("ip") or "", via,
+            "INSERT OR REPLACE INTO report_log(serial,email,hostname,os,ip,via,reported_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (serial, email, p.get("hostname") or "", p.get("os") or "", p.get("ip") or "", via,
              datetime.datetime.now().isoformat(timespec="seconds")))
         conn.commit()
         conn.close()
