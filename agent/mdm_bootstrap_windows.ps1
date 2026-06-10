@@ -51,7 +51,12 @@ try {
         ((Get-Content -LiteralPath $versionPath -Raw).Trim() -eq [string]$Version) -and
         (Test-Path -LiteralPath $scriptPath) -and
         $task) {
-        Log "already v$Version and Scheduled Task exists; no-op"
+        try {
+            Start-ScheduledTask -TaskName $TaskName
+            Log "already v$Version and Scheduled Task exists; started existing Scheduled Task"
+        } catch {
+            Log "already v$Version and Scheduled Task exists; immediate start skipped: $($_.Exception.Message)"
+        }
         exit 0
     }
 

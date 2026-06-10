@@ -60,6 +60,17 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     assert "LaunchAgent" not in script
 
 
+def test_windows_bootstrap_starts_existing_task_when_already_current():
+    script = BOOTSTRAP.read_text(encoding="utf-8")
+    already_current_block = script[
+        script.index("if ((Test-Path -LiteralPath $versionPath)") :
+        script.index("$fresh = $false")
+    ]
+
+    assert "Start-ScheduledTask -TaskName $TaskName" in already_current_block
+    assert "started existing Scheduled Task" in already_current_block
+
+
 def test_macos_bootstrap_remains_separate_from_windows_push_script():
     script = MAC_BOOTSTRAP.read_text(encoding="utf-8")
 
