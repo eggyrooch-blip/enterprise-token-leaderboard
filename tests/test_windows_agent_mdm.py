@@ -27,6 +27,8 @@ def test_windows_reporter_collects_serial_and_posts_existing_tokscale_payload():
     assert "graph --since" in script
     assert "npx -y tokscale@latest" in script
     assert "bunx tokscale@latest" in script
+    assert ".cmd" in script
+    assert "$env:ComSpec" in script
     assert "Rename-Computer" not in script
 
 

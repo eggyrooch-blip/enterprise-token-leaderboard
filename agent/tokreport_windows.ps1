@@ -144,6 +144,34 @@ function Read-CleanJson {
     return ""
 }
 
+function Quote-CmdArg {
+    param([string]$Arg)
+    if ($Arg -notmatch '[\s&()^=;!+,`~\[\]{}]') {
+        return $Arg
+    }
+    return '"' + ($Arg -replace '"', '\"') + '"'
+}
+
+function Start-CapturedProcess {
+    param(
+        [string]$File,
+        [string[]]$Arguments,
+        [string]$OutPath,
+        [string]$ErrPath
+    )
+    $ext = [System.IO.Path]::GetExtension($File).ToLowerInvariant()
+    if (@(".cmd", ".bat") -contains $ext) {
+        $cmdExe = if ($env:ComSpec) { $env:ComSpec } else { "cmd.exe" }
+        $cmdLine = (Quote-CmdArg $File) + " " + (($Arguments | ForEach-Object { Quote-CmdArg $_ }) -join " ")
+        return Start-Process -FilePath $cmdExe -ArgumentList @("/d", "/s", "/c", $cmdLine) `
+            -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath `
+            -NoNewWindow -PassThru
+    }
+    return Start-Process -FilePath $File -ArgumentList $Arguments `
+        -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath `
+        -NoNewWindow -PassThru
+}
+
 function Invoke-TokscaleJson {
     param(
         [string]$Display,
@@ -167,9 +195,7 @@ function Invoke-TokscaleJson {
         $err = Join-Path $TmpDir ("tokscale-$($Display.Split(' ')[0])-$try.err")
         $allArgs = @($spec.Prefix) + $Arguments
         try {
-            $p = Start-Process -FilePath $spec.File -ArgumentList $allArgs `
-                -RedirectStandardOutput $out -RedirectStandardError $err `
-                -NoNewWindow -PassThru
+            $p = Start-CapturedProcess -File $spec.File -Arguments $allArgs -OutPath $out -ErrPath $err
             if (-not $p.WaitForExit($CommandTimeoutSeconds * 1000)) {
                 try { $p.Kill() } catch {}
                 Log "$Display timed out on try $try"
