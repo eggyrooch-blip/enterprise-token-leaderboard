@@ -42,6 +42,8 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     assert "-LogonType Group" not in script
     assert "New-ScheduledTaskTrigger -AtLogOn" in script
     assert "New-ScheduledTaskTrigger -Once" in script
+    assert "-NonInteractive" in script
+    assert "-WindowStyle Hidden" in script
     assert ".version" in script
     assert "v1/tokscale/report" in script
     assert "LaunchAgent" not in script

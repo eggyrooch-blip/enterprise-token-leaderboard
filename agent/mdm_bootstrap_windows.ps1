@@ -78,7 +78,7 @@ try {
         exit 0
     }
 
-    $actionArg = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -ConfigPath `"$configPath`" -Via mdm"
+    $actionArg = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -ConfigPath `"$configPath`" -Via mdm"
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $actionArg
     $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
     $hourlyTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
