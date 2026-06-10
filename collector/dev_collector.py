@@ -521,18 +521,25 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        # 加固:任何上报处理异常(尤其是坏 JSON body → json.loads 抛错)都优雅回 400,
-        # 绝不让单个坏 payload 把 handler 线程打挂、连接重置(那样 nginx 会回 502)。
+        # 加固:绝不让单个上报异常把 handler 线程打挂、连接重置(那样 nginx 回 502)。
+        # 坏 JSON body(json.loads 抛 ValueError/JSONDecodeError)→ 400 客户端错误;
+        # 其它异常(DB/服务端 bug)→ 500,保留运维信号、不被误判成客户端问题。
         try:
             if self.path.startswith("/v1/tokscale/report"):
                 return self._tokscale_report()
             if self.path.startswith("/v1/feishu/report"):
                 return self._feishu_report()
             self._send(404, {"error": "not found"})
-        except Exception as e:
-            sys.stderr.write("do_POST %s error: %s\n" % (self.path, repr(e)[:300]))
+        except ValueError as e:   # json.JSONDecodeError 是 ValueError 子类
+            sys.stderr.write("do_POST %s bad-json: %s\n" % (self.path, repr(e)[:300]))
             try:
                 self._send(400, {"ok": False, "error": "bad request", "detail": str(e)[:200]})
+            except Exception:
+                pass
+        except Exception as e:
+            sys.stderr.write("do_POST %s server-error: %s\n" % (self.path, repr(e)[:300]))
+            try:
+                self._send(500, {"ok": False, "error": "internal error"})
             except Exception:
                 pass
 

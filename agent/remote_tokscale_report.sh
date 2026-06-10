@@ -70,6 +70,12 @@ TOKSCALE_CMD='export PATH="$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.local/bin
 # 取数临时目录(tokscale 输出落文件,不走管道)。
 TMPD="$(mktemp -d 2>/dev/null || echo "/tmp/tokreport.$$")"
 mkdir -p "$TMPD"
+# 关键:以 root 运行时,run_as_user 会 sudo -u CONSOLE_USER 跑 tokscale,其 '> 文件' 重定向以
+# 该普通用户身份执行;而 mktemp -d 建的是 root-owned 0700 目录,普通用户写不进去会静默丢数据。
+# 故 root 路径下把临时目录 chown 给 CONSOLE_USER。普通用户直接运行时(else 分支)本就可写,无需 chown。
+if [ "$(id -u)" -eq 0 ] && [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" != "unknown" ]; then
+  chown "$CONSOLE_USER" "$TMPD" 2>/dev/null
+fi
 trap 'kill -9 "$WATCHDOG_PID" 2>/dev/null; rm -rf "$TMPD" 2>/dev/null' EXIT
 
 # 容错取数：tokscale 输出【重定向到文件】而非命令替换捕获 —— tokscale 是 Node/bun CLI,
