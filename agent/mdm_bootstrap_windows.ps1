@@ -25,6 +25,18 @@ function Get-TaskIfExists {
     }
 }
 
+function Log-TaskInfo {
+    try {
+        Start-Sleep -Seconds 5
+        $taskNow = Get-TaskIfExists
+        $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
+        $state = if ($taskNow) { [string]$taskNow.State } else { "unknown" }
+        Log "task state=$state lastRunTime=$($info.LastRunTime) lastTaskResult=$($info.LastTaskResult)"
+    } catch {
+        Log "task info unavailable: $($_.Exception.Message)"
+    }
+}
+
 try {
     if ([string]::IsNullOrWhiteSpace($Collector) -or $Collector -like "*example.com*") {
         Log "COLLECTOR is required; pass -Collector https://<collector>"
@@ -57,6 +69,7 @@ try {
         } catch {
             Log "already v$Version and Scheduled Task exists; immediate start skipped: $($_.Exception.Message)"
         }
+        Log-TaskInfo
         exit 0
     }
 
@@ -103,6 +116,7 @@ try {
     } catch {
         Log "task registered; immediate start skipped: $($_.Exception.Message)"
     }
+    Log-TaskInfo
 
     if ($fresh) {
         Set-Content -LiteralPath $versionPath -Encoding ASCII -Value ([string]$Version)

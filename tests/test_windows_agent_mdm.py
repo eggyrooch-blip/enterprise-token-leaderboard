@@ -71,6 +71,16 @@ def test_windows_bootstrap_starts_existing_task_when_already_current():
     assert "started existing Scheduled Task" in already_current_block
 
 
+def test_windows_bootstrap_logs_scheduled_task_diagnostics_after_start():
+    script = BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert "Get-ScheduledTaskInfo -TaskName $TaskName" in script
+    assert "LastRunTime" in script
+    assert "LastTaskResult" in script
+    assert "State" in script
+    assert "task info unavailable" in script
+
+
 def test_macos_bootstrap_remains_separate_from_windows_push_script():
     script = MAC_BOOTSTRAP.read_text(encoding="utf-8")
 
