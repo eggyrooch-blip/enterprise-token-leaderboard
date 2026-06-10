@@ -16,7 +16,7 @@
 
 # ── 整体超时保护（防止 npx/tokscale 卡住拖死 MDM/SSH 连接）──────────────────
 # 关键：后台看门狗的 FD 全部重定向到 /dev/null，否则残留进程会让 MDM 连接挂起
-SCRIPT_TIMEOUT=180
+SCRIPT_TIMEOUT=600
 ( sleep "$SCRIPT_TIMEOUT" && kill -9 $$ 2>/dev/null ) </dev/null >/dev/null 2>&1 &
 WATCHDOG_PID=$!
 trap 'kill -9 "$WATCHDOG_PID" 2>/dev/null' EXIT
@@ -84,6 +84,9 @@ fetch_json() {  # $1 = 子命令 (models|monthly)
   printf '{"entries":[]}'
 }
 
+# 取数串行(不并行):三条 tokscale 调用是扫同一批本地日志的 IO/CPU 密集型,并行只会互相抢
+# IO/CPU 反而不快(实测 97s vs 串行 107s),还会因并发把大 JSON 截断。真正的修复是上面把
+# 看门狗 SCRIPT_TIMEOUT 从 180→600s 留足余量(每条仍有 tmout 120 + curl --max-time 兜底)。
 # ── lifetime 快照 + 月度时间序列（两者都是可重复上报的幂等快照）───────────────
 MODELS=$(fetch_json models)
 MONTHLY=$(fetch_json monthly)

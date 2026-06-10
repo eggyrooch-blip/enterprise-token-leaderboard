@@ -14,7 +14,7 @@
 # ============================================================
 set -u
 
-VERSION=4                                  # 改采集逻辑/计划时 +1，触发员工机平滑更新
+VERSION=5                                  # 改采集逻辑/计划时 +1，触发员工机平滑更新
 LABEL="com.example.tokreport"
 COLLECTOR="${COLLECTOR:-https://collector.example.com}"  # collector endpoint
 LIB="${TOKREPORT_LIB:-/usr/local/lib/tokreport}"   # 可覆盖(测试用);生产默认不变
