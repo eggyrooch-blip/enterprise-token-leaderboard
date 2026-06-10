@@ -30,6 +30,8 @@ def test_windows_reporter_collects_serial_and_posts_existing_tokscale_payload():
     assert ".cmd" in script
     assert ".ps1" in script
     assert "$env:ComSpec" in script
+    assert '@("/d", "/c", $cmdLine)' in script
+    assert '"/s"' not in script
     assert "powershell.exe" in script
     assert "Rename-Computer" not in script
 
@@ -76,6 +78,7 @@ def test_collector_serves_windows_reporter_next_to_macos_reporter():
 def test_deploy_syncs_reporter_scripts_needed_by_static_routes():
     script = DEPLOY.read_text(encoding="utf-8")
 
+    assert "collector/help.html" in script
     assert "agent/remote_tokscale_report.sh" in script
     assert "agent/tokreport_windows.ps1" in script
     assert "tokreport.ps1" in script

@@ -149,7 +149,7 @@ function Quote-CmdArg {
     if ($Arg -notmatch '[\s&()^=;!+,`~\[\]{}]') {
         return $Arg
     }
-    return '"' + ($Arg -replace '"', '\"') + '"'
+    return '"' + ($Arg -replace '"', '""') + '"'
 }
 
 function Start-CapturedProcess {
@@ -162,8 +162,8 @@ function Start-CapturedProcess {
     $ext = [System.IO.Path]::GetExtension($File).ToLowerInvariant()
     if (@(".cmd", ".bat") -contains $ext) {
         $cmdExe = if ($env:ComSpec) { $env:ComSpec } else { "cmd.exe" }
-        $cmdLine = (Quote-CmdArg $File) + " " + (($Arguments | ForEach-Object { Quote-CmdArg $_ }) -join " ")
-        return Start-Process -FilePath $cmdExe -ArgumentList @("/d", "/s", "/c", $cmdLine) `
+        $cmdLine = '"' + (Quote-CmdArg $File) + " " + (($Arguments | ForEach-Object { Quote-CmdArg $_ }) -join " ") + '"'
+        return Start-Process -FilePath $cmdExe -ArgumentList @("/d", "/c", $cmdLine) `
             -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath `
             -NoNewWindow -PassThru
     }

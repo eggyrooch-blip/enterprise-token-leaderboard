@@ -57,6 +57,7 @@ rsync -az \
     collector/feilian_client.py \
     collector/litellm_collector.py \
     collector/dashboard.html \
+    collector/help.html \
     "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
 
 info "[2b/6] rsync reporter scripts → 远端 (remote_tokscale_report.sh, /tokreport.ps1)"
