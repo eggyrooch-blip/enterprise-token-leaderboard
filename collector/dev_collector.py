@@ -486,20 +486,39 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_script_file(self, local_name, fallback_relpath, content_type):
-        here = os.path.dirname(os.path.abspath(__file__))
-        local = os.path.join(here, local_name)
-        repo = os.path.normpath(os.path.join(os.path.dirname(here), fallback_relpath))
-        p = local if os.path.exists(local) else repo
-        try:
-            body = open(p, "rb").read()
-        except OSError:
-            return self._send(404, {"error": local_name + " not found"})
+    def _send_bytes(self, body, content_type):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_script_file(self, local_name, fallback_relpath):
+        here = os.path.dirname(os.path.abspath(__file__))
+        local = os.path.join(here, local_name)
+        repo = os.path.normpath(os.path.join(os.path.dirname(here), fallback_relpath))
+        p = local if os.path.exists(local) else repo
+        try:
+            return open(p, "rb").read()
+        except OSError:
+            return None
+
+    def _send_script_file(self, local_name, fallback_relpath, content_type):
+        body = self._read_script_file(local_name, fallback_relpath)
+        if body is None:
+            return self._send(404, {"error": local_name + " not found"})
+        self._send_bytes(body, content_type)
+
+    @staticmethod
+    def _shell_dq(value):
+        return str(value).replace("\\", "\\\\").replace("$", "\\$").replace('"', '\\"').replace("`", "\\`")
+
+    def _public_base_url(self):
+        proto = self.headers.get("X-Forwarded-Proto") or "http"
+        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host")
+        if not host:
+            host = "127.0.0.1:%s" % PORT
+        return "%s://%s" % (proto, host)
 
     def _dashboard(self):
         """提供中性企业实时看板(同目录 dashboard.html,前端 fetch /v1/* 同源)。"""
@@ -512,8 +531,21 @@ class H(BaseHTTPRequestHandler):
     def _tokreport_sh(self):
         """手工补报脚本(与飞连 MDM 下发的同一份)。员工 `sudo bash` 运行即可，
         按序列号经飞连反解身份，机器侧零配置。仅内网可达。"""
-        self._send_script_file("tokreport.sh", os.path.join("agent", "remote_tokscale_report.sh"),
-                               "text/x-shellscript;charset=utf-8")
+        body = self._read_script_file("remote_tokscale_report.sh",
+                                      os.path.join("agent", "remote_tokscale_report.sh"))
+        if body is None:
+            return self._send(404, {"error": "tokreport.sh not found"})
+        text = body.decode("utf-8")
+        token = sorted(TOKENS)[0] if TOKENS else ""
+        text = text.replace(
+            'COLLECTOR="${COLLECTOR:-https://collector.example.com}"',
+            'COLLECTOR="${COLLECTOR:-%s}"' % self._shell_dq(self._public_base_url()),
+        )
+        text = text.replace(
+            'TOKEN="${TOKEN:-}"',
+            'TOKEN="${TOKEN:-%s}"' % self._shell_dq(token),
+        )
+        self._send_bytes(text.encode("utf-8"), "text/x-shellscript;charset=utf-8")
 
     def _tokreport_ps1(self):
         """Windows 手工补报脚本。MDM 使用独立的 mdm_bootstrap_windows.ps1；

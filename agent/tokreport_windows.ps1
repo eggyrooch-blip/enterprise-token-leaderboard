@@ -167,6 +167,17 @@ function Start-CapturedProcess {
             -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath `
             -NoNewWindow -PassThru
     }
+    if ($ext -eq ".ps1") {
+        $psExe = "powershell.exe"
+        $found = Get-Command "powershell.exe" -ErrorAction SilentlyContinue
+        if ($found) {
+            $psExe = $found.Source
+        }
+        $psArgs = @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $File) + $Arguments
+        return Start-Process -FilePath $psExe -ArgumentList $psArgs `
+            -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath `
+            -NoNewWindow -PassThru
+    }
     return Start-Process -FilePath $File -ArgumentList $Arguments `
         -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath `
         -NoNewWindow -PassThru

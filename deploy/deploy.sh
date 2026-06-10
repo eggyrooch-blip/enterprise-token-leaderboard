@@ -59,11 +59,11 @@ rsync -az \
     collector/dashboard.html \
     "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
 
-info "[2b/6] rsync reporter scripts → 远端 (/tokreport.sh, /tokreport.ps1)"
+info "[2b/6] rsync reporter scripts → 远端 (remote_tokscale_report.sh, /tokreport.ps1)"
 rsync -az \
     -e "ssh $SSH_OPTS" \
     agent/remote_tokscale_report.sh \
-    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/tokreport.sh"
+    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/remote_tokscale_report.sh"
 rsync -az \
     -e "ssh $SSH_OPTS" \
     agent/tokreport_windows.ps1 \

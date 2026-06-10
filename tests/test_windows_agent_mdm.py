@@ -28,7 +28,9 @@ def test_windows_reporter_collects_serial_and_posts_existing_tokscale_payload():
     assert "npx -y tokscale@latest" in script
     assert "bunx tokscale@latest" in script
     assert ".cmd" in script
+    assert ".ps1" in script
     assert "$env:ComSpec" in script
+    assert "powershell.exe" in script
     assert "Rename-Computer" not in script
 
 
@@ -65,6 +67,8 @@ def test_collector_serves_windows_reporter_next_to_macos_reporter():
 
     assert "remote_tokscale_report.sh" in source
     assert "tokreport_windows.ps1" in source
+    assert "X-Forwarded-Proto" in source
+    assert 'TOKEN="${TOKEN:-' in source
     assert 'path == "/tokreport.sh"' in source
     assert 'path == "/tokreport.ps1"' in source
 
@@ -73,9 +77,9 @@ def test_deploy_syncs_reporter_scripts_needed_by_static_routes():
     script = DEPLOY.read_text(encoding="utf-8")
 
     assert "agent/remote_tokscale_report.sh" in script
-    assert "tokreport.sh" in script
     assert "agent/tokreport_windows.ps1" in script
     assert "tokreport.ps1" in script
+    assert "${REMOTE_DIR}/tokreport.sh" not in script
 
 
 def test_docs_describe_separate_windows_mdm_without_removing_macos_path():
