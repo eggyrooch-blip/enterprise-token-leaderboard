@@ -68,23 +68,30 @@ def load_feilian_map():
     except Exception as e:
         log(f"飞连不可用(用飞书自带身份兜底): {e}")
         return None
-    m, offset = {}, 0
+    # 同一 dict 双索引:user_id 键(ou_*) + email 键(含 @，与 uid 不冲突)。
+    # user_id 命中不了的 aily 用户(externalID 不是飞连 user_id) → 按合成 email 兜底解析，
+    # 拿到真实 department_path，不再落「裸组名→未归类」(孙可 2026-06-11)。
+    m, offset, n = {}, 0, 0
     while True:
         data = fc._request("GET", "/api/open/v2/user/list",
                            query={"department_id": root, "fetch_child": "true",
                                   "limit": 100, "offset": offset})
         ul = (data or {}).get("user_list") or []
         for u in ul:
+            rec = {"email": (u.get("email") or "").lower(),
+                   "name": u.get("full_name") or "",
+                   "dept": u.get("department_path") or "unknown",
+                   "avatar": u.get("avatar") or ""}
             uid = u.get("user_id")
             if uid:
-                m[uid] = {"email": (u.get("email") or "").lower(),
-                          "name": u.get("full_name") or "",
-                          "dept": u.get("department_path") or "unknown",
-                          "avatar": u.get("avatar") or ""}
+                m[uid] = rec
+            if rec["email"]:
+                m[rec["email"]] = rec   # email 兜底索引
+            n += 1
         if len(ul) < 100:
             break
         offset += 100
-    log(f"飞连身份预载 {len(m)} 人")
+    log(f"飞连身份预载 {n} 人")
     return m
 
 
@@ -276,6 +283,11 @@ def normalize(captured, period, fmap):
             seen.add(uid)
             ident = (fmap or {}).get(uid) or {}
             email = ident.get("email") or f"{uid}@{EMAIL_DOMAIN}"
+            # user_id 没命中飞连 → 用合成 email 再查飞连(同 dict email 索引)，拿真实部门
+            if not ident and fmap:
+                ident = fmap.get(email.lower()) or {}
+                if ident.get("name"):
+                    email = ident.get("email") or email
             name = ident.get("name") or ei.get("entityName") or uid
             dept = ident.get("dept")
             if not dept or dept == "unknown":

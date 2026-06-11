@@ -479,16 +479,22 @@ _FEILIAN_MAX = int(os.environ.get("LITELLM_FEILIAN_MAX", "300"))  # 单次跑最
 
 
 def _resolve_feilian_info(conn, emails):
-    """email → (中文名, 头像). 先 join 现有 people(tokscale 已落的飞连头像),
-    仍缺头像的再走飞连 user_by_email 兜底(只查缺的, 查到落库后下次自然跳过).
-    返回 {email: (name, avatar)}; 只包含查到东西的。"""
+    """email → (中文名, 头像, 部门全路径). 先 join 现有 people, 仍缺头像或缺 Keep 部门的
+    再走飞连 user_by_email 兜底(只查缺的, 查到落库后下次自然跳过). 返回 {email:(name,avatar,dept)}.
+    历史 bug:旧版只取 name+avatar，丢了同一返回里的 department_path → 纯 API 用户 dept 永远空、
+    落未归类。这里把 dept 一并带回，write_db 用它补空 dept(自愈，litellm-sync.timer 每小时跑)。"""
     info = {}
     for e in emails:
         row = conn.execute(
-            "SELECT name, avatar FROM people WHERE email=?", (e,)).fetchone()
-        if row and (row[0] or row[1]):
-            info[e] = (row[0] or "", row[1] or "")
-    missing = [e for e in emails if (e not in info or not info[e][1])]
+            "SELECT name, avatar, dept FROM people WHERE email=?", (e,)).fetchone()
+        if row and (row[0] or row[1] or row[2]):
+            info[e] = (row[0] or "", row[1] or "", row[2] or "")
+
+    def _needs(e):
+        n, a, d = info.get(e, ("", "", ""))
+        return (not a) or (not str(d).startswith("Keep"))  # 缺头像 或 缺真实(Keep)部门
+
+    missing = [e for e in emails if _needs(e)]
     if missing and _FEILIAN_AVATARS:
         fc = _feilian()
         root = None
@@ -504,9 +510,10 @@ def _resolve_feilian_info(conn, emails):
                 except Exception:
                     u = None
                 if u:
-                    prev = info.get(e, ("", ""))
+                    prev = info.get(e, ("", "", ""))
                     info[e] = (u.get("full_name") or prev[0],
-                               u.get("avatar") or prev[1])
+                               u.get("avatar") or prev[1],
+                               u.get("department_path") or prev[2])
     return info
 
 
@@ -529,8 +536,9 @@ def write_db(rows, names, agent_owner):
         for email, (name, is_agent) in names.items():
             if is_agent:
                 oe, on = agent_owner.get(email, ("", ""))
-                oname, oavatar = finfo.get(oe, ("", ""))
+                oname, oavatar, _od = finfo.get(oe, ("", "", ""))
                 owner_disp = oname or on or (oe.split("@")[0] if oe else "")
+                # agent → dept 槽位放归属人中文名(看板显示“隶属 X”)，不写飞连部门
                 conn.execute(
                     "INSERT OR REPLACE INTO people(email,name,avatar,dept) VALUES(?,?,?,?)",
                     (email, name, oavatar or "", owner_disp))
@@ -538,13 +546,20 @@ def write_db(rows, names, agent_owner):
                 conn.execute(
                     "INSERT OR IGNORE INTO people(email,name,avatar,dept) VALUES(?,?,?,?)",
                     (email, name, "", ""))
-                fn, fav = finfo.get(email, ("", ""))
+                fn, fav, fdept = finfo.get(email, ("", "", ""))
+                # 补头像(缺才补)
                 if fav:
                     conn.execute(
                         "UPDATE people SET avatar=?, "
                         "name=CASE WHEN name IS NULL OR name='' THEN ? ELSE name END "
                         "WHERE email=? AND (avatar IS NULL OR avatar='')",
                         (fav, fn or name, email))
+                # 补部门(历史 bug 修复):dept 为空/非 Keep 且飞连查到真实部门 → 填上，不覆盖已有 Keep 部门
+                if fdept and str(fdept).startswith("Keep"):
+                    conn.execute(
+                        "UPDATE people SET dept=? "
+                        "WHERE email=? AND (dept IS NULL OR dept='' OR dept NOT LIKE 'Keep%')",
+                        (fdept, email))
         conn.commit()
     finally:
         conn.close()

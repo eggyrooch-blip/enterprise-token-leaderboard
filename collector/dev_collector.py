@@ -20,6 +20,7 @@
 import datetime
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -370,22 +371,41 @@ def _ancestors(path):
     return ["/".join(segs[:i]) for i in range(1, len(segs) + 1)]
 
 
+_SP_RE = re.compile(r"\(SP\d+\)")  # 供应商公司名带的 (SP000083) 标记 → 外部合作商判定
+
+
 def _normalize_dept_path(path):
-    """业务外包归并：把 '<根>/合作商/<供应商>/<真实部门-子部门-组>' 归一成真实组织树节点。
-    'Keep/合作商/V/技术平台部-基础技术部-安全组' → 'Keep/技术平台部/基础技术部/安全组'。
-    规则：剥掉 '合作商' 段及其后紧跟的供应商代号段，再把后面用 '-' 拼接的叶子段按 '-'
-    拆成正常层级，重新挂回原路径的根前缀。非合作商路径原样返回(幂等)。空/None 原样返回。
-    叶子的短横各段须与飞连真实部门名逐字一致，roll-up 才能与 headcount 正确合并。"""
-    if not path or "合作商" not in path:
+    """部门路径归一化。两类外包分流：
+    1) 外部供应商(合作商-W / 任一段带 (SP数字) / 裸公司名)：收口到 'Keep/外部合作商/<公司名(SP码)>'
+       —— 部门榜聚成单个父节点，下钻见各公司，不平铺(孙可 2026-06-11「很乱」)。
+       'Keep/合作商/W/北京再作品牌管理有限公司(SP000083)' → 'Keep/外部合作商/北京再作品牌管理有限公司(SP000083)'
+       裸名 '四川乔木禾电子商务有限公司(SP000442)' → 'Keep/外部合作商/四川乔木禾电子商务有限公司(SP000442)'
+    2) 业务外包-V(真实部门)：剥 合作商/供应商 前缀，叶子按 '-' 拆层级，折回真实 Keep 树。
+       'Keep/合作商/V/技术平台部-基础技术部-安全组' → 'Keep/技术平台部/基础技术部/安全组'。
+       叶子短横各段须与飞连真实部门名逐字一致，roll-up 才能与 headcount 正确合并。
+    非外包路径原样返回(幂等)。空/None 原样返回。"""
+    if not path:
         return path
     segs = [s for s in path.split("/") if s]
+    if not segs:
+        return path
+    root = segs[0] if segs[0] == "Keep" else "Keep"  # 裸公司名也归 Keep 树
+    # 1) 外部供应商：任一段带 (SP数字) → 取该公司名段，收口到 外部合作商
+    sp_seg = next((s for s in segs if _SP_RE.search(s)), None)
+    if sp_seg:
+        return root + "/外部合作商/" + sp_seg
     if "合作商" not in segs:
         return path
     i = segs.index("合作商")
-    head = segs[:i]            # 真实前缀(通常 'Keep')
-    rest = segs[i + 1:]        # 供应商代号 + 叶子段
+    head = segs[:i] or ["Keep"]   # 真实前缀(通常 'Keep')
+    rest = segs[i + 1:]           # 供应商代号 + 叶子段
+    # 2) 合作商-W(供应商，无 SP 码也兜底归外部)：vendor code 'W' → 外部合作商
+    if rest and rest[0] == "W":
+        company = rest[-1] if len(rest) > 1 else "未知供应商"
+        return "/".join(head) + "/外部合作商/" + company
+    # 3) 合作商-V(真实部门)：丢供应商代号，叶子拆短横折回真实树
     if rest:
-        rest = rest[1:]        # 丢掉供应商代号(如 'V')
+        rest = rest[1:]
     expanded = []
     for seg in rest:
         expanded.extend(p for p in seg.split("-") if p)
