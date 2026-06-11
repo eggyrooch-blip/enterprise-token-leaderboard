@@ -370,6 +370,29 @@ def _ancestors(path):
     return ["/".join(segs[:i]) for i in range(1, len(segs) + 1)]
 
 
+def _normalize_dept_path(path):
+    """业务外包归并：把 '<根>/合作商/<供应商>/<真实部门-子部门-组>' 归一成真实组织树节点。
+    'Keep/合作商/V/技术平台部-基础技术部-安全组' → 'Keep/技术平台部/基础技术部/安全组'。
+    规则：剥掉 '合作商' 段及其后紧跟的供应商代号段，再把后面用 '-' 拼接的叶子段按 '-'
+    拆成正常层级，重新挂回原路径的根前缀。非合作商路径原样返回(幂等)。空/None 原样返回。
+    叶子的短横各段须与飞连真实部门名逐字一致，roll-up 才能与 headcount 正确合并。"""
+    if not path or "合作商" not in path:
+        return path
+    segs = [s for s in path.split("/") if s]
+    if "合作商" not in segs:
+        return path
+    i = segs.index("合作商")
+    head = segs[:i]            # 真实前缀(通常 'Keep')
+    rest = segs[i + 1:]        # 供应商代号 + 叶子段
+    if rest:
+        rest = rest[1:]        # 丢掉供应商代号(如 'V')
+    expanded = []
+    for seg in rest:
+        expanded.extend(p for p in seg.split("-") if p)
+    out = head + expanded
+    return "/".join(out) if out else path
+
+
 # ---------------------------------------------------------------------------
 # 飞连部门总人数缓存（部门榜 headcount / active_rate 用）
 # ---------------------------------------------------------------------------
@@ -396,6 +419,7 @@ def _fetch_dept_headcount():
         for u in ul:
             path = u.get("department_path")
             if path:
+                path = _normalize_dept_path(path)  # 外包归并:合作商路径折回真实部门
                 counts[path] = counts.get(path, 0) + 1
         off += len(ul)
         total = (data or {}).get("count") or 0
@@ -816,7 +840,7 @@ class H(BaseHTTPRequestHandler):
             for x in parts:
                 x["pct"] = round(x["tokens"] / total * 100, 1) if total else 0
             result.append({
-                "email": r[0], "dept": r[1],
+                "email": r[0], "dept": _normalize_dept_path(r[1]),  # 外包按真实部门显示,不带合作商前缀
                 "input": r[2] or 0, "output": r[3] or 0,
                 "cache_read": r[4] or 0, "cache_write": r[5] or 0,
                 "reasoning": r[6] or 0, "tokens": total,
@@ -880,7 +904,7 @@ class H(BaseHTTPRequestHandler):
         result = []
         for r in rows:
             result.append({
-                "email": r[0], "dept": r[1],
+                "email": r[0], "dept": _normalize_dept_path(r[1]),  # 外包按真实部门显示,不带合作商前缀
                 "input": r[2] or 0, "output": r[3] or 0,
                 "cache_read": r[4] or 0, "cache_write": r[5] or 0,
                 "reasoning": r[6] or 0, "tokens": r[7] or 0,
@@ -925,38 +949,72 @@ class H(BaseHTTPRequestHandler):
 
         def _canon_dept(email, depts):
             """每人规范部门：people.dept 全路径优先 → usage 里最具体的 Keep/ 路径 →
-            都没有则归到 'Keep/未归类'(裸别名/unknown 统一兜底，保持单棵树)。"""
+            都没有则归到 'Keep/未归类'(裸别名/unknown 统一兜底，保持单棵树)。
+            末尾统一过 _normalize_dept_path：外包路径折回真实部门，与 headcount 同口径。"""
             d = pdept.get(email) or ""
             if d.startswith("Keep"):
-                return d
+                return _normalize_dept_path(d)
             keep_us = [x for x in depts if x.startswith("Keep")]
             if keep_us:
-                return max(keep_us, key=len)
+                return _normalize_dept_path(max(keep_us, key=len))
             return "Keep/未归类"
 
         # 部门总人数(飞连,缓存,懒加载,graceful)：叶子级 headcount 同样 roll-up 到每级父部门。
+        # 注意:dept_headcount.json 是 6h 文件缓存,旧缓存里仍是未归并的 'Keep/合作商/V/...' 路径,
+        # 命中/兜底时不会重算 → 必须在消费点再归一化一次(幂等),否则归并后的真实叶子拿不到 headcount。
         headcount_map = _dept_headcount_map()
         node_hc = {}
         for path, cnt in headcount_map.items():
-            for anc in _ancestors(path):
+            for anc in _ancestors(_normalize_dept_path(path)):
                 node_hc[anc] = node_hc.get(anc, 0) + (cnt or 0)
 
-        nodes = {}  # path -> {tokens, cost, messages, users:set}
+        def _node(path):
+            n = nodes.get(path)
+            if n is None:
+                # token_users/aily_users 分开:人均按各自口径,活跃渗透取并集
+                n = {"tokens": 0, "cost": 0.0, "messages": 0, "credits": 0.0,
+                     "token_users": set(), "aily_users": set()}
+                nodes[path] = n
+            return n
+
+        nodes = {}  # path -> {tokens, cost, messages, credits, token_users, aily_users}
         for email, p in per.items():
             cd = _canon_dept(email, p["depts"])
             for anc in _ancestors(cd):
-                n = nodes.get(anc)
-                if n is None:
-                    n = {"tokens": 0, "cost": 0.0, "messages": 0, "users": set()}
-                    nodes[anc] = n
+                n = _node(anc)
                 n["tokens"] += p["tok"]
                 n["cost"] += p["cost"]
                 n["messages"] += p["msg"]
-                n["users"].add(email)
+                n["token_users"].add(email)
+
+        # aily(飞书 AI 权益)并入部门榜:取最新一个周期快照(与 token 的 7/30 天筛选解耦)。
+        # 单位「点」credits,不与 token 加总;aily 的人并进活跃集 → 活跃渗透取并集。
+        period = (conn.execute("SELECT max(period_start) FROM feishu_member").fetchone()
+                  or [None])[0]
+        if period:
+            fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
+            aily_rows = conn.execute(
+                "SELECT email, MAX(dept), SUM(credits) FROM feishu_member"
+                " WHERE period_start=?%s GROUP BY email HAVING SUM(credits)>0" % fdep,
+                (period,)).fetchall()
+            for email, fdept, credits in aily_rows:
+                d = pdept.get(email) or ""
+                if d.startswith("Keep"):
+                    cd = _normalize_dept_path(d)
+                elif fdept and str(fdept).startswith("Keep"):
+                    cd = _normalize_dept_path(fdept)
+                else:
+                    cd = "Keep/未归类"
+                for anc in _ancestors(cd):
+                    n = _node(anc)
+                    n["credits"] += credits or 0
+                    n["aily_users"].add(email)
 
         result = []
         for path, n in nodes.items():
-            people = len(n["users"])
+            token_people = len(n["token_users"])
+            aily_people = len(n["aily_users"])
+            people = len(n["token_users"] | n["aily_users"])   # 活跃 = token ∪ aily(去重)
             hc = node_hc.get(path)
             if hc and hc > 0:
                 active_rate = round(people / float(hc) * 100, 1)
@@ -966,11 +1024,16 @@ class H(BaseHTTPRequestHandler):
             result.append({
                 "dept": path,
                 "depth": path.count("/"),     # 'Keep'=0, 'Keep/技术平台部'=1 ... 供前端建树/缩进
-                "people": people,
+                "people": people,             # 活跃人数(token∪aily),供活跃渗透
+                "token_people": token_people,
+                "aily_people": aily_people,
                 "headcount": hc,
                 "active_rate": active_rate,
                 "tokens": n["tokens"], "cost": round(n["cost"], 4),
                 "messages": n["messages"],
+                "credits": round(n["credits"], 2),  # aily 总点数(单位「点」,不与 token 加总)
+                "per_capita_tokens": round(n["tokens"] / token_people) if token_people else 0,
+                "per_capita_credits": round(n["credits"] / aily_people, 1) if aily_people else 0,
             })
         result.sort(key=lambda x: -x["tokens"])
         self._send(200, {"teams": result})

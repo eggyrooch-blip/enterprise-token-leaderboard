@@ -392,8 +392,13 @@ function renderTeamTree(){
     nodes.forEach(function(n){ if((n.depth||0)<=1) TEAM_EXPANDED.add(n.dept); });
   }
 
-  // 3) 主指标口径与占比:人均=tokens/people,再叠加日均;占比按全体节点人均之和(参考量)
-  var mv=function(x){ return metricTok((x.tokens||0)/(((x.people||0))||1)); };
+  // 3) 主指标口径与占比:人均 token=tokens/token_people(只算用编程工具的人,不被 aily-only 稀释),
+  //    再叠加日均;占比按全体节点人均之和(参考量)。活跃人数 people=token∪aily(供活跃渗透)。
+  var mv=function(x){
+    var pc=(x.per_capita_tokens!=null)?x.per_capita_tokens
+          :((x.tokens||0)/(((x.token_people||x.people||0))||1));
+    return metricTok(pc);
+  };
   var allVals=nodes.map(mv).concat([1]);
   var max=Math.max.apply(null,allVals);
   var tot=nodes.reduce(function(a,x){return a+mv(x)},0);
@@ -415,7 +420,9 @@ function renderTeamTree(){
       } else { sub='使用 '+(x.people||0)+' 人'; }
       var pct=Math.max(2,mv(x)/max*100), share=tot?(mv(x)/tot*100):0;
       var big=compact(mv(x))+'/人';
-      var small='总 '+compact(metricTok(x.tokens||0))+' · $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%';
+      // 人均点数(飞书 aily,单位「点」)与 token 分列,不加总;只在该部门有 aily 用量时显示
+      var creditTag=(x.per_capita_credits>0)?(' · 人均 '+compact(x.per_capita_credits)+' 点'):'';
+      var small='总 '+compact(metricTok(x.tokens||0))+' · $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%'+creditTag;
       var pad=depth*18;                                 // 每级缩进 18px,层级靠缩进体现
       html.push('<div class="r" data-depth="'+depth+'">'+
         '<span class="tw-pad" style="width:'+pad+'px"></span>'+
