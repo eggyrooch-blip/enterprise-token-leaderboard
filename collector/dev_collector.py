@@ -413,6 +413,16 @@ def _normalize_dept_path(path):
     return "/".join(out) if out else path
 
 
+def _to_keep(raw):
+    """任意 dept 字符串 → 归一化后的 Keep 路径；归不到 Keep 树(裸非 SP 组名/空/unknown)→ None。
+    裸供应商公司名(带 SP 码)经 _normalize_dept_path 会变 'Keep/外部合作商/...'，故能被收口；
+    纯飞书裸组名('品质组')归一后仍无 Keep 前缀 → None → 由上层落未归类。"""
+    if not raw:
+        return None
+    n = _normalize_dept_path(raw)
+    return n if n and n.startswith("Keep") else None
+
+
 # ---------------------------------------------------------------------------
 # 飞连部门总人数缓存（部门榜 headcount / active_rate 用）
 # ---------------------------------------------------------------------------
@@ -968,15 +978,15 @@ class H(BaseHTTPRequestHandler):
                 p["depts"].append(dept)
 
         def _canon_dept(email, depts):
-            """每人规范部门：people.dept 全路径优先 → usage 里最具体的 Keep/ 路径 →
-            都没有则归到 'Keep/未归类'(裸别名/unknown 统一兜底，保持单棵树)。
-            末尾统一过 _normalize_dept_path：外包路径折回真实部门，与 headcount 同口径。"""
-            d = pdept.get(email) or ""
-            if d.startswith("Keep"):
-                return _normalize_dept_path(d)
-            keep_us = [x for x in depts if x.startswith("Keep")]
-            if keep_us:
-                return _normalize_dept_path(max(keep_us, key=len))
+            """每人规范部门：people.dept 优先 → usage 里最具体的可归一 Keep 路径 →
+            都归不到则 'Keep/未归类'。统一过 _to_keep：外包折回真实部门、裸供应商(SP码)收口外部合作商，
+            与 headcount 同口径。裸非 SP 组名/unknown 归不到 Keep → 未归类。"""
+            cand = _to_keep(pdept.get(email))
+            if cand:
+                return cand
+            keeps = [c for c in (_to_keep(x) for x in depts) if c]
+            if keeps:
+                return max(keeps, key=len)
             return "Keep/未归类"
 
         # 部门总人数(飞连,缓存,懒加载,graceful)：叶子级 headcount 同样 roll-up 到每级父部门。
@@ -1018,13 +1028,9 @@ class H(BaseHTTPRequestHandler):
                 " WHERE period_start=?%s GROUP BY email HAVING SUM(credits)>0" % fdep,
                 (period,)).fetchall()
             for email, fdept, credits in aily_rows:
-                d = pdept.get(email) or ""
-                if d.startswith("Keep"):
-                    cd = _normalize_dept_path(d)
-                elif fdept and str(fdept).startswith("Keep"):
-                    cd = _normalize_dept_path(fdept)
-                else:
-                    cd = "Keep/未归类"
+                # people.dept 优先,否则用 feishu_member.dept;统一过 _to_keep —— 裸供应商(SP码)
+                # 也收口到外部合作商,不再因「不以 Keep 开头」误落未归类(codex 评审发现)。
+                cd = _to_keep(pdept.get(email)) or _to_keep(fdept) or "Keep/未归类"
                 for anc in _ancestors(cd):
                     n = _node(anc)
                     n["credits"] += credits or 0

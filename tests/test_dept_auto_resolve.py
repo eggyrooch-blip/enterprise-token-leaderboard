@@ -96,6 +96,37 @@ def test_teams_collapses_multiple_suppliers_into_one_node(dc, monkeypatch):
     assert tops == ["Keep"]
 
 
+def test_bare_sp_aily_user_routes_to_external_not_uncategorized(dc, monkeypatch):
+    """codex 评审发现:纯 aily 用户 feishu.dept 是裸供应商名(带 SP码、不以 Keep 开头)时，
+    旧逻辑只在 startswith('Keep') 才归一 → 落未归类。应收口到 Keep/外部合作商，不落未归类。"""
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    conn.execute("INSERT INTO feishu_member VALUES('wb-x@keep.com','文洁',"
+                 "'四川乔木禾电子商务有限公司(SP000442)','aily_credits',80,'2026-06-01','2026-06-07','')")
+    conn.commit()  # 注意:无 people 行(纯 aily 外包)
+    teams = _teams(dc, conn, monkeypatch, {})
+
+    assert "Keep/未归类" not in teams, "裸 SP aily 外包不该落未归类"
+    assert "Keep/外部合作商/四川乔木禾电子商务有限公司(SP000442)" in teams
+    ext = teams["Keep/外部合作商"]
+    assert ext["credits"] == 80
+    assert ext["aily_people"] == 1
+
+
+def test_token_user_bare_sp_dept_routes_to_external(dc, monkeypatch):
+    """token 用户 usage.dept 为裸供应商名(扫描显示 usage.dept 里确有裸 SP 名)→ 也收口外部合作商。"""
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    conn.execute("INSERT INTO usage VALUES('w@keep.com','中软国际科技服务有限公司(SP004867)',"
+                 "'lifetime','all','subscription','Claude Code',500,1,5)")
+    # people.dept 也空,只能靠 usage.dept 归一
+    conn.execute("INSERT INTO people VALUES('w@keep.com','w','','')")
+    conn.commit()
+    teams = _teams(dc, conn, monkeypatch, {})
+    assert "Keep/未归类" not in teams
+    assert teams["Keep/外部合作商"]["tokens"] == 500
+
+
 # ---------------------------------------------------------------------------
 # 漏洞 1 — LiteLLM dept 自愈
 # ---------------------------------------------------------------------------
