@@ -202,10 +202,13 @@ def num(r, *keys):
         if k in r and r[k] is not None:
             try:
                 return int(r[k])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 try:
-                    return int(float(r[k]))
-                except (TypeError, ValueError):
+                    f = float(r[k])
+                    if f != f or f in (float("inf"), float("-inf")):  # NaN / ±inf → 0
+                        return 0
+                    return int(f)
+                except (TypeError, ValueError, OverflowError):
                     pass
     return 0
 
@@ -344,20 +347,21 @@ def _upsert_hermes_usage(conn, source, client, date, records):
     # 若同一批里两条 record 撞同一把 key，逐条 REPLACE 会只保留最后一条（丢量）。所以这里
     # 先聚合求和，保证「一把 key 一行、值是批内之和」——与「多个智能体累加到本人」一致，
     # 也不依赖上游 uploader 是否已去重。dept 取该 key 第一条非空值。
-    # 字段一律 str() 强转再 strip：上游若发来非字符串(如 email:123)也不崩，按坏记录跳过计数，
-    # 绝不让一条类型错的 record 把整请求打成 500（SPEC：坏记录 skip+count，不 fail 请求）。
-    def _s(rec, k):
+    # 身份字段(email/model)必须是「非空字符串」才算有效：
+    #   - 非字符串(如 email:123 / model:{…}) → 当坏记录跳过计数，绝不强转成 "123" 之类
+    #     的假身份混进榜，也绝不抛异常把整请求打成 500（SPEC：坏记录 skip+count，不 fail）。
+    def _opt_str(rec, k):
         v = rec.get(k)
-        return str(v).strip() if v is not None else ""
+        return v.strip() if isinstance(v, str) else None
 
     agg = {}            # (email, provider, model) -> {dept, inp, out, total}
     for rec in records or []:
         if not isinstance(rec, dict):
             skipped += 1
             continue
-        email = _s(rec, "email")
-        model = _s(rec, "model")
-        if not email or not model:          # 缺 email/model → 无法归属或无意义，跳过计数
+        email = _opt_str(rec, "email")
+        model = _opt_str(rec, "model")
+        if not email or not model:          # 缺/非字符串 email/model → 无法可靠归属，跳过计数
             skipped += 1
             continue
         inp = num(rec, "input_tokens", "input")
@@ -368,12 +372,12 @@ def _upsert_hermes_usage(conn, source, client, date, records):
         if total <= 0:                       # 无任何可计量 token → 跳过，绝不拿 0 覆盖好数据
             skipped += 1
             continue
-        provider = _s(rec, "provider")
+        provider = _opt_str(rec, "provider") or ""     # 非字符串/缺 → ''
+        dept = _opt_str(rec, "dept") or "unknown"      # 非字符串/缺 → 'unknown'
         key = (email, provider, model)
         slot = agg.get(key)
         if slot is None:
-            agg[key] = {"dept": (_s(rec, "dept") or "unknown"),
-                        "inp": inp, "out": out, "total": total}
+            agg[key] = {"dept": dept, "inp": inp, "out": out, "total": total}
         else:
             slot["inp"] += inp
             slot["out"] += out

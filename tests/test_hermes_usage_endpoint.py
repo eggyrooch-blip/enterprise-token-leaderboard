@@ -69,20 +69,38 @@ def test_idempotent_resend_same_day_does_not_double():
     assert _rows(conn) == {"day": 120, "month": 120, "lifetime": 120}
 
 
-def test_typed_bad_fields_are_skipped_not_crash():
+def test_non_string_identity_fields_are_skipped_not_coerced():
     conn = _conn()
-    # Non-string email/provider/model must not raise (would otherwise 500 in do_POST).
+    # Non-string email/model are unparseable identity -> skipped (NOT coerced to "123"/"999"),
+    # and must never raise (would otherwise 500 in do_POST).
     written, skipped = dev_collector._upsert_hermes_usage(
         conn, "hermes", "Hermes", "2026-06-11",
         [
             {"email": 123, "model": "m", "input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
-            {"email": "a@c.com", "model": 999, "input_tokens": 5},
+            {"email": "a@c.com", "model": {"x": 1}, "input_tokens": 5},
             {"email": "a@c.com", "model": "m", "provider": ["x"], "input_tokens": 4, "output_tokens": 6},
         ],
     )
-    # 1st: email coerces to "123" (truthy) -> valid; 2nd: model "999" valid; 3rd: provider "['x']" valid.
-    # None crash. (We assert no exception + everything accounted for.)
-    assert written + skipped == 3
+    assert (written, skipped) == (1, 2)               # only the 3rd record is valid
+    # No garbage "123" email entered the table.
+    emails = [r[0] for r in conn.execute("SELECT email FROM usage WHERE source='hermes'")]
+    assert set(emails) == {"a@c.com"}
+    # provider coerced to "" (non-string list ignored), not "['x']".
+    provs = {r[0] for r in conn.execute("SELECT provider FROM usage WHERE source='hermes'")}
+    assert provs == {""}
+
+
+def test_overflow_and_nonfinite_token_values_do_not_crash():
+    conn = _conn()
+    # "1e10000" -> float inf -> int(inf) would OverflowError; must be treated as 0, not 500.
+    written, skipped = dev_collector._upsert_hermes_usage(
+        conn, "hermes", "Hermes", "2026-06-11",
+        [{"email": "a@c.com", "model": "m", "input_tokens": "1e10000", "output_tokens": "nan", "total_tokens": "x"}],
+    )
+    # All token fields unparseable/non-finite -> total 0 -> record skipped (no positive tokens).
+    assert (written, skipped) == (0, 1)
+    assert dev_collector.num({"v": "1e10000"}, "v") == 0
+    assert dev_collector.num({"v": "nan"}, "v") == 0
 
 
 def test_empty_records_clears_existing_day_snapshot():
