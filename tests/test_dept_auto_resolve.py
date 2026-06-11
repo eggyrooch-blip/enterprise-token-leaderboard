@@ -332,3 +332,21 @@ def test_personal_board_falls_back_to_usage_dept_when_no_people_path(dc):
     conn.commit()
     lb = _leaderboard(dc, conn)
     assert lb["Bob"]["dept"] == "某团队别名"
+
+
+def _cursor_board(dc, conn):
+    cap = {}
+    class Fake:
+        def _send(self, code, obj): cap["obj"] = obj
+    dc.H._cursor(Fake(), conn, {})
+    return {x["email"]: x for x in cap["obj"]["cursor"]}
+
+
+def test_cursor_board_prefers_people_dept(dc):
+    """Cursor 榜同样优先 people.dept(飞连全路径),不被裸 usage.dept 盖掉(codex 评审补的覆盖)。"""
+    conn = _full_conn()
+    _usage_row(conn, "guo@keep.com", "技术平台部", "cursor", "Cursor", 3000)
+    conn.execute("INSERT INTO people VALUES('guo@keep.com','郭东霖','','Keep/技术平台部/推荐搜索部/算法组')")
+    conn.commit()
+    cb = _cursor_board(dc, conn)
+    assert cb["guo@keep.com"]["dept"] == "Keep/技术平台部/推荐搜索部/算法组"
