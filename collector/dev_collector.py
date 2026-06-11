@@ -339,30 +339,53 @@ def _upsert_hermes_usage(conn, source, client, date, records):
     """
     written = 0
     skipped = 0
-    # ---- day 桶：DELETE 本 source 在该 date 的旧行，再写当天快照 ----
-    conn.execute(
-        "DELETE FROM usage WHERE source=? AND period_type=? AND period=?",
-        (source, "day", date))
+    # ---- 先在「本批内」按 (email, provider, model) 求和，再写库 ----
+    # day 桶 PK 含 (email, period, source, client, provider, model)，用 INSERT OR REPLACE。
+    # 若同一批里两条 record 撞同一把 key，逐条 REPLACE 会只保留最后一条（丢量）。所以这里
+    # 先聚合求和，保证「一把 key 一行、值是批内之和」——与「多个智能体累加到本人」一致，
+    # 也不依赖上游 uploader 是否已去重。dept 取该 key 第一条非空值。
+    agg = {}            # (email, provider, model) -> {dept, inp, out, total}
     for rec in records or []:
         if not isinstance(rec, dict):
             skipped += 1
             continue
         email = (rec.get("email") or "").strip()
-        if not email:                       # 缺 email → 无法归属，跳过计数
+        model = (rec.get("model") or "").strip()
+        if not email or not model:          # 缺 email/model → 无法归属或无意义，跳过计数
             skipped += 1
             continue
-        dept = rec.get("dept") or "unknown"
-        provider = rec.get("provider") or ""           # 缺省 ''
-        model = rec.get("model") or "unknown"
         inp = num(rec, "input_tokens", "input")
         out = num(rec, "output_tokens", "output")
         total = num(rec, "total_tokens", "total")
         if total <= 0:                       # total 缺省 = input + output
             total = inp + out
+        if total <= 0:                       # 无任何可计量 token → 跳过，绝不拿 0 覆盖好数据
+            skipped += 1
+            continue
+        provider = (rec.get("provider") or "").strip()
+        key = (email, provider, model)
+        slot = agg.get(key)
+        if slot is None:
+            agg[key] = {"dept": (rec.get("dept") or "unknown"),
+                        "inp": inp, "out": out, "total": total}
+        else:
+            slot["inp"] += inp
+            slot["out"] += out
+            slot["total"] += total
+    # 整批无任何有效记录（空/全坏）→ 不碰库：空快照绝不擦掉已有好快照。
+    # （uploader 每小时发的是从 append-only 台账重算的当日全量，日内只增不减，
+    #  故"无有效记录"只可能是坏输入或空批，此时保留上次的好数据才正确。）
+    if not agg:
+        return 0, skipped
+    # ---- day 桶：DELETE 本 source 在该 date 的旧行，再写当天聚合快照 ----
+    conn.execute(
+        "DELETE FROM usage WHERE source=? AND period_type=? AND period=?",
+        (source, "day", date))
+    for (email, provider, model), v in agg.items():
         conn.execute(_UPSERT_SQL, (
-            email, dept, "day", date, source,
+            email, v["dept"], "day", date, source,
             client, provider, model,
-            inp, out, 0, 0, 0, total, 0.0, 0,
+            v["inp"], v["out"], 0, 0, 0, v["total"], 0.0, 0,
         ))
         written += 1
     # ---- month / lifetime 桶：DELETE 本 source 全部，再从 day 行重算（防翻倍）----
@@ -802,8 +825,12 @@ class H(BaseHTTPRequestHandler):
                 "source": source, "allowed": sorted(HERMES_ALLOWED_SOURCES)})
         client = (p.get("client") or "Hermes").strip() or "Hermes"   # 缺省 'Hermes'
         date = (p.get("date") or "").strip()
-        if len(date) != 10 or date[4] != "-" or date[7] != "-":
-            return self._send(400, {"ok": False, "error": "bad date", "date": date})
+        try:
+            # 真校验 YYYY-MM-DD（拒绝 2026-13-40 / 非数字等），date 进 SQL period 列。
+            if date != datetime.datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d"):
+                raise ValueError
+        except ValueError:
+            return self._send(400, {"ok": False, "error": "bad date (want YYYY-MM-DD)", "date": date})
         records = p.get("records") or []
         conn = db()
         written, skipped = _upsert_hermes_usage(conn, source, client, date, records)
