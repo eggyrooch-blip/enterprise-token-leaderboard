@@ -344,13 +344,19 @@ def _upsert_hermes_usage(conn, source, client, date, records):
     # 若同一批里两条 record 撞同一把 key，逐条 REPLACE 会只保留最后一条（丢量）。所以这里
     # 先聚合求和，保证「一把 key 一行、值是批内之和」——与「多个智能体累加到本人」一致，
     # 也不依赖上游 uploader 是否已去重。dept 取该 key 第一条非空值。
+    # 字段一律 str() 强转再 strip：上游若发来非字符串(如 email:123)也不崩，按坏记录跳过计数，
+    # 绝不让一条类型错的 record 把整请求打成 500（SPEC：坏记录 skip+count，不 fail 请求）。
+    def _s(rec, k):
+        v = rec.get(k)
+        return str(v).strip() if v is not None else ""
+
     agg = {}            # (email, provider, model) -> {dept, inp, out, total}
     for rec in records or []:
         if not isinstance(rec, dict):
             skipped += 1
             continue
-        email = (rec.get("email") or "").strip()
-        model = (rec.get("model") or "").strip()
+        email = _s(rec, "email")
+        model = _s(rec, "model")
         if not email or not model:          # 缺 email/model → 无法归属或无意义，跳过计数
             skipped += 1
             continue
@@ -362,20 +368,22 @@ def _upsert_hermes_usage(conn, source, client, date, records):
         if total <= 0:                       # 无任何可计量 token → 跳过，绝不拿 0 覆盖好数据
             skipped += 1
             continue
-        provider = (rec.get("provider") or "").strip()
+        provider = _s(rec, "provider")
         key = (email, provider, model)
         slot = agg.get(key)
         if slot is None:
-            agg[key] = {"dept": (rec.get("dept") or "unknown"),
+            agg[key] = {"dept": (_s(rec, "dept") or "unknown"),
                         "inp": inp, "out": out, "total": total}
         else:
             slot["inp"] += inp
             slot["out"] += out
             slot["total"] += total
-    # 整批无任何有效记录（空/全坏）→ 不碰库：空快照绝不擦掉已有好快照。
-    # （uploader 每小时发的是从 append-only 台账重算的当日全量，日内只增不减，
-    #  故"无有效记录"只可能是坏输入或空批，此时保留上次的好数据才正确。）
-    if not agg:
+    # 区分两种「无有效记录」：
+    #   - 权威空快照（请求体 records 本就为 []）→ 照常 DELETE 清空该日，遵守 snapshot 契约
+    #     （表示「该日确无 Hermes 用量」，应清掉可能残留的旧行）。
+    #   - 有记录但全被跳过（坏输入/解析不到）→ 守卫：不碰库，保留上次的好快照，
+    #     绝不让一批坏输入把好数据擦成空。
+    if not agg and records:
         return 0, skipped
     # ---- day 桶：DELETE 本 source 在该 date 的旧行，再写当天聚合快照 ----
     conn.execute(

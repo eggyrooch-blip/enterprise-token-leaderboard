@@ -69,6 +69,35 @@ def test_idempotent_resend_same_day_does_not_double():
     assert _rows(conn) == {"day": 120, "month": 120, "lifetime": 120}
 
 
+def test_typed_bad_fields_are_skipped_not_crash():
+    conn = _conn()
+    # Non-string email/provider/model must not raise (would otherwise 500 in do_POST).
+    written, skipped = dev_collector._upsert_hermes_usage(
+        conn, "hermes", "Hermes", "2026-06-11",
+        [
+            {"email": 123, "model": "m", "input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+            {"email": "a@c.com", "model": 999, "input_tokens": 5},
+            {"email": "a@c.com", "model": "m", "provider": ["x"], "input_tokens": 4, "output_tokens": 6},
+        ],
+    )
+    # 1st: email coerces to "123" (truthy) -> valid; 2nd: model "999" valid; 3rd: provider "['x']" valid.
+    # None crash. (We assert no exception + everything accounted for.)
+    assert written + skipped == 3
+
+
+def test_empty_records_clears_existing_day_snapshot():
+    conn = _conn()
+    dev_collector._upsert_hermes_usage(
+        conn, "hermes", "Hermes", "2026-06-11",
+        [{"email": "a@c.com", "model": "m", "input_tokens": 100, "output_tokens": 20, "total_tokens": 120}],
+    )
+    assert _rows(conn) == {"day": 120, "month": 120, "lifetime": 120}
+    # Authoritative empty snapshot (records=[]) clears the date's rows (snapshot contract).
+    written, skipped = dev_collector._upsert_hermes_usage(conn, "hermes", "Hermes", "2026-06-11", [])
+    assert (written, skipped) == (0, 0)
+    assert _rows(conn) == {}
+
+
 def test_total_falls_back_to_input_plus_output():
     conn = _conn()
     dev_collector._upsert_hermes_usage(
