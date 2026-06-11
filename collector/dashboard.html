@@ -424,9 +424,11 @@ function renderTeamTree(){
       var creditTag=(x.per_capita_credits>0)?(' · 人均 '+compact(x.per_capita_credits)+' 点'):'';
       var small='总 '+compact(metricTok(x.tokens||0))+' · $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%'+creditTag;
       var pad=depth*18;                                 // 每级缩进 18px,层级靠缩进体现
-      html.push('<div class="r" data-depth="'+depth+'">'+
+      // 有子节点的行:整行可点(data-path + 手型光标),点哪都展开/收起,不必精准点三角
+      var rowAttr=hasKids?(' data-path="'+encodeURIComponent(x.dept)+'" style="cursor:pointer"'):'';
+      html.push('<div class="r" data-depth="'+depth+'"'+rowAttr+'>'+
         '<span class="tw-pad" style="width:'+pad+'px"></span>'+
-        '<span class="'+twCls+'"'+(hasKids?(' data-path="'+encodeURIComponent(x.dept)+'"'):'')+'>'+tri+'</span>'+
+        '<span class="'+twCls+'">'+tri+'</span>'+
         '<div class="nm">'+name+'<div class="sub">'+sub+'</div></div>'+
         '<div class="track"><div class="fill" style="width:'+pct+'%"></div></div>'+
         '<div class="val"><div class="t num">'+big+'</div><div class="s num">'+small+'</div></div></div>');
@@ -438,8 +440,8 @@ function renderTeamTree(){
   if(roots.length===1 && roots[0].dept==='Keep') roots = children['Keep']||[];
   walk(roots, 0);
   $('list').innerHTML=html.join('');
-  // 绑定三角点击:切换该 path 的展开状态后保持状态重渲染
-  $('list').querySelectorAll('.tw[data-path]').forEach(function(t){
+  // 绑定整行点击:切换该 path 的展开状态后保持状态重渲染(行是扁平兄弟节点,无嵌套冒泡)
+  $('list').querySelectorAll('.r[data-path]').forEach(function(t){
     t.onclick=function(){
       var p=decodeURIComponent(t.getAttribute('data-path'));
       if(TEAM_EXPANDED.has(p)) TEAM_EXPANDED.delete(p); else TEAM_EXPANDED.add(p);
