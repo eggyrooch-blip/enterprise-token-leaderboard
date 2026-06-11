@@ -475,7 +475,7 @@ function render(){
       name=x.name||(x.email||'').split('@')[0]||'—';
       if(CUR==='person' && x.via==='manual') name+='<span class="tag-m" title="最近一次为员工手工补报,非 MDM 自动采集">手工</span>';
       if(x.departed) name+='<span class="tag-off" title="该员工已离职">离职</span>';   // 灰色离职小标签
-      sub=x.dept||'';                                  // 完整部门路径
+      sub=stripKeep(x.dept||'');                       // 部门路径去前导 Keep/(个人榜/工具榜不展示 Keep 根)
       var fb=(name||'·').slice(-2);
       av = x.avatar
         ? '<img class="av" src="'+x.avatar+'" onerror="this.outerHTML=&quot;<span class=\\&quot;av fb\\&quot;>'+fb+'</span>&quot;">'
