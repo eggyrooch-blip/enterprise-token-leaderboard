@@ -278,3 +278,57 @@ def test_feishu_no_match_keeps_bare_fallback():
     out = F.normalize(captured, "2026-06-01", fmap)
     m = out["members"][0]
     assert m["dept"] == "某外部组"   # 查不到时退回飞书裸名(不崩)
+
+
+# ---------------------------------------------------------------------------
+# 个人榜优先 people.dept(飞连全路径),不被 LiteLLM 裸别名经 MAX 盖掉
+# ---------------------------------------------------------------------------
+def _full_conn():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript("""
+        CREATE TABLE usage(email TEXT, dept TEXT, period_type TEXT, period TEXT,
+            source TEXT, client TEXT, provider TEXT, model TEXT,
+            input INT DEFAULT 0, output INT DEFAULT 0, cache_read INT DEFAULT 0,
+            cache_write INT DEFAULT 0, reasoning INT DEFAULT 0,
+            total INT, cost REAL, messages INT);
+        CREATE TABLE people(email TEXT PRIMARY KEY, name TEXT, avatar TEXT, dept TEXT);
+        CREATE TABLE departed(email TEXT PRIMARY KEY);
+        CREATE TABLE report_log(serial TEXT, email TEXT, via TEXT, reported_at TEXT);
+    """)
+    return conn
+
+
+def _usage_row(conn, email, dept, source, client, total):
+    conn.execute("INSERT INTO usage(email,dept,period_type,period,source,client,provider,model,"
+                 "input,output,total,cost,messages) VALUES(?,?,'lifetime','all',?,?,'x','m',?,0,?,1,5)",
+                 (email, dept, source, client, total, total))
+
+
+def _leaderboard(dc, conn):
+    cap = {}
+    class Fake:
+        def _send(self, code, obj): cap["obj"] = obj
+    dc.H._leaderboard(Fake(), conn, {})
+    return {x["name"]: x for x in cap["obj"]["leaderboard"]}
+
+
+def test_personal_board_prefers_people_dept_over_bare_litellm_alias(dc):
+    """郭东霖:litellm 裸别名'技术平台部' + people.dept 飞连全路径。
+    MAX(u.dept) 会因中文排在 'K' 之后误选裸别名;须优先 people.dept 全路径。"""
+    conn = _full_conn()
+    _usage_row(conn, "guo@keep.com", "技术平台部", "litellm", "LiteLLM", 3142)
+    _usage_row(conn, "guo@keep.com", "Keep/技术平台部/推荐搜索部/算法组", "cursor", "Cursor", 100)
+    conn.execute("INSERT INTO people VALUES('guo@keep.com','郭东霖','','Keep/技术平台部/推荐搜索部/算法组')")
+    conn.commit()
+    lb = _leaderboard(dc, conn)
+    assert lb["郭东霖"]["dept"] == "Keep/技术平台部/推荐搜索部/算法组"
+
+
+def test_personal_board_falls_back_to_usage_dept_when_no_people_path(dc):
+    """people.dept 空(飞连未解析)→ 退回 usage.dept(裸别名),不崩。"""
+    conn = _full_conn()
+    _usage_row(conn, "bob@keep.com", "某团队别名", "litellm", "LiteLLM", 500)
+    conn.execute("INSERT INTO people VALUES('bob@keep.com','Bob','','')")
+    conn.commit()
+    lb = _leaderboard(dc, conn)
+    assert lb["Bob"]["dept"] == "某团队别名"

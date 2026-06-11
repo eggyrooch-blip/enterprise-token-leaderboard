@@ -1007,7 +1007,8 @@ class H(BaseHTTPRequestHandler):
                    SUM(u.reasoning), SUM(u.total), SUM(u.cost), SUM(u.messages),
                    MAX(p.name), MAX(p.avatar),
                    (SELECT rl.via FROM report_log rl WHERE rl.email = u.email
-                    ORDER BY rl.reported_at DESC LIMIT 1)
+                    ORDER BY rl.reported_at DESC LIMIT 1),
+                   MAX(p.dept)
             FROM usage u LEFT JOIN people p ON p.email = u.email
             WHERE %s AND u.source != 'litellm_agent'%s%s
             GROUP BY u.email
@@ -1029,8 +1030,10 @@ class H(BaseHTTPRequestHandler):
             parts = sorted(comp.get(r[0], []), key=lambda x: x["tokens"], reverse=True)
             for x in parts:
                 x["pct"] = round(x["tokens"] / total * 100, 1) if total else 0
+            # 部门优先用 people.dept(飞连自愈的全路径),裸的 MAX(u.dept) 只兜底 ——
+            # 否则 LiteLLM 团队别名(裸"技术平台部")会被 MAX 误选盖掉飞连全路径(中文排在 'K' 之后)。
             result.append({
-                "email": r[0], "dept": _normalize_dept_path(r[1]),  # 外包按真实部门显示,不带合作商前缀
+                "email": r[0], "dept": _to_keep(r[13]) or _normalize_dept_path(r[1]),
                 "input": r[2] or 0, "output": r[3] or 0,
                 "cache_read": r[4] or 0, "cache_write": r[5] or 0,
                 "reasoning": r[6] or 0, "tokens": total,
@@ -1085,7 +1088,7 @@ class H(BaseHTTPRequestHandler):
             SELECT u.email, MAX(u.dept),
                    SUM(u.input), SUM(u.output), SUM(u.cache_read), SUM(u.cache_write),
                    SUM(u.reasoning), SUM(u.total), SUM(u.cost), SUM(u.messages),
-                   MAX(p.name), MAX(p.avatar)
+                   MAX(p.name), MAX(p.avatar), MAX(p.dept)
             FROM usage u LEFT JOIN people p ON p.email = u.email
             WHERE %s AND u.source='cursor'%s
             GROUP BY u.email
@@ -1094,7 +1097,7 @@ class H(BaseHTTPRequestHandler):
         result = []
         for r in rows:
             result.append({
-                "email": r[0], "dept": _normalize_dept_path(r[1]),  # 外包按真实部门显示,不带合作商前缀
+                "email": r[0], "dept": _to_keep(r[12]) or _normalize_dept_path(r[1]),  # 优先 people.dept(飞连全路径)
                 "input": r[2] or 0, "output": r[3] or 0,
                 "cache_read": r[4] or 0, "cache_write": r[5] or 0,
                 "reasoning": r[6] or 0, "tokens": r[7] or 0,
