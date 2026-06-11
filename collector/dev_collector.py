@@ -311,6 +311,89 @@ def _upsert_daily(conn, email, dept, graph):
     return up
 
 
+# ---------------------------------------------------------------------------
+# Hermes 显式-email 上报（additive，不动现有 tokscale/feishu 路径）
+# ---------------------------------------------------------------------------
+# source 白名单：只接受这些 source 写库（防止任意外部 source 污染表 / 误删别的来源）。
+# 经环境变量 HERMES_REPORT_SOURCES 可扩充（逗号分隔），默认仅 'hermes'。
+HERMES_ALLOWED_SOURCES = {
+    s.strip() for s in os.environ.get("HERMES_REPORT_SOURCES", "hermes").split(",")
+    if s.strip()
+}
+
+
+def _upsert_hermes_usage(conn, source, client, date, records):
+    """把一批「该 date 的当日累计快照」record 写进 usage 表的 day/month/lifetime 三桶。
+
+    幂等口径（与 litellm_collector 同思路：DELETE 旧行后整批重写，连跑同日不翻倍）：
+      - day 桶是唯一真相。先 DELETE 掉本 source 在该 date 的全部 day 行（严格限定
+        source=本次请求体的 source，绝不误删别的 source），再把本批 record 逐行 INSERT
+        为 period=date 的 day 行。
+      - month / lifetime 桶不直接收数，而是「重算」：DELETE 本 source 的全部 month +
+        lifetime 行，再从「本 source 现存的所有 day 行」按 (email,dept,client,provider,
+        model) 维度 SUM 重新聚合写入。month 按 period=YYYY-MM 求和，lifetime period='all'
+        全量求和。因此无论某天被上报几次、补报几天，month/lifetime 永远等于 day 行之和，
+        结构上不可能翻倍。
+
+    返回 (written, skipped)。缺 email 或非法 record 跳过并计数，不抛异常。
+    """
+    written = 0
+    skipped = 0
+    # ---- day 桶：DELETE 本 source 在该 date 的旧行，再写当天快照 ----
+    conn.execute(
+        "DELETE FROM usage WHERE source=? AND period_type=? AND period=?",
+        (source, "day", date))
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            skipped += 1
+            continue
+        email = (rec.get("email") or "").strip()
+        if not email:                       # 缺 email → 无法归属，跳过计数
+            skipped += 1
+            continue
+        dept = rec.get("dept") or "unknown"
+        provider = rec.get("provider") or ""           # 缺省 ''
+        model = rec.get("model") or "unknown"
+        inp = num(rec, "input_tokens", "input")
+        out = num(rec, "output_tokens", "output")
+        total = num(rec, "total_tokens", "total")
+        if total <= 0:                       # total 缺省 = input + output
+            total = inp + out
+        conn.execute(_UPSERT_SQL, (
+            email, dept, "day", date, source,
+            client, provider, model,
+            inp, out, 0, 0, 0, total, 0.0, 0,
+        ))
+        written += 1
+    # ---- month / lifetime 桶：DELETE 本 source 全部，再从 day 行重算（防翻倍）----
+    conn.execute(
+        "DELETE FROM usage WHERE source=? AND period_type IN ('month','lifetime')",
+        (source,))
+    # month：按 YYYY-MM 求和（period 取 day-period 的前 7 位）
+    conn.execute("""
+        INSERT INTO usage
+            (email, dept, period_type, period, source, client, provider, model,
+             input, output, cache_read, cache_write, reasoning, total, cost, messages)
+        SELECT email, MAX(dept), 'month', substr(period,1,7), source, client, provider, model,
+               SUM(input), SUM(output), 0, 0, 0, SUM(total), 0, 0
+        FROM usage
+        WHERE source=? AND period_type='day'
+        GROUP BY email, period_type, substr(period,1,7), source, client, provider, model
+    """, (source,))
+    # lifetime：全量求和，period='all'
+    conn.execute("""
+        INSERT INTO usage
+            (email, dept, period_type, period, source, client, provider, model,
+             input, output, cache_read, cache_write, reasoning, total, cost, messages)
+        SELECT email, MAX(dept), 'lifetime', 'all', source, client, provider, model,
+               SUM(input), SUM(output), 0, 0, 0, SUM(total), 0, 0
+        FROM usage
+        WHERE source=? AND period_type='day'
+        GROUP BY email, source, client, provider, model
+    """, (source,))
+    return written, skipped
+
+
 def _range_clause(qs, prefix=""):
     """全局时间范围 → (where_sql, params)。优先级:
       ?from=YYYY-MM-DD&to=YYYY-MM-DD  → 日桶在 [from,to] 内求和(Kibana 式起止日期)
@@ -640,6 +723,8 @@ class H(BaseHTTPRequestHandler):
                 return self._tokscale_report()
             if self.path.startswith("/v1/feishu/report"):
                 return self._feishu_report()
+            if self.path.startswith("/v1/usage/report"):
+                return self._usage_report()
             self._send(404, {"error": "not found"})
         except ValueError as e:   # json.JSONDecodeError 是 ValueError 子类
             sys.stderr.write("do_POST %s bad-json: %s\n" % (self.path, repr(e)[:300]))
@@ -689,6 +774,42 @@ class H(BaseHTTPRequestHandler):
                  float(t.get("credits") or 0), int(t.get("user_count") or 0))); nt += 1
         conn.commit(); conn.close()
         self._send(200, {"ok": True, "members": nm, "quota": nq, "trend": nt})
+
+    def _usage_report(self):
+        """显式-email 用量上报(additive)。给异地宿主(如 hermes-1)走 HTTP 把每人 token
+        用量并入排行榜的 usage 表 —— 现有 /v1/tokscale/report 按序列号反解身份且 source
+        硬编码 'subscription',收不了显式 email + 自定义 source,故新增本端点。
+
+        payload: {source:'hermes', client:'Hermes', date:'YYYY-MM-DD',
+                  records:[{email, dept, provider, model,
+                            input_tokens, output_tokens, total_tokens}, ...]}
+        行为:
+          - source 必须在白名单(HERMES_ALLOWED_SOURCES,默认 {'hermes'})。不在 → 400 拒绝、不写库。
+          - date 缺/格式不对 → 400(没有归属周期无法写桶)。
+          - 写 usage 表 day/month/lifetime 三桶(口径见 _upsert_hermes_usage):day=当天快照、
+            month/lifetime 从 day 行重算,连跑同日不翻倍。
+          - 单条 record 缺 email/非法 → 跳过计数,返回 {ok,written,skipped},不 500。
+        幂等:DELETE(限定 source=请求体值)+ 重写,严格不误删别的 source。
+        """
+        if not self._auth():
+            return self._send(403, {"error": "invalid token"})
+        p = self._read_body()
+        source = (p.get("source") or "").strip()
+        if source not in HERMES_ALLOWED_SOURCES:
+            # 白名单外一律拒绝且不写,避免任意 source 污染表 / 误删既有来源
+            return self._send(400, {
+                "ok": False, "error": "source not allowed",
+                "source": source, "allowed": sorted(HERMES_ALLOWED_SOURCES)})
+        client = (p.get("client") or "Hermes").strip() or "Hermes"   # 缺省 'Hermes'
+        date = (p.get("date") or "").strip()
+        if len(date) != 10 or date[4] != "-" or date[7] != "-":
+            return self._send(400, {"ok": False, "error": "bad date", "date": date})
+        records = p.get("records") or []
+        conn = db()
+        written, skipped = _upsert_hermes_usage(conn, source, client, date, records)
+        conn.commit()
+        conn.close()
+        self._send(200, {"ok": True, "written": written, "skipped": skipped})
 
     def _tokscale_report(self):
         """接收 {serial, email, hostname, models:{entries:[...]}, monthly:{entries:[...]}}
