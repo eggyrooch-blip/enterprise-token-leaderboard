@@ -383,13 +383,18 @@ function renderTeamTree(){
     if(parent!=null && byPath[parent]){ (children[parent]=children[parent]||[]).push(n); }
     else { (children['__root__']=children['__root__']||[]).push(n); }
   });
-  // 每层内按 tokens 倒序
-  Object.keys(children).forEach(function(k){ children[k].sort(function(a,b){return (b.tokens||0)-(a.tokens||0);}); });
+  // 每层内按 tokens 倒序;但「外部合作商」恒置末尾(外包供应商,不与真实部门比排名)
+  var isExt=function(d){ return (d||'').split('/').pop()==='外部合作商'; };
+  Object.keys(children).forEach(function(k){ children[k].sort(function(a,b){
+    var ea=isExt(a.dept), eb=isExt(b.dept);
+    if(ea!==eb) return ea?1:-1;                       // 外部合作商沉底
+    return (b.tokens||0)-(a.tokens||0);
+  }); });
 
-  // 2) 首次按 depth<=1 默认展开(Keep 根 + 一级事业部),之后保持用户的展开状态
+  // 2) 首次按 depth<=1 默认展开(Keep 根 + 一级事业部),但「外部合作商」默认收起;之后保持用户状态
   if(TEAM_EXPANDED===null){
     TEAM_EXPANDED=new Set();
-    nodes.forEach(function(n){ if((n.depth||0)<=1) TEAM_EXPANDED.add(n.dept); });
+    nodes.forEach(function(n){ if((n.depth||0)<=1 && !isExt(n.dept)) TEAM_EXPANDED.add(n.dept); });
   }
 
   // 3) 主指标口径与占比:人均 token=tokens/token_people(只算用编程工具的人,不被 aily-only 稀释),
