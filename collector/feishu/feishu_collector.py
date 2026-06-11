@@ -71,26 +71,32 @@ def load_feilian_map():
     # 同一 dict 双索引:user_id 键(ou_*) + email 键(含 @，与 uid 不冲突)。
     # user_id 命中不了的 aily 用户(externalID 不是飞连 user_id) → 按合成 email 兜底解析，
     # 拿到真实 department_path，不再落「裸组名→未归类」(孙可 2026-06-11)。
+    # 分页循环也包在 try 内:飞连分页中途失败 → 保留已载部分(优雅降级)，绝不让采集崩
+    # (codex 评审:飞连不可达→采集器照常落库，不崩)。
     m, offset, n = {}, 0, 0
-    while True:
-        data = fc._request("GET", "/api/open/v2/user/list",
-                           query={"department_id": root, "fetch_child": "true",
-                                  "limit": 100, "offset": offset})
-        ul = (data or {}).get("user_list") or []
-        for u in ul:
-            rec = {"email": (u.get("email") or "").lower(),
-                   "name": u.get("full_name") or "",
-                   "dept": u.get("department_path") or "unknown",
-                   "avatar": u.get("avatar") or ""}
-            uid = u.get("user_id")
-            if uid:
-                m[uid] = rec
-            if rec["email"]:
-                m[rec["email"]] = rec   # email 兜底索引
-            n += 1
-        if len(ul) < 100:
-            break
-        offset += 100
+    try:
+        while True:
+            data = fc._request("GET", "/api/open/v2/user/list",
+                               query={"department_id": root, "fetch_child": "true",
+                                      "limit": 100, "offset": offset})
+            ul = (data or {}).get("user_list") or []
+            for u in ul:
+                rec = {"email": (u.get("email") or "").lower(),
+                       "name": u.get("full_name") or "",
+                       "dept": u.get("department_path") or "unknown",
+                       "avatar": u.get("avatar") or ""}
+                uid = u.get("user_id")
+                if uid:
+                    m[uid] = rec
+                if rec["email"]:
+                    m[rec["email"]] = rec   # email 兜底索引
+                n += 1
+            if len(ul) < 100:
+                break
+            offset += 100
+    except Exception as e:
+        log(f"飞连分页中断({n} 人已载，其余用飞书自带身份兜底): {e}")
+        return m or None        # 有部分用部分，全无则 None → normalize 退回飞书裸名
     log(f"飞连身份预载 {n} 人")
     return m
 

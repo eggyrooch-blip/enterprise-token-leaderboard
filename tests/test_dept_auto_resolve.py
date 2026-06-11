@@ -199,6 +199,34 @@ def test_feishu_email_fallback_resolves_dept():
     assert m["name"] == "罗锐"
 
 
+def test_feishu_load_map_survives_pagination_failure(monkeypatch):
+    """codex 评审:飞连分页中途网络失败,load_feilian_map 不能抛出崩掉采集器,
+    应保留已载部分(或返回 None),让 normalize 退回飞书裸名。"""
+    import feishu_collector as F
+    F = importlib.reload(F)
+
+    calls = {"n": 0}
+
+    class FlakyFC:
+        def root_department_id(self): return "root"
+        def _request(self, *a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # 第一页正常返回 100 人(凑满促使继续翻页)
+                return {"user_list": [{"user_id": "ou_%d" % i, "email": "u%d@keep.com" % i,
+                                       "full_name": "U%d" % i, "department_path": "Keep/A"}
+                                      for i in range(100)]}
+            raise RuntimeError("feilian 5xx mid-pagination")   # 第二页炸
+
+    import types
+    fake_mod = types.ModuleType("feilian_client")
+    fake_mod.FeilianClient = lambda: FlakyFC()
+    monkeypatch.setitem(sys.modules, "feilian_client", fake_mod)
+
+    m = F.load_feilian_map()   # 不应抛异常
+    assert m is not None and len(m) >= 100   # 保留了第一页已载部分(优雅降级)
+
+
 def test_feishu_no_match_keeps_bare_fallback():
     import feishu_collector as F
     F = importlib.reload(F)
