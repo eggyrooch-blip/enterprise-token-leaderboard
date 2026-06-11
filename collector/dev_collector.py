@@ -1010,6 +1010,8 @@ class H(BaseHTTPRequestHandler):
         nodes = {}  # path -> {tokens, cost, messages, credits, token_users, aily_users}
         for email, p in per.items():
             cd = _canon_dept(email, p["depts"])
+            if cd == "Keep/未归类":
+                continue   # 解析不到真实部门(离职/飞连外)→ 跳过,不污染部门榜(孙可 2026-06-11)
             for anc in _ancestors(cd):
                 n = _node(anc)
                 n["tokens"] += p["tok"]
@@ -1030,7 +1032,9 @@ class H(BaseHTTPRequestHandler):
             for email, fdept, credits in aily_rows:
                 # people.dept 优先,否则用 feishu_member.dept;统一过 _to_keep —— 裸供应商(SP码)
                 # 也收口到外部合作商,不再因「不以 Keep 开头」误落未归类(codex 评审发现)。
-                cd = _to_keep(pdept.get(email)) or _to_keep(fdept) or "Keep/未归类"
+                cd = _to_keep(pdept.get(email)) or _to_keep(fdept)
+                if not cd:
+                    continue   # 飞连查不到真实部门(离职/飞连外纯飞书用户)→ 跳过,不进未归类(孙可 2026-06-11)
                 for anc in _ancestors(cd):
                     n = _node(anc)
                     n["credits"] += credits or 0

@@ -96,6 +96,44 @@ def test_teams_collapses_multiple_suppliers_into_one_node(dc, monkeypatch):
     assert tops == ["Keep"]
 
 
+def test_unresolved_aily_user_dropped_not_uncategorized(dc, monkeypatch):
+    """孙可 2026-06-11:解析不到真实部门的人(离职/飞连外纯飞书用户,如罗锐@品质组)
+    从部门榜跳过,不堆进 Keep/未归类。未归类节点应消失。"""
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    conn.execute("INSERT INTO feishu_member VALUES('luorui@keep.com','罗锐','品质组',"
+                 "'aily_credits',300,'2026-06-01','2026-06-07','')")
+    conn.commit()  # 裸非 SP 组名、无 people 行 → 解析失败
+    teams = _teams(dc, conn, monkeypatch, {})
+    assert all("未归类" not in d for d in teams)
+
+
+def test_unresolved_token_user_dropped_not_uncategorized(dc, monkeypatch):
+    """token 用户 people.dept 空且 usage.dept 裸别名(归不到 Keep)→ 跳过,不进未归类。"""
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    conn.execute("INSERT INTO usage VALUES('ghost@keep.com','某裸别名','lifetime','all',"
+                 "'litellm','LiteLLM',500,1,5)")
+    conn.execute("INSERT INTO people VALUES('ghost@keep.com','ghost','','')")
+    conn.commit()
+    teams = _teams(dc, conn, monkeypatch, {})
+    assert "Keep/未归类" not in teams
+
+
+def test_resolved_users_not_dropped(dc, monkeypatch):
+    """正常 Keep 用户 + 外部供应商(SP码)不被误伤,照常出现;未归类不出现。"""
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    conn.execute("INSERT INTO usage VALUES('a@keep.com','Keep/CFO 线/法务部','lifetime','all','subscription','Claude Code',900,1,5)")
+    conn.execute("INSERT OR REPLACE INTO people VALUES('a@keep.com','a','','Keep/CFO 线/法务部')")
+    conn.execute("INSERT INTO feishu_member VALUES('wb@keep.com','文洁','四川乔木禾电子商务有限公司(SP000442)','aily_credits',80,'2026-06-01','2026-06-07','')")
+    conn.commit()
+    teams = _teams(dc, conn, monkeypatch, {})
+    assert "Keep/CFO 线/法务部" in teams
+    assert "Keep/外部合作商/四川乔木禾电子商务有限公司(SP000442)" in teams
+    assert "Keep/未归类" not in teams
+
+
 def test_bare_sp_aily_user_routes_to_external_not_uncategorized(dc, monkeypatch):
     """codex 评审发现:纯 aily 用户 feishu.dept 是裸供应商名(带 SP码、不以 Keep 开头)时，
     旧逻辑只在 startswith('Keep') 才归一 → 落未归类。应收口到 Keep/外部合作商，不落未归类。"""
