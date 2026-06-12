@@ -154,7 +154,7 @@ def test_hermes_usage_autofills_people_from_feilian(monkeypatch):
 
         def user_by_email(self, email, root):
             assert root == "root"
-            if email == "fresh@keep.com":
+            if email == "fresh@example.com":
                 return {
                     "full_name": "新用户",
                     "avatar": "https://avatar.example/fresh.png",
@@ -170,7 +170,7 @@ def test_hermes_usage_autofills_people_from_feilian(monkeypatch):
     conn = _conn()
     payload = [
         {
-            "email": "fresh@keep.com",
+            "email": "fresh@example.com",
             "dept": "unknown",
             "model": "m",
             "input_tokens": 7,
@@ -178,10 +178,10 @@ def test_hermes_usage_autofills_people_from_feilian(monkeypatch):
         }
     ]
     dev_collector._upsert_hermes_usage(conn, "hermes", "Hermes", "2026-06-12", payload)
-    filled = dev_collector._autofill_people_for_emails(conn, ["fresh@keep.com"])
+    filled = dev_collector._autofill_people_for_emails(conn, ["fresh@example.com"])
 
     assert filled == 1
-    assert conn.execute("SELECT name,dept FROM people WHERE email='fresh@keep.com'").fetchone() == (
+    assert conn.execute("SELECT name,dept FROM people WHERE email='fresh@example.com'").fetchone() == (
         "新用户",
         "Keep/客户服务中心/客服运营部/运营支持组",
     )
@@ -198,7 +198,7 @@ def test_hermes_people_autofill_is_best_effort_when_feilian_fails(monkeypatch):
     monkeypatch.setattr(dev_collector, "_fc", None)
 
     conn = _conn()
-    filled = dev_collector._autofill_people_for_emails(conn, ["fresh@keep.com"])
+    filled = dev_collector._autofill_people_for_emails(conn, ["fresh@example.com"])
 
     assert filled == 0
     assert conn.execute("SELECT COUNT(*) FROM people").fetchone() == (0,)
@@ -224,12 +224,12 @@ def test_hermes_people_autofill_preserves_existing_complete_people_row(monkeypat
     conn = _conn()
     conn.execute(
         "INSERT INTO people(email,name,avatar,dept) VALUES(?,?,?,?)",
-        ("known@keep.com", "已知用户", "https://avatar.example/known.png", "Keep/技术平台部/基础技术部/IT 组"),
+        ("known@example.com", "已知用户", "https://avatar.example/known.png", "Keep/技术平台部/基础技术部/IT 组"),
     )
-    filled = dev_collector._autofill_people_for_emails(conn, ["known@keep.com"])
+    filled = dev_collector._autofill_people_for_emails(conn, ["known@example.com"])
 
     assert filled == 0
-    assert conn.execute("SELECT name,dept FROM people WHERE email='known@keep.com'").fetchone() == (
+    assert conn.execute("SELECT name,dept FROM people WHERE email='known@example.com'").fetchone() == (
         "已知用户",
         "Keep/技术平台部/基础技术部/IT 组",
     )
@@ -238,6 +238,7 @@ def test_hermes_people_autofill_preserves_existing_complete_people_row(monkeypat
 def test_usage_report_commits_usage_before_people_autofill(monkeypatch, tmp_path):
     db_path = tmp_path / "tok.db"
     monkeypatch.setattr(dev_collector, "DB", str(db_path))
+    monkeypatch.setattr(dev_collector, "TOKENS", {"devtoken"})
     observed = []
 
     def observe_committed_usage(_conn, _records):
@@ -245,7 +246,7 @@ def test_usage_report_commits_usage_before_people_autofill(monkeypatch, tmp_path
             observed.append(
                 probe.execute(
                     "SELECT total FROM usage WHERE email=? AND client=? AND period_type=?",
-                    ("fresh@keep.com", "Hermes", "day"),
+                    ("fresh@example.com", "Hermes", "day"),
                 ).fetchone()
             )
         return 0
@@ -261,7 +262,7 @@ def test_usage_report_commits_usage_before_people_autofill(monkeypatch, tmp_path
             "client": "Hermes",
             "date": "2026-06-12",
             "records": [
-                {"email": "fresh@keep.com", "model": "m", "input_tokens": 7, "output_tokens": 8}
+                {"email": "fresh@example.com", "model": "m", "input_tokens": 7, "output_tokens": 8}
             ],
         }
         req = urllib.request.Request(
