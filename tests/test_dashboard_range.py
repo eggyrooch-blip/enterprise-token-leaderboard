@@ -26,3 +26,18 @@ def test_no_duplicate_outer_range_buttons():
     assert 'data-q="d7"' in html and 'data-q="d30"' in html, (
         "日历快捷预设 近7/近30 天必须保留"
     )
+
+
+def test_hermes_board_is_standalone_after_litellm():
+    html = DASHBOARD.read_text(encoding="utf-8")
+
+    litellm_pos = html.index('data-t="litellm"')
+    hermes_pos = html.index('data-t="hermes"')
+    agent_pos = html.index('data-t="agent"')
+
+    assert litellm_pos < hermes_pos < agent_pos
+    assert "Hermes 榜" in html
+    assert "encodeURIComponent('Hermes')" in html
+    assert "CACHE.hermes=hm.leaderboard||[]" in html
+    assert "CUR==='hermes'" in html
+    assert "'Hermes'" in html[html.index("var TOOL_COLOR="):html.index("function toolColor")]

@@ -216,6 +216,7 @@
       <button class="tab" data-t="claude"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 2.6 1.4 4.9 3.5 6.2V18a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1v-2.8A7 7 0 0 0 12 2Z"/><path d="M9 22h6"/></svg>Claude 榜</button>
       <button class="tab" data-t="codex"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>Codex 榜</button>
       <button class="tab" data-t="litellm"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/></svg>LiteLLM 榜</button>
+      <button class="tab" data-t="hermes"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4Z"/></svg>Hermes 榜</button>
       <button class="tab" data-t="agent"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>Agent 榜</button>
       <button class="tab" data-t="governance"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>大厂治理指标</button>
       <button class="tab" data-t="feishu"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 5.4L20 8l-4 4 1 6-5-2.8L7 18l1-6-4-4 5.6-.6L12 2Z"/></svg>飞书 AI 权益</button>
@@ -248,7 +249,7 @@ function metricTok(n){n=n||0; return Math.round(METRIC==='daily' ? n/rangeDays()
 function compact(n){n=n||0; if(n>=1e8)return (n/1e8).toFixed(n>=1e9?1:2)+' 亿'; if(n>=1e4)return (n/1e4).toFixed(1)+' 万'; return (n).toLocaleString('en-US');}
 function grp(n){return (n||0).toLocaleString('en-US');}
 function ini(s){s=s||'·'; var a=s.split('@')[0]; return a.slice(-2);}
-var TOOL_COLOR={'Claude Code':'#24C789','Codex CLI':'#5A87F9','Cursor':'#6D51F4','Gemini CLI':'#F5824E','Kimi CLI':'#17BEB2','OpenCode':'#A4D44C','LiteLLM':'#FFB15A'};
+var TOOL_COLOR={'Claude Code':'#24C789','Codex CLI':'#5A87F9','Cursor':'#6D51F4','Gemini CLI':'#F5824E','Kimi CLI':'#17BEB2','OpenCode':'#A4D44C','LiteLLM':'#FFB15A','Hermes':'#E06B8A','hermes':'#E06B8A'};
 function toolColor(c){return TOOL_COLOR[c]||'#CCCCCC';}
 function shortTool(c){return (c||'').replace(' Code','').replace(' CLI','');}
 // 部门路径去掉最前面的 "Keep/" 前缀(以及单独 "Keep")
@@ -297,19 +298,20 @@ async function load(){
   var qp = parts.join('&');
   var q = qp ? ('?'+qp) : '';
   var qa = qp ? ('&'+qp) : '';
-  var [lb,tm,tool,model,cur,ag,gov,cc,cx,ll,fs]=await Promise.all([
+  var [lb,tm,tool,model,cur,ag,gov,cc,cx,ll,hm,fs]=await Promise.all([
     j('/v1/leaderboard'+q), j('/v1/teams'+q),
     j('/v1/breakdown?by=client'+qa), j('/v1/breakdown?by=model'+qa), j('/v1/cursor'+q),
     j('/v1/agent_leaderboard'+q), j('/v1/governance_metrics'),
     j('/v1/leaderboard?client='+encodeURIComponent('Claude Code')+qa),
     j('/v1/leaderboard?client='+encodeURIComponent('Codex CLI')+qa),
     j('/v1/leaderboard?client='+encodeURIComponent('LiteLLM')+qa),   // LiteLLM 榜=网关用量(已自动排除 agent)
+    j('/v1/leaderboard?client='+encodeURIComponent('Hermes')+qa),
     j('/v1/feishu'+(SHOW_DEPARTED?'?show_departed=1':''))   // 飞书 AI 权益(独立周期快照,不受 token 时间范围影响)
   ]);
   CACHE.person=lb.leaderboard||[]; CACHE.team=tm.teams||[];
   CACHE.tool=tool.breakdown||[]; CACHE.model=model.breakdown||[]; CACHE.cursor=cur.cursor||[];
   CACHE.agent=ag.agent_leaderboard||[]; CACHE.governance=gov.metrics||GOVERNANCE_METRICS;
-  CACHE.claude=cc.leaderboard||[]; CACHE.codex=cx.leaderboard||[]; CACHE.litellm=ll.leaderboard||[]; CACHE.feishu=fs||{};
+  CACHE.claude=cc.leaderboard||[]; CACHE.codex=cx.leaderboard||[]; CACHE.litellm=ll.leaderboard||[]; CACHE.hermes=hm.leaderboard||[]; CACHE.feishu=fs||{};
   // KPI
   var tot=CACHE.person.reduce(function(a,x){return a+(x.tokens||0)},0);
   var cost=CACHE.person.reduce(function(a,x){return a+(x.cost||0)},0);
@@ -471,7 +473,7 @@ function render(){
   var tot=rows.reduce(function(a,x){return a+mv(x)},0);
   var __body=rows.map(function(x,i){
     var name,sub,av='';
-    if(CUR==='person'||CUR==='cursor'||CUR==='claude'||CUR==='codex'||CUR==='litellm'){
+    if(CUR==='person'||CUR==='cursor'||CUR==='claude'||CUR==='codex'||CUR==='litellm'||CUR==='hermes'){
       name=x.name||(x.email||'').split('@')[0]||'—';
       if(CUR==='person' && x.via==='manual') name+='<span class="tag-m" title="最近一次为员工手工补报,非 MDM 自动采集">手工</span>';
       if(x.departed) name+='<span class="tag-off" title="该员工已离职">离职</span>';   // 灰色离职小标签
@@ -513,8 +515,8 @@ function render(){
     } else if(isCur){
       fillHTML='<div class="fill" style="width:'+pct+'%;background:'+toolColor("Cursor")+'"></div>';
       big=compact(mv(x)); small='$'+grp(Math.round(x.cost||0))+' · '+grp(x.requests||0)+' 次 · '+share.toFixed(1)+'%';
-    } else if(CUR==='claude'||CUR==='codex'||CUR==='litellm'){
-      var ccol=toolColor(CUR==='claude'?'Claude Code':(CUR==='codex'?'Codex CLI':'LiteLLM'));
+    } else if(CUR==='claude'||CUR==='codex'||CUR==='litellm'||CUR==='hermes'){
+      var ccol=toolColor(CUR==='claude'?'Claude Code':(CUR==='codex'?'Codex CLI':(CUR==='litellm'?'LiteLLM':'Hermes')));
       fillHTML='<div class="fill" style="width:'+pct+'%;background:'+ccol+'"></div>';
       big=compact(mv(x)); small='$'+grp(Math.round(x.cost||0))+(x.messages?(' · '+grp(x.messages)+' 条'):'')+' · '+share.toFixed(1)+'%';
     } else if(isTeam){
@@ -534,7 +536,7 @@ function render(){
   var __lg='';
   if(CUR==='person'){
     var present={}; rows.forEach(function(r){(r.composition||[]).forEach(function(s){present[s.client]=1;});});
-    var order=['Claude Code','Codex CLI','Cursor','Gemini CLI','Kimi CLI','OpenCode','LiteLLM'];
+    var order=['Claude Code','Codex CLI','Cursor','Gemini CLI','Kimi CLI','OpenCode','LiteLLM','Hermes','hermes'];
     var keys=order.filter(function(c){return present[c];});
     Object.keys(present).forEach(function(c){if(order.indexOf(c)<0)keys.push(c);});
     __lg='<div class="legend">'+keys.map(function(c){return '<span class="lg"><i style="background:'+toolColor(c)+'"></i>'+c+'</span>';}).join('')+'</div>';
