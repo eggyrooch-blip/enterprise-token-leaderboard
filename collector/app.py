@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import calendar
 import os
 from datetime import date, datetime, timedelta
 from typing import List, Mapping, Optional
@@ -57,11 +58,38 @@ def months_overlapped(start: date | str, end: date | str) -> int:
     return (end_d.year - start_d.year) * 12 + (end_d.month - start_d.month) + 1
 
 
-def _subscription_months(days: int) -> int:
+def prorated_month_fraction(start: date | str, end: date | str) -> float:
+    """按天摊销的「月费倍数」：闭区间 [start, end] 横跨的每个自然月，
+    取「窗口落在该月的天数 / 该月总天数」之和。
+
+    6/6~6/12（含首尾 7 天，6 月 30 天）=> 7/30；5/14~6/12 => 18/31 + 12/30；
+    整月 6/1~6/30 => 恰好 1.0；end < start（坏数据）=> 1.0（至少 1 月，防 0/负）。
+    """
+    start_d = _coerce_date(start)
+    end_d = _coerce_date(end)
+    if end_d < start_d:
+        return 1.0
+    fraction = 0.0
+    year, month = start_d.year, start_d.month
+    while (year, month) <= (end_d.year, end_d.month):
+        days_in_month = calendar.monthrange(year, month)[1]
+        month_first = date(year, month, 1)
+        month_last = date(year, month, days_in_month)
+        seg_start = start_d if start_d > month_first else month_first
+        seg_end = end_d if end_d < month_last else month_last
+        fraction += ((seg_end - seg_start).days + 1) / days_in_month
+        if month == 12:
+            year, month = year + 1, 1
+        else:
+            month += 1
+    return fraction
+
+
+def _subscription_fraction(days: int) -> float:
     today = date.today()
     span = max(int(days or 1), 1)
     start = today - timedelta(days=span - 1)
-    return months_overlapped(start, today)
+    return prorated_month_fraction(start, today)
 
 
 async def _fetch_subscriptions(conn: asyncpg.Connection) -> tuple[dict[str, list[dict]], dict[str, float], dict[str, dict[str, str]]]:
@@ -106,10 +134,10 @@ def _subscription_text(subs: list[dict]) -> str:
 def _aggregate_rows_to_email(
     rows: list[Mapping[str, object]],
     fee_by_email: Mapping[str, float],
-    months: int,
+    fee_fraction: float,
     profile_by_email: Mapping[str, Mapping[str, str]],
 ) -> list[dict[str, object]]:
-    """Collapse usage rows to one row per email, then add subscription fee once."""
+    """Collapse usage rows to one row per email, then add the day-prorated subscription fee once."""
     by_email: dict[str, dict[str, object]] = {}
     best_dept_tokens: dict[str, int] = {}
     for row in rows:
@@ -144,7 +172,7 @@ def _aggregate_rows_to_email(
             best_dept_tokens[email] = total_tokens
     for email, person in by_email.items():
         person["gateway_cost"] = round(float(person["gateway_cost"] or 0.0), 4)
-        person["cost_usd"] = round(float(person["gateway_cost"] or 0.0) + fee_by_email.get(email, 0.0) * months, 4)
+        person["cost_usd"] = round(float(person["gateway_cost"] or 0.0) + fee_by_email.get(email, 0.0) * fee_fraction, 4)
     return list(by_email.values())
 
 
@@ -279,8 +307,8 @@ async def leaderboard(days: int = 30, source: str = "all", limit: int = 100) -> 
     async with _pool.acquire() as conn:
         subs_by_email, fee_by_email, profile_by_email = await _fetch_subscriptions(conn)
         rows = await conn.fetch(sql, *args)
-    months = _subscription_months(days)
-    aggregated_rows = _aggregate_rows_to_email([dict(r) for r in rows], fee_by_email, months, profile_by_email)
+    fee_fraction = _subscription_fraction(days)
+    aggregated_rows = _aggregate_rows_to_email([dict(r) for r in rows], fee_by_email, fee_fraction, profile_by_email)
     ranking = []
     seen_emails = set()
     # 公司实付口径：订阅费按窗口触达自然月数整月计；usage cost 只取 api/litellm 实销，
@@ -341,8 +369,8 @@ async def dashboard(days: int = 30) -> str:
                    ROUND(100.0*SUM(lines_accepted)/NULLIF(SUM(lines_suggested),0),1) rate
             FROM code_daily WHERE usage_date >= {window}
             GROUP BY dept ORDER BY acc DESC""", days)
-    months = _subscription_months(days)
-    aggregated_rows = _aggregate_rows_to_email([dict(r) for r in ppl], fee_by_email, months, profile_by_email)
+    fee_fraction = _subscription_fraction(days)
+    aggregated_rows = _aggregate_rows_to_email([dict(r) for r in ppl], fee_by_email, fee_fraction, profile_by_email)
     ppl_rows = []
     seen_emails = set()
     for r in aggregated_rows:

@@ -17,6 +17,7 @@
 部署：CentOS7 + Python 3.6.8 / macOS Python3 均可。
 环境变量：COLLECTOR_API_TOKENS=devtoken  DEV_DB=/tmp/tok.db  PORT=8090
 """
+import calendar
 import datetime
 import json
 import os
@@ -340,6 +341,36 @@ def months_overlapped(start, end):
     return (end_d.year - start_d.year) * 12 + (end_d.month - start_d.month) + 1
 
 
+def prorated_month_fraction(start, end):
+    """按天摊销的「月费倍数」：闭区间 [start,end] 横跨的每个自然月，
+    取「窗口落在该月的天数 / 该月总天数」之和。
+
+    例如 6/6~6/12（含首尾 7 天，6 月 30 天）=> 7/30；
+    5/14~6/12 => 18/31 + 12/30；整月 6/1~6/30 => 30/30 = 恰好 1.0。
+    end < start（坏数据）时回退为 1.0，与 months_overlapped 的「至少 1 月」语义一致，
+    防止订阅费被算成 0 或负数。
+    """
+    start_d = _coerce_date(start)
+    end_d = _coerce_date(end)
+    if end_d < start_d:
+        return 1.0
+    fraction = 0.0
+    year, month = start_d.year, start_d.month
+    while (year, month) <= (end_d.year, end_d.month):
+        days_in_month = calendar.monthrange(year, month)[1]
+        month_first = datetime.date(year, month, 1)
+        month_last = datetime.date(year, month, days_in_month)
+        seg_start = start_d if start_d > month_first else month_first
+        seg_end = end_d if end_d < month_last else month_last
+        days_in_window = (seg_end - seg_start).days + 1
+        fraction += days_in_window / days_in_month
+        if month == 12:
+            year, month = year + 1, 1
+        else:
+            month += 1
+    return fraction
+
+
 def load_subscriptions(conn):
     """subscriptions 表 -> {email: [{tool,tier,fee}, ...]}。
 
@@ -373,6 +404,21 @@ _CLIENT_LABELS = {
     "opencode": "OpenCode",
     "kimi": "Kimi CLI",
 }
+_CLIENT_TO_SUB_TOOL = {
+    "Claude Code": "claude",
+    "Codex CLI": "codex",
+    "Cursor": "cursor",
+}
+
+
+def _single_tool_subs(subs_by_email, email, tool):
+    # 工具榜只挂同工具的单个订阅徽标,复用个人榜 subs 结构避免前端分叉。
+    if not tool:
+        return []
+    for sub in subs_by_email.get(email, []):
+        if (sub.get("tool") or "").lower() == tool:
+            return [sub]
+    return []
 
 # 用 INSERT OR REPLACE 而非 ON CONFLICT DO UPDATE：
 # 后者需 SQLite ≥3.24，而部署目标(CentOS7)是 3.7.17。
@@ -1274,6 +1320,13 @@ class H(BaseHTTPRequestHandler):
             result.append(row)
             by_email[r[0]] = row
 
+        # 工具榜只回传对应工具的单个订阅,不把订阅费并进 cost。
+        subs_by_email = load_subscriptions(conn)
+        sub_tool = _CLIENT_TO_SUB_TOOL.get(cli)
+        if cli:
+            for row in result:
+                row["subs"] = _single_tool_subs(subs_by_email, row["email"], sub_tool)
+
         # 飞书 AI 权益并入个人榜:1 点 = 1 token,计入总量参与排序(孙可 2026-06-12)。
         # 只在主个人榜并入;带 ?client 的工具榜(Claude/Codex/Cursor/LiteLLM/Hermes)不并。
         # 纯飞书用户(无 token 用量)也建行进榜,排序靠后无妨(孙可:不用显出来)。
@@ -1306,7 +1359,6 @@ class H(BaseHTTPRequestHandler):
                 row["feishu_credits"] = credits   # 单列飞书点数,前端可标注「含飞书 X 点」
                 row["composition"].append({"client": "飞书AI权益", "tokens": credits})
 
-            subs_by_email = load_subscriptions(conn)
             usage_window_start = {}
             if cost_start is None:
                 for mr in conn.execute("""
@@ -1318,21 +1370,22 @@ class H(BaseHTTPRequestHandler):
                     if mr[0] and mr[1]:
                         usage_window_start[mr[0]] = mr[1]
 
-            def _months_for(email):
+            def _fee_fraction_for(email):
+                # 订阅费按天摊销：窗口落在每个自然月的天数 / 该月总天数之和。
                 if cost_start is not None and cost_end is not None:
-                    return months_overlapped(cost_start, cost_end)
+                    return prorated_month_fraction(cost_start, cost_end)
                 if usage_window_start.get(email):
-                    return months_overlapped(usage_window_start[email], today)
+                    return prorated_month_fraction(usage_window_start[email], today)
                 # lifetime/all 且此人没有任何 usage 明细时，纯订阅用户按 1 个月算。
-                return 1
+                return 1.0
 
             for row in result:
                 subs = list(subs_by_email.get(row["email"], []))
                 row["subs"] = subs
                 if not subs:
                     continue
-                months = _months_for(row["email"])
-                fee_total = sum(float(s.get("fee") or 0) * months for s in subs)
+                fraction = _fee_fraction_for(row["email"])
+                fee_total = sum(float(s.get("fee") or 0) * fraction for s in subs)
                 row["cost"] = round(float(row["cost"] or 0) + fee_total, 4)
 
         # 飞书并入后总量可能变 → 统一算 composition 占比 + 重排
@@ -1393,6 +1446,8 @@ class H(BaseHTTPRequestHandler):
             ORDER BY SUM(u.total) DESC
         """ % (where, dep_clause), params).fetchall()
         result = []
+        # Cursor 榜只挂 cursor 订阅徽标,不带其他工具。
+        subs_by_email = load_subscriptions(conn)
         for r in rows:
             result.append({
                 "email": r[0], "dept": _to_keep(r[12]) or _normalize_dept_path(r[1]),  # 优先 people.dept(飞连全路径)
@@ -1402,6 +1457,7 @@ class H(BaseHTTPRequestHandler):
                 "cost": round(r[8] or 0, 2), "requests": r[9] or 0,
                 "name": r[10] or (r[0] or "").split("@")[0], "avatar": r[11] or "",
                 "departed": r[0] in departed,
+                "subs": _single_tool_subs(subs_by_email, r[0], "cursor"),
             })
         self._send(200, {"cursor": result})
 

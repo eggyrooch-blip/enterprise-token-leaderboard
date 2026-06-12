@@ -43,6 +43,13 @@ def _leaderboard(dc, conn, qs):
     return handler.payload["leaderboard"]
 
 
+def _cursor_rows(dc, conn, qs):
+    handler = _DummyHandler()
+    dc.H._cursor(handler, conn, qs)
+    assert handler.code == 200
+    return handler.payload["cursor"]
+
+
 def _governance(dc, conn):
     handler = _DummyHandler()
     dc.H._governance_metrics(handler, conn)
@@ -84,10 +91,11 @@ def _idle_subscription(payload):
     return payload["summary"]["subscriptions"]["idle"]
 
 
-def test_months_overlapped_counts_distinct_calendar_months(dc):
-    assert dc.months_overlapped("2026-06-01", "2026-06-30") == 1
-    assert dc.months_overlapped("2026-06-30", "2026-07-01") == 2
-    assert dc.months_overlapped("2026-05-31", "2026-07-01") == 3
+def test_prorated_month_fraction_examples(dc):
+    assert dc.prorated_month_fraction("2026-06-06", "2026-06-12") == pytest.approx(7 / 30)
+    assert dc.prorated_month_fraction("2026-05-14", "2026-06-12") == pytest.approx((18 / 31) + (12 / 30))
+    assert dc.prorated_month_fraction("2026-06-01", "2026-06-30") == 1.0
+    assert dc.prorated_month_fraction("2026-06-12", "2026-06-11") == 1.0
 
 
 def test_idle_subscription_person_is_absent_from_leaderboard_and_exposed_in_governance(dc, monkeypatch, tmp_path):
@@ -134,7 +142,7 @@ def test_person_cost_uses_gateway_actual_plus_subscription_fee(dc, monkeypatch, 
 
     row = _row_by_email(rows, "mix@keep.com")
     assert row["tokens"] == 200
-    assert row["cost"] == 203.5
+    assert row["cost"] == 101.5645
     assert row["subs"] == [{"tool": "claude", "tier": "premium", "fee": 100.0, "seats": 1}]
     assert _idle_subscription(payload) == {"count": 0, "monthly_fee_usd": 0.0, "people": []}
 
@@ -156,7 +164,8 @@ def test_subscription_removal_drops_fee_and_badges(dc, monkeypatch, tmp_path):
     finally:
         conn.close()
 
-    assert before["cost"] == 81.25
+    # days=30 @ today=2026-06-12 → window 2026-05-14..2026-06-12 → 摊销倍数 18/31 + 12/30。
+    assert before["cost"] == round(1.25 + 40.0 * ((18 / 31) + (12 / 30)), 4)
     assert before["subs"] == [{"tool": "cursor", "tier": "standard", "fee": 40.0, "seats": 1}]
     assert after["cost"] == 1.25
     assert after["subs"] == []
@@ -200,5 +209,110 @@ def test_subscription_cost_uses_aggregated_fee_row_and_preserves_seats(dc, monke
 
     row = _row_by_email(rows, "seats@keep.com")
     assert row["tokens"] == 20
-    assert row["cost"] == 100.75
+    assert row["cost"] == 49.7823
     assert row["subs"] == [{"tool": "codex", "tier": "standard", "fee": 50.0, "seats": 2}]
+
+
+def test_subscription_cost_prorates_fee_inside_one_month_and_keeps_stored_seat_multiplier(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "premium@keep.com", "Premium", "Keep/平台/基础")
+        _insert_sub(conn, "premium@keep.com", "claude", "premium", 240.0, "Premium", "Keep/平台/基础", seats=3)
+        _insert_usage(dc, conn, "premium@keep.com", "Keep/平台/基础", "2026-06-06", "api", "Hermes", 10, 0.5, 1)
+        conn.commit()
+
+        rows = _leaderboard(dc, conn, {"days": ["7"]})
+    finally:
+        conn.close()
+
+    row = _row_by_email(rows, "premium@keep.com")
+    assert row["cost"] == round(0.5 + 240.0 * (7 / 30), 4)
+    assert row["subs"] == [{"tool": "claude", "tier": "premium", "fee": 240.0, "seats": 3}]
+
+
+def test_cursor_board_attaches_only_cursor_badge_and_keeps_gateway_cost(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "cursor-sub@keep.com", "Cursor Sub", "Keep/平台/基础")
+        _insert_people(conn, "cursor-none@keep.com", "Cursor None", "Keep/平台/基础")
+        _insert_people(conn, "cursor-leak@keep.com", "Cursor Leak", "Keep/平台/基础")
+        _insert_sub(conn, "cursor-sub@keep.com", "cursor", "standard", 40.0, "Cursor Sub", "Keep/平台/基础")
+        _insert_sub(conn, "cursor-sub@keep.com", "claude", "premium", 120.0, "Cursor Sub", "Keep/平台/基础")
+        _insert_sub(conn, "cursor-leak@keep.com", "claude", "premium", 120.0, "Cursor Leak", "Keep/平台/基础")
+        _insert_usage(dc, conn, "cursor-sub@keep.com", "Keep/平台/基础", "2026-06-10", "cursor", "Cursor", 150, 4.2, 7)
+        _insert_usage(dc, conn, "cursor-none@keep.com", "Keep/平台/基础", "2026-06-10", "cursor", "Cursor", 120, 1.8, 5)
+        _insert_usage(dc, conn, "cursor-leak@keep.com", "Keep/平台/基础", "2026-06-10", "cursor", "Cursor", 90, 2.6, 4)
+        conn.commit()
+
+        rows = _cursor_rows(dc, conn, {"days": ["30"]})
+    finally:
+        conn.close()
+
+    subbed = _row_by_email(rows, "cursor-sub@keep.com")
+    assert subbed["cost"] == 4.2
+    assert subbed["subs"] == [{"tool": "cursor", "tier": "standard", "fee": 40.0, "seats": 1}]
+    assert _row_by_email(rows, "cursor-none@keep.com")["subs"] == []
+    assert _row_by_email(rows, "cursor-leak@keep.com")["subs"] == []
+
+
+def test_claude_board_attaches_only_claude_badge_and_keeps_gateway_cost(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "claude-sub@keep.com", "Claude Sub", "Keep/平台/基础")
+        _insert_people(conn, "claude-none@keep.com", "Claude None", "Keep/平台/基础")
+        _insert_people(conn, "claude-leak@keep.com", "Claude Leak", "Keep/平台/基础")
+        _insert_sub(conn, "claude-sub@keep.com", "claude", "premium", 120.0, "Claude Sub", "Keep/平台/基础")
+        _insert_sub(conn, "claude-sub@keep.com", "cursor", "standard", 40.0, "Claude Sub", "Keep/平台/基础")
+        _insert_sub(conn, "claude-leak@keep.com", "codex", "standard", 30.0, "Claude Leak", "Keep/平台/基础")
+        _insert_usage(dc, conn, "claude-sub@keep.com", "Keep/平台/基础", "2026-06-10", "subscription", "Claude Code", 210, 9.5, 3)
+        _insert_usage(dc, conn, "claude-none@keep.com", "Keep/平台/基础", "2026-06-10", "subscription", "Claude Code", 120, 2.0, 2)
+        _insert_usage(dc, conn, "claude-leak@keep.com", "Keep/平台/基础", "2026-06-10", "subscription", "Claude Code", 100, 1.2, 1)
+        conn.commit()
+
+        rows = _leaderboard(dc, conn, {"client": ["Claude Code"], "days": ["30"]})
+        person_rows = _leaderboard(dc, conn, {"days": ["30"]})
+    finally:
+        conn.close()
+
+    subbed = _row_by_email(rows, "claude-sub@keep.com")
+    assert subbed["cost"] == 0
+    assert subbed["subs"] == [{"tool": "claude", "tier": "premium", "fee": 120.0, "seats": 1}]
+    assert _row_by_email(person_rows, "claude-sub@keep.com")["cost"] == round((120.0 + 40.0) * ((18 / 31) + (12 / 30)), 4)
+    assert _row_by_email(rows, "claude-none@keep.com")["subs"] == []
+    assert _row_by_email(rows, "claude-leak@keep.com")["subs"] == []
+
+
+def test_codex_board_attaches_only_codex_badge_and_keeps_gateway_cost(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "codex-sub@keep.com", "Codex Sub", "Keep/平台/基础")
+        _insert_people(conn, "codex-none@keep.com", "Codex None", "Keep/平台/基础")
+        _insert_people(conn, "codex-leak@keep.com", "Codex Leak", "Keep/平台/基础")
+        _insert_sub(conn, "codex-sub@keep.com", "codex", "standard", 30.0, "Codex Sub", "Keep/平台/基础")
+        _insert_sub(conn, "codex-sub@keep.com", "claude", "premium", 120.0, "Codex Sub", "Keep/平台/基础")
+        _insert_sub(conn, "codex-leak@keep.com", "claude", "premium", 120.0, "Codex Leak", "Keep/平台/基础")
+        _insert_sub(conn, "codex-leak@keep.com", "cursor", "standard", 40.0, "Codex Leak", "Keep/平台/基础")
+        _insert_usage(dc, conn, "codex-sub@keep.com", "Keep/平台/基础", "2026-06-10", "subscription", "Codex CLI", 180, 3.4, 2)
+        _insert_usage(dc, conn, "codex-none@keep.com", "Keep/平台/基础", "2026-06-10", "subscription", "Codex CLI", 130, 1.1, 1)
+        _insert_usage(dc, conn, "codex-leak@keep.com", "Keep/平台/基础", "2026-06-10", "subscription", "Codex CLI", 110, 0.9, 1)
+        conn.commit()
+
+        rows = _leaderboard(dc, conn, {"client": ["Codex CLI"], "days": ["30"]})
+        person_rows = _leaderboard(dc, conn, {"days": ["30"]})
+    finally:
+        conn.close()
+
+    subbed = _row_by_email(rows, "codex-sub@keep.com")
+    assert subbed["cost"] == 0
+    assert subbed["subs"] == [{"tool": "codex", "tier": "standard", "fee": 30.0, "seats": 1}]
+    assert _row_by_email(person_rows, "codex-sub@keep.com")["cost"] == round((30.0 + 120.0) * ((18 / 31) + (12 / 30)), 4)
+    assert _row_by_email(rows, "codex-none@keep.com")["subs"] == []
+    assert _row_by_email(rows, "codex-leak@keep.com")["subs"] == []

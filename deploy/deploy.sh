@@ -38,6 +38,7 @@ cd "$REPO_ROOT"
 [[ -f "$LOCAL_ENV" ]] || die "凭证文件 '$LOCAL_ENV' 不存在。请先复制 deploy/.env.example 并填写真实值。"
 [[ -f "collector/dev_collector.py" ]] || die "collector/dev_collector.py 不存在，请确认 repo 结构。"
 [[ -f "collector/feilian_client.py" ]] || die "collector/feilian_client.py 不存在。"
+[[ -f "collector/subscriptions_sync.py" ]] || die "collector/subscriptions_sync.py 不存在。"
 [[ -f "agent/remote_tokscale_report.sh" ]] || die "agent/remote_tokscale_report.sh 不存在。"
 [[ -f "agent/tokreport_windows.ps1" ]] || die "agent/tokreport_windows.ps1 不存在。"
 command -v rsync >/dev/null 2>&1 || die "本机未安装 rsync。"
@@ -56,6 +57,7 @@ rsync -az \
     collector/dev_collector.py \
     collector/feilian_client.py \
     collector/litellm_collector.py \
+    collector/subscriptions_sync.py \
     collector/dashboard.html \
     collector/help.html \
     "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
@@ -113,6 +115,22 @@ ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
     "sudo systemctl daemon-reload && sudo systemctl enable --now litellm-sync.timer"
 info "litellm-sync.timer 已 enable --now（开机 3min 后首跑，之后每个整点）"
 warn "立即手动跑一次（主控执行）: ssh it@${REMOTE_HOST} 'sudo systemctl start litellm-sync.service'"
+
+# ── 4c. 订阅名单同步 timer（每天 03:30 从飞书表整表覆盖 subscriptions） ──
+# 前提：.env 里需含 FEISHU_APP_ID + FEISHU_APP_SECRET（bot 凭证，已随 .env 上传）。
+info "[4c/6] 安装 subscriptions-sync service + timer（daily 03:30）"
+for _unit in subscriptions-sync.service subscriptions-sync.timer; do
+    sed \
+        -e "s|__REMOTE_DIR__|${REMOTE_DIR}|g" \
+        -e "s|__PYTHON__|${PYTHON}|g" \
+        "$SCRIPT_DIR/${_unit}" \
+    | ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+        "sudo tee /etc/systemd/system/${_unit} > /dev/null"
+done
+ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+    "sudo systemctl daemon-reload && sudo systemctl enable --now subscriptions-sync.timer"
+info "subscriptions-sync.timer 已 enable --now（每天 03:30 触发，oneshot）"
+warn "立即手动跑一次（主控执行）: ssh it@${REMOTE_HOST} 'sudo systemctl start subscriptions-sync.service'"
 
 # ── 5. 幂等验证：检查 unit 是否被 systemd 识别 ──────────────────────
 info "[5/6] 验证 collector unit 注册"

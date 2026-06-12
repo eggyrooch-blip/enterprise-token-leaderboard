@@ -4,6 +4,8 @@ import pathlib
 import sys
 import types
 
+import pytest
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -24,6 +26,7 @@ def _load_app_module(monkeypatch):
 
 def test_aggregate_rows_to_email_counts_subscription_fee_once(monkeypatch):
     app = _load_app_module(monkeypatch)
+    fee_fraction = (18 / 31) + (12 / 30)
 
     rows = [
         {
@@ -47,7 +50,7 @@ def test_aggregate_rows_to_email_counts_subscription_fee_once(monkeypatch):
     aggregated = app._aggregate_rows_to_email(
         rows,
         {"dup@keep.com": 25.0},
-        2,
+        fee_fraction,
         {"dup@keep.com": {"dept": "Keep/平台/基础"}},
     )
 
@@ -59,7 +62,7 @@ def test_aggregate_rows_to_email_counts_subscription_fee_once(monkeypatch):
             "gateway_cost": 4.75,
             "api_tokens": 90,
             "subscription_tokens": 60,
-            "cost_usd": 54.75,
+            "cost_usd": round(4.75 + 25.0 * fee_fraction, 4),
         }
     ]
 
@@ -117,6 +120,24 @@ def _freeze_today(monkeypatch, app, today_text):
     monkeypatch.setattr(app, "date", _FakeDate)
 
 
+def test_prorated_month_fraction_examples(monkeypatch):
+    app = _load_app_module(monkeypatch)
+
+    assert app.prorated_month_fraction("2026-06-06", "2026-06-12") == pytest.approx(7 / 30)
+    assert app.prorated_month_fraction("2026-05-14", "2026-06-12") == pytest.approx((18 / 31) + (12 / 30))
+    assert app.prorated_month_fraction("2026-06-01", "2026-06-30") == 1.0
+    assert app.prorated_month_fraction("2026-06-12", "2026-06-11") == 1.0
+
+
+def test_subscription_fraction_uses_days_window(monkeypatch):
+    app = _load_app_module(monkeypatch)
+    _freeze_today(monkeypatch, app, "2026-06-12")
+
+    assert app._subscription_fraction(7) == pytest.approx(7 / 30)
+    assert app._subscription_fraction(30) == pytest.approx((18 / 31) + (12 / 30))
+    assert app._subscription_fraction(30 + 1) != 1.0
+
+
 def test_leaderboard_and_dashboard_skip_roster_only_subscription_rows(monkeypatch):
     app = _load_app_module(monkeypatch)
     _freeze_today(monkeypatch, app, "2026-06-12")
@@ -162,7 +183,7 @@ def test_leaderboard_and_dashboard_skip_roster_only_subscription_rows(monkeypatc
             "email": "active@keep.com",
             "dept": "Keep/平台/基础",
             "total_tokens": 120,
-            "cost_usd": 101.5,
+            "cost_usd": 50.5323,
             "subs": [{"tool": "claude", "tier": "premium", "fee": 50.0, "seats": 1}],
         }
     ]
