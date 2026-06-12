@@ -38,6 +38,8 @@ def test_parse_roster_rows_skips_headers_and_detects_claude_premium():
         "dept": "Keep/平台/基础",
         "tier": "standard",
         "monthly_fee_usd": 25.0,
+        "start_date": None,
+        "end_date": None,
     }]
     assert claude == [
         {
@@ -47,6 +49,8 @@ def test_parse_roster_rows_skips_headers_and_detects_claude_premium():
             "dept": "Keep/平台/基础",
             "tier": "premium",
             "monthly_fee_usd": 100.0,
+            "start_date": None,
+            "end_date": None,
         },
         {
             "tool": "claude",
@@ -55,6 +59,8 @@ def test_parse_roster_rows_skips_headers_and_detects_claude_premium():
             "dept": "Keep/平台/基础",
             "tier": "standard",
             "monthly_fee_usd": 25.0,
+            "start_date": None,
+            "end_date": None,
         },
     ]
     assert cursor == [{
@@ -64,6 +70,8 @@ def test_parse_roster_rows_skips_headers_and_detects_claude_premium():
         "dept": "",
         "tier": "standard",
         "monthly_fee_usd": 40.0,
+        "start_date": None,
+        "end_date": None,
     }]
 
 
@@ -285,6 +293,8 @@ def test_build_snapshot_aggregates_seats_per_email_and_tool():
             "seats": 2,
             "display_name": "Alice",
             "dept": "Keep/平台/基础",
+            "start_date": None,
+            "end_date": None,
         },
         {
             "email": "alice@keep.com",
@@ -294,5 +304,121 @@ def test_build_snapshot_aggregates_seats_per_email_and_tool():
             "seats": 2,
             "display_name": "Alice",
             "dept": "Keep/平台/基础",
+            "start_date": None,
+            "end_date": None,
         },
     ]
+
+
+def test_parse_codex_lifecycle_dates(monkeypatch):
+    rows = [
+        ["忽略", "", "", "", "加入日期", "", "", "", "", "", "", "", "", "", "", "备注", "是否删除"],
+        ["", "alice", "alice@gmail.com", "", "2026-06-03", "Alice", "Keep/平台/基础", "", "", "", "", "", "", "", "", "已删除 (2026-06-10 不在名单)", True],
+        ["", "bob", "bob@gmail.com", "", "2026-06-05", "Bob", "Keep/平台/基础", "", "", "", "", "", "", "", "", "已删除但没日期", "TRUE"],
+        ["", "carol", "carol@gmail.com", "", "2026-06-07", "Carol", "Keep/平台/基础", "", "", "", "", "", "", "", "", "", "FALSE"],
+    ]
+    monkeypatch.setattr(subscriptions_sync, "_today_str", lambda: "2026-06-12")
+
+    parsed = subscriptions_sync.parse_codex_rows(rows)
+
+    assert parsed[0]["start_date"] == "2026-06-03"
+    assert parsed[0]["end_date"] == "2026-06-10"
+    assert parsed[1]["start_date"] == "2026-06-05"
+    assert parsed[1]["end_date"] == "2026-06-12"
+    assert parsed[2]["start_date"] == "2026-06-07"
+    assert parsed[2]["end_date"] is None
+
+
+def test_parse_claude_lifecycle_dates():
+    rows = [
+        ["", "", "", "", "飞书 user_id", "飞书实名", "部门", "", "备注", "审批单号", "是否删除"],
+        ["", "", "", "", "ou_alice", "Alice", "Keep/平台/基础", "", "Premium 席位", "202606030031", ""],
+        ["", "", "", "", "ou_bob", "Bob", "Keep/平台/基础", "", "已删除 (2026-06-11 不在成员名单)", "", True],
+        ["", "", "", "", "ou_carol", "Carol", "Keep/平台/基础", "", "", "", ""],
+    ]
+
+    parsed = subscriptions_sync.parse_claude_rows(rows)
+
+    assert parsed[0]["tier"] == "premium"
+    assert parsed[0]["start_date"] == "2026-06-03"
+    assert parsed[0]["end_date"] is None
+    assert parsed[1]["start_date"] is None
+    assert parsed[1]["end_date"] == "2026-06-11"
+    assert parsed[2]["start_date"] is None
+    assert parsed[2]["end_date"] is None
+
+
+def test_aggregate_lifecycle_min_start_max_end_null_wins():
+    merged = subscriptions_sync._aggregate_subscriptions([
+        {
+            "email": "alice@keep.com",
+            "tool": "codex",
+            "tier": "standard",
+            "monthly_fee_usd": 25.0,
+            "display_name": "Alice",
+            "dept": "Keep/平台/基础",
+            "start_date": "2026-05-01",
+            "end_date": "2026-06-10",
+        },
+        {
+            "email": "alice@keep.com",
+            "tool": "codex",
+            "tier": "standard",
+            "monthly_fee_usd": 25.0,
+            "display_name": "Alice",
+            "dept": "Keep/平台/基础",
+            "start_date": "2026-06-01",
+            "end_date": None,
+        },
+        {
+            "email": "bob@keep.com",
+            "tool": "claude",
+            "tier": "premium",
+            "monthly_fee_usd": 100.0,
+            "display_name": "Bob",
+            "dept": "Keep/平台/应用",
+            "start_date": "2026-05-02",
+            "end_date": "2026-06-08",
+        },
+        {
+            "email": "bob@keep.com",
+            "tool": "claude",
+            "tier": "premium",
+            "monthly_fee_usd": 100.0,
+            "display_name": "Bob",
+            "dept": "Keep/平台/应用",
+            "start_date": "2026-05-20",
+            "end_date": "2026-06-11",
+        },
+    ])
+
+    assert merged[0]["start_date"] == "2026-05-01"
+    assert merged[0]["end_date"] is None
+    assert merged[1]["start_date"] == "2026-05-02"
+    assert merged[1]["end_date"] == "2026-06-11"
+
+
+def test_write_snapshot_roundtrips_dates():
+    conn = sqlite3.connect(":memory:")
+    subscriptions_sync.ensure_tables(conn)
+
+    subscriptions_sync.write_snapshot(conn, [
+        {
+            "email": "alice@keep.com",
+            "tool": "codex",
+            "tier": "standard",
+            "monthly_fee_usd": 25.0,
+            "seats": 1,
+            "display_name": "Alice",
+            "dept": "Keep/平台/基础",
+            "start_date": "2026-06-03",
+            "end_date": "2026-06-10",
+        },
+    ], [], "2026-06-12T10:00:00Z")
+
+    row = conn.execute(
+        "SELECT start_date, end_date FROM subscriptions WHERE email=? AND tool=?",
+        ("alice@keep.com", "codex"),
+    ).fetchone()
+
+    assert row == ("2026-06-03", "2026-06-10")

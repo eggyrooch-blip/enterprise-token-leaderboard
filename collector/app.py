@@ -92,10 +92,65 @@ def _subscription_fraction(days: int) -> float:
     return prorated_month_fraction(start, today)
 
 
+def _interval_fraction(
+    win_start: date | str, win_end: date | str,
+    sub_start: date | str | None, sub_end: date | str | None,
+) -> float:
+    """窗口 [win] 与订阅区间 [sub] 的重叠月费倍数；无重叠返回 0。
+
+    sub_start/sub_end 为 None 表示该侧无界（订阅起始未知 / 仍生效）。
+    """
+    ws = _coerce_date(win_start)
+    we = _coerce_date(win_end)
+    ss = _coerce_date(sub_start) if sub_start else ws
+    se = _coerce_date(sub_end) if sub_end else we
+    eff_s = max(ws, ss)
+    eff_e = min(we, se)
+    if eff_s > eff_e:
+        return 0.0
+    return prorated_month_fraction(eff_s, eff_e)
+
+
+def _prorate_subscriptions(
+    subs_by_email: Mapping[str, list[dict]], days: int,
+) -> tuple[dict[str, float], dict[str, list[dict]]]:
+    """按各订阅的生命周期区间与查询窗口 [today-(days-1), today] 的重叠摊销月费。
+
+    返回 (prorated_fee_by_email, filtered_subs_by_email)：无重叠的订阅既不计费、
+    也从徽章列表中剔除（已退订/未来才生效 → 当前窗口不显示）。
+    """
+    today = date.today()
+    win_start = today - timedelta(days=max(int(days or 1), 1) - 1)
+    prorated_fee: dict[str, float] = {}
+    filtered: dict[str, list[dict]] = {}
+    for email, subs in subs_by_email.items():
+        kept: list[dict] = []
+        total = 0.0
+        for sub in subs:
+            frac = _interval_fraction(win_start, today, sub.get("start"), sub.get("end"))
+            if frac <= 0:
+                continue
+            kept.append(sub)
+            total += float(sub.get("fee") or 0) * frac
+        if kept:
+            filtered[email] = kept
+        if total:
+            prorated_fee[email] = total
+    return prorated_fee, filtered
+
+
+def _row_get(row: Mapping[str, object], key: str) -> object | None:
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
+
+
 async def _fetch_subscriptions(conn: asyncpg.Connection) -> tuple[dict[str, list[dict]], dict[str, float], dict[str, dict[str, str]]]:
     rows = await conn.fetch(
         """
-        SELECT email, tool, tier, monthly_fee_usd, seats, display_name, dept
+        SELECT email, tool, tier, monthly_fee_usd, seats, display_name, dept,
+               start_date, end_date
         FROM subscriptions
         ORDER BY email, tool, tier
         """
@@ -107,12 +162,19 @@ async def _fetch_subscriptions(conn: asyncpg.Connection) -> tuple[dict[str, list
         email = (r["email"] or "").strip()
         if not email:
             continue
-        subs_by_email.setdefault(email, []).append({
+        sub = {
             "tool": r["tool"],
             "tier": r["tier"],
             "fee": float(r["monthly_fee_usd"] or 0),
             "seats": int(r["seats"] or 1),
-        })
+        }
+        start_date = _row_get(r, "start_date")
+        end_date = _row_get(r, "end_date")
+        if start_date:
+            sub["start"] = start_date
+        if end_date:
+            sub["end"] = end_date
+        subs_by_email.setdefault(email, []).append(sub)
         fee_by_email[email] = fee_by_email.get(email, 0.0) + float(r["monthly_fee_usd"] or 0)
         profile = profile_by_email.setdefault(email, {})
         if r["display_name"] and not profile.get("display_name"):
@@ -134,10 +196,17 @@ def _subscription_text(subs: list[dict]) -> str:
 def _aggregate_rows_to_email(
     rows: list[Mapping[str, object]],
     fee_by_email: Mapping[str, float],
-    fee_fraction: float,
-    profile_by_email: Mapping[str, Mapping[str, str]],
+    fee_fraction: float = 1.0,
+    profile_by_email: Mapping[str, Mapping[str, str]] | None = None,
 ) -> list[dict[str, object]]:
-    """Collapse usage rows to one row per email, then add the day-prorated subscription fee once."""
+    """Collapse usage rows to one row per email, then add the subscription fee once.
+
+    `fee_by_email` may be either a flat monthly fee (then multiply by `fee_fraction`)
+    or a pre-prorated fee per email (pass `fee_fraction=1.0`). Callers now pass
+    per-subscription lifecycle-prorated fees with `fee_fraction=1.0`.
+    """
+    if profile_by_email is None:
+        profile_by_email = {}
     by_email: dict[str, dict[str, object]] = {}
     best_dept_tokens: dict[str, int] = {}
     for row in rows:
@@ -305,17 +374,16 @@ async def leaderboard(days: int = 30, source: str = "all", limit: int = 100) -> 
         ORDER BY total_tokens DESC, email ASC;
     """
     async with _pool.acquire() as conn:
-        subs_by_email, fee_by_email, profile_by_email = await _fetch_subscriptions(conn)
+        subs_by_email, _, profile_by_email = await _fetch_subscriptions(conn)
         rows = await conn.fetch(sql, *args)
-    fee_fraction = _subscription_fraction(days)
-    aggregated_rows = _aggregate_rows_to_email([dict(r) for r in rows], fee_by_email, fee_fraction, profile_by_email)
+    # 订阅费按各席位的生命周期区间与查询窗口的重叠摊销；无重叠的席位不计费也不挂徽章。
+    prorated_fee_by_email, subs_by_email = _prorate_subscriptions(subs_by_email, days)
+    aggregated_rows = _aggregate_rows_to_email(
+        [dict(r) for r in rows], prorated_fee_by_email, 1.0, profile_by_email)
     ranking = []
-    seen_emails = set()
-    # 公司实付口径：订阅费按窗口触达自然月数整月计；usage cost 只取 api/litellm 实销，
-    # 排除 subscription 牌价；纯订阅人也进榜。
+    # 公司实付口径：usage cost 只取 api/litellm 实销，排除 subscription 牌价；纯订阅人不进榜。
     for r in aggregated_rows:
         email = r["email"]
-        seen_emails.add(email)
         ranking.append({
             "email": email,
             "dept": r["dept"] or "unknown",

@@ -371,14 +371,36 @@ def prorated_month_fraction(start, end):
     return fraction
 
 
+def _interval_fraction(win_start, win_end, sub_start, sub_end):
+    """窗口 [win] 与订阅区间 [sub] 的重叠月费倍数；无重叠返回 0。"""
+    ws = _coerce_date(win_start)
+    we = _coerce_date(win_end)
+    ss = _coerce_date(sub_start) if sub_start else ws
+    se = _coerce_date(sub_end) if sub_end else we
+    eff_s = max(ws, ss)
+    eff_e = min(we, se)
+    if eff_s > eff_e:
+        return 0.0
+    return prorated_month_fraction(eff_s, eff_e)
+
+
+def _interval_overlaps(win_start, win_end, sub_start, sub_end):
+    ws = _coerce_date(win_start)
+    we = _coerce_date(win_end)
+    ss = _coerce_date(sub_start) if sub_start else ws
+    se = _coerce_date(sub_end) if sub_end else we
+    return max(ws, ss) <= min(we, se)
+
+
 def load_subscriptions(conn):
-    """subscriptions 表 -> {email: [{tool,tier,fee}, ...]}。
+    """subscriptions 表 -> {email: [{tool,tier,fee,seats[,start][,end]}, ...]}。
 
     表不存在/为空时返回空 dict，便于旧库或局部测试直接复用。
     """
     try:
         rows = conn.execute(
-            "SELECT email, tool, tier, monthly_fee_usd, seats FROM subscriptions ORDER BY email, tool"
+            "SELECT email, tool, tier, monthly_fee_usd, seats, start_date, end_date"
+            " FROM subscriptions ORDER BY email, tool"
         ).fetchall()
     except Exception:
         return {}
@@ -387,12 +409,17 @@ def load_subscriptions(conn):
         email = r[0] or ""
         if not email:
             continue
-        out.setdefault(email, []).append({
+        item = {
             "tool": r[1] or "",
             "tier": r[2] or "standard",
             "fee": float(r[3] or 0),
             "seats": int(r[4] or 1),
-        })
+        }
+        if r[5]:
+            item["start"] = r[5]
+        if r[6]:
+            item["end"] = r[6]
+        out.setdefault(email, []).append(item)
     return out
 
 
@@ -411,13 +438,17 @@ _CLIENT_TO_SUB_TOOL = {
 }
 
 
-def _single_tool_subs(subs_by_email, email, tool):
+def _single_tool_subs(subs_by_email, email, tool, win_start=None, win_end=None):
     # 工具榜只挂同工具的单个订阅徽标,复用个人榜 subs 结构避免前端分叉。
     if not tool:
         return []
     for sub in subs_by_email.get(email, []):
-        if (sub.get("tool") or "").lower() == tool:
-            return [sub]
+        if (sub.get("tool") or "").lower() != tool:
+            continue
+        if win_start is not None and win_end is not None and not _interval_overlaps(
+                win_start, win_end, sub.get("start"), sub.get("end")):
+            continue
+        return [sub]
     return []
 
 # 用 INSERT OR REPLACE 而非 ON CONFLICT DO UPDATE：
@@ -1324,8 +1355,10 @@ class H(BaseHTTPRequestHandler):
         subs_by_email = load_subscriptions(conn)
         sub_tool = _CLIENT_TO_SUB_TOOL.get(cli)
         if cli:
+            win_s = cost_start if cost_start is not None else today
+            win_e = cost_end if cost_end is not None else today
             for row in result:
-                row["subs"] = _single_tool_subs(subs_by_email, row["email"], sub_tool)
+                row["subs"] = _single_tool_subs(subs_by_email, row["email"], sub_tool, win_s, win_e)
 
         # 飞书 AI 权益并入个人榜:1 点 = 1 token,计入总量参与排序(孙可 2026-06-12)。
         # 只在主个人榜并入;带 ?client 的工具榜(Claude/Codex/Cursor/LiteLLM/Hermes)不并。
@@ -1370,22 +1403,29 @@ class H(BaseHTTPRequestHandler):
                     if mr[0] and mr[1]:
                         usage_window_start[mr[0]] = mr[1]
 
-            def _fee_fraction_for(email):
-                # 订阅费按天摊销：窗口落在每个自然月的天数 / 该月总天数之和。
+            def _fee_window(email):
                 if cost_start is not None and cost_end is not None:
-                    return prorated_month_fraction(cost_start, cost_end)
-                if usage_window_start.get(email):
-                    return prorated_month_fraction(usage_window_start[email], today)
-                # lifetime/all 且此人没有任何 usage 明细时，纯订阅用户按 1 个月算。
-                return 1.0
+                    return cost_start, cost_end
+                return usage_window_start.get(email) or today, today
 
             for row in result:
-                subs = list(subs_by_email.get(row["email"], []))
-                row["subs"] = subs
-                if not subs:
+                win_s, win_e = _fee_window(row["email"])
+                kept = []
+                fee_total = 0.0
+                for sub in subs_by_email.get(row["email"], []):
+                    if cost_start is None and usage_window_start.get(row["email"]) is None and \
+                            not sub.get("start") and not sub.get("end"):
+                        # lifetime/all 且此人无 usage 明细时，保留原「整月订阅=1.0」语义。
+                        frac = 1.0
+                    else:
+                        frac = _interval_fraction(win_s, win_e, sub.get("start"), sub.get("end"))
+                    if frac <= 0:
+                        continue
+                    kept.append(sub)
+                    fee_total += float(sub.get("fee") or 0) * frac
+                row["subs"] = kept
+                if not kept:
                     continue
-                fraction = _fee_fraction_for(row["email"])
-                fee_total = sum(float(s.get("fee") or 0) * fraction for s in subs)
                 row["cost"] = round(float(row["cost"] or 0) + fee_total, 4)
 
         # 飞书并入后总量可能变 → 统一算 composition 占比 + 重排
@@ -1448,6 +1488,10 @@ class H(BaseHTTPRequestHandler):
         result = []
         # Cursor 榜只挂 cursor 订阅徽标,不带其他工具。
         subs_by_email = load_subscriptions(conn)
+        cost_start, cost_end = _cost_window(qs)
+        today = datetime.date.today()
+        win_s = cost_start if cost_start is not None else today
+        win_e = cost_end if cost_end is not None else today
         for r in rows:
             result.append({
                 "email": r[0], "dept": _to_keep(r[12]) or _normalize_dept_path(r[1]),  # 优先 people.dept(飞连全路径)
@@ -1457,7 +1501,7 @@ class H(BaseHTTPRequestHandler):
                 "cost": round(r[8] or 0, 2), "requests": r[9] or 0,
                 "name": r[10] or (r[0] or "").split("@")[0], "avatar": r[11] or "",
                 "departed": r[0] in departed,
-                "subs": _single_tool_subs(subs_by_email, r[0], "cursor"),
+                "subs": _single_tool_subs(subs_by_email, r[0], "cursor", win_s, win_e),
             })
         self._send(200, {"cursor": result})
 
@@ -1731,13 +1775,19 @@ class H(BaseHTTPRequestHandler):
             WHERE source != 'litellm_agent' AND COALESCE(email, '') != ''
         """).fetchall()
         usage_emails = {r[0] for r in idle_usage_rows if r and r[0]}
+        # 闲置只算「此刻仍生效」的席位：已删除(end_date 早于今天)的席位是「已退订」而非闲置，
+        # 不进闲置计数/月费。窗口给到 [today, today] 即「现在是否仍在订阅区间内」。
+        idle_window = datetime.date.today()
         idle_people = []
         idle_emails = set()
         for email, subs in subs_by_email.items():
             if email in usage_emails:
                 continue
-            idle_emails.add(email)
             for sub in subs:
+                if not _interval_overlaps(idle_window, idle_window,
+                                          sub.get("start"), sub.get("end")):
+                    continue
+                idle_emails.add(email)
                 idle_people.append({
                     "email": email,
                     "tool": sub.get("tool") or "",

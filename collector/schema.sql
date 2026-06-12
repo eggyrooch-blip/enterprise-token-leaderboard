@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     seats           INTEGER       NOT NULL DEFAULT 1,             -- 同人同工具的账号数；单价×seats 已并入 monthly_fee_usd
     display_name    TEXT          NOT NULL DEFAULT '',
     dept            TEXT          NOT NULL DEFAULT '',
+    start_date      TEXT,                                        -- 订阅起始(加入日期); NULL=无下界
+    end_date        TEXT,                                        -- 订阅终止(删除日期); NULL=仍生效
     synced_at       TIMESTAMPTZ   NOT NULL DEFAULT now(),
     PRIMARY KEY (email, tool)
 );

@@ -191,3 +191,76 @@ def test_leaderboard_and_dashboard_skip_roster_only_subscription_rows(monkeypatc
     html = asyncio.run(app.dashboard(days=30))
     assert "active@keep.com" in html
     assert "idle@keep.com" not in html
+
+
+def test_app_sub_overlap_proration(monkeypatch):
+    app = _load_app_module(monkeypatch)
+    _freeze_today(monkeypatch, app, "2026-06-12")
+    conn = _FakeConn(
+        subs_rows=[
+            {
+                "email": "mid@keep.com",
+                "tool": "claude",
+                "tier": "premium",
+                "monthly_fee_usd": 50.0,
+                "seats": 1,
+                "display_name": "Mid",
+                "dept": "Keep/平台/基础",
+                "start_date": "2026-06-01",
+                "end_date": None,
+            },
+            {
+                "email": "drop@keep.com",
+                "tool": "cursor",
+                "tier": "standard",
+                "monthly_fee_usd": 40.0,
+                "seats": 1,
+                "display_name": "Drop",
+                "dept": "Keep/平台/基础",
+                "start_date": None,
+                "end_date": "2026-04-01",
+            },
+        ],
+        usage_rows=[
+            {
+                "email": "mid@keep.com",
+                "dept": "Keep/平台/基础",
+                "total_tokens": 100,
+                "gateway_cost": 1.25,
+                "t": 100,
+                "c": 1.25,
+                "api": 100,
+                "sub": 0,
+            },
+            {
+                "email": "drop@keep.com",
+                "dept": "Keep/平台/基础",
+                "total_tokens": 80,
+                "gateway_cost": 0.75,
+                "t": 80,
+                "c": 0.75,
+                "api": 80,
+                "sub": 0,
+            },
+        ],
+    )
+    monkeypatch.setattr(app, "_pool", _FakePool(conn))
+
+    leaderboard = asyncio.run(app.leaderboard(days=30, source="all", limit=100))
+
+    assert leaderboard["ranking"] == [
+        {
+            "email": "mid@keep.com",
+            "dept": "Keep/平台/基础",
+            "total_tokens": 100,
+            "cost_usd": round(1.25 + 50.0 * app.prorated_month_fraction("2026-06-01", "2026-06-12"), 4),
+            "subs": [{"tool": "claude", "tier": "premium", "fee": 50.0, "seats": 1, "start": "2026-06-01"}],
+        },
+        {
+            "email": "drop@keep.com",
+            "dept": "Keep/平台/基础",
+            "total_tokens": 80,
+            "cost_usd": 0.75,
+            "subs": [],
+        },
+    ]

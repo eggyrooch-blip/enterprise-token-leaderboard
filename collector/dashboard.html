@@ -88,11 +88,14 @@
   .nm .sub{font-weight:400;font-size:12px;color:var(--t3);margin-top:2px;line-height:1.3}
   .tag-m{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;background:#FFF4E5;color:#B8742A;font:600 10.5px var(--font);vertical-align:middle}
   .tag-off{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;background:#EEE;color:#888;font:600 10.5px var(--font);vertical-align:middle}
-  .sub-badge{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;background:#F4F6F8;color:var(--t2);font:600 10.5px var(--font);vertical-align:middle}
+  .sub-badge{display:inline-block;position:relative;margin-left:6px;padding:1px 7px;border-radius:999px;background:#F4F6F8;color:var(--t2);font:600 10.5px var(--font);vertical-align:middle}
   .sub-badge.premium{background:#FFF4E5;color:#B8742A;border:1px solid rgba(184,116,42,.22)}
-  .sub-logo{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;margin-left:6px;border-radius:999px;vertical-align:middle;line-height:0;white-space:nowrap}
+  .sub-logo{display:inline-flex;position:relative;align-items:center;justify-content:center;width:16px;height:16px;margin-left:6px;border-radius:999px;vertical-align:middle;line-height:0;white-space:nowrap}
   .sub-logo svg{display:block}
   .sub-logo.premium{background:rgba(229,177,0,.10);box-shadow:0 0 0 1px rgba(229,177,0,.55),0 0 0 3px rgba(229,177,0,.16)}
+  .sub-logo.ended,.sub-badge.ended{filter:grayscale(1);opacity:.45}
+  .sub-logo.ended::before,.sub-badge.ended::before{content:'';position:absolute;inset:0;border-radius:999px;border:1px solid rgba(92,99,112,.22);pointer-events:none}
+  .sub-logo.ended::after,.sub-badge.ended::after{content:'';position:absolute;left:2px;right:2px;top:50%;height:1.5px;background:rgba(92,99,112,.68);border-radius:999px;transform:rotate(-18deg);pointer-events:none}
   /* metric (总量/日均) segmented control, sits right of tabs row */
   .seg-ctl{display:inline-flex;margin-left:auto;background:#fff;border-radius:999px;padding:3px;gap:2px;align-items:center}
   .seg-ctl button{height:30px;padding:0 14px;border:0;border-radius:999px;background:transparent;color:var(--t2);font:600 13px var(--font);cursor:pointer}
@@ -270,13 +273,17 @@ var SUB_LOGOS={
 function subLogoHtml(s){
   var tool=String(s.tool||'').toLowerCase(), tier=String(s.tier||'standard').toLowerCase();
   var logo=SUB_LOGOS[tool], seats=Number(s.seats)||1, seatText=seats>1?' ×'+seats:'';
-  var tip=titleCaseWord(tool)+' '+titleCaseWord(tier)+' · $'+(Number(s.fee)||0)+'/月'+seatText;
+  var title=titleCaseWord(tool)+' '+titleCaseWord(tier), start=s.start?String(s.start):'', end=s.end?String(s.end):'';
+  var ended=!!end, tip=title+' · $'+(Number(s.fee)||0)+'/月'+seatText;
+  if(ended) tip=title+' · $'+(Number(s.fee)||0)+'/月 · '+(start||'?')+' ~ '+end+' 已删除';
+  else if(start) tip+=' · 自 '+start;
+  var cls=(tier==='premium'?' premium':'')+(ended?' ended':'');
   if(!logo){
     // Unknown tool falls back to the old text pill so badges never disappear silently.
-    return '<span class="sub-badge'+(tier==='premium'?' premium':'')+'" title="'+esc(tip)+'">'+esc(tool)+'</span>';
+    return '<span class="sub-badge'+cls+'" title="'+esc(tip)+'">'+esc(tool)+'</span>';
   }
   var color=(tool==='claude' && tier==='premium') ? '#E5B100' : logo.color;
-  return '<span class="sub-logo'+(tier==='premium'?' premium':'')+'" style="color:'+color+'" title="'+esc(tip)+'"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="'+logo.path+'" fill="currentColor"/></svg></span>';
+  return '<span class="sub-logo'+cls+'" style="color:'+color+'" title="'+esc(tip)+'"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="'+logo.path+'" fill="currentColor"/></svg></span>';
 }
 // 部门路径去掉最前面的 "Keep/" 前缀(以及单独 "Keep")
 function stripKeep(p){p=p||''; if(p==='Keep')return p; return p.replace(/^Keep\//,'');}

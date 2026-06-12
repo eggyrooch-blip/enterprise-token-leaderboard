@@ -316,3 +316,122 @@ def test_codex_board_attaches_only_codex_badge_and_keeps_gateway_cost(dc, monkey
     assert _row_by_email(person_rows, "codex-sub@keep.com")["cost"] == round((30.0 + 120.0) * ((18 / 31) + (12 / 30)), 4)
     assert _row_by_email(rows, "codex-none@keep.com")["subs"] == []
     assert _row_by_email(rows, "codex-leak@keep.com")["subs"] == []
+
+
+def _insert_sub_life(conn, email, tool, tier, fee, name, dept, start, end, seats=1, synced_at="2026-06-12T10:00:00Z"):
+    conn.execute(
+        "INSERT OR REPLACE INTO subscriptions"
+        "(email, tool, tier, monthly_fee_usd, seats, display_name, dept, start_date, end_date, synced_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (email, tool, tier, fee, seats, name, dept, start, end, synced_at),
+    )
+
+
+def test_sub_started_midwindow_prorates_from_start(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "start@keep.com", "Start", "Keep/平台/基础")
+        _insert_sub_life(conn, "start@keep.com", "codex", "standard", 40.0, "Start", "Keep/平台/基础", "2026-06-01", None)
+        _insert_usage(dc, conn, "start@keep.com", "Keep/平台/基础", "2026-06-10", "api", "Hermes", 60, 1.25, 1)
+        conn.commit()
+
+        rows = _leaderboard(dc, conn, {"days": ["30"]})
+    finally:
+        conn.close()
+
+    row = _row_by_email(rows, "start@keep.com")
+    assert row["cost"] == round(1.25 + 40.0 * dc.prorated_month_fraction("2026-06-01", "2026-06-12"), 4)
+    assert row["subs"] == [{"tool": "codex", "tier": "standard", "fee": 40.0, "seats": 1, "start": "2026-06-01"}]
+
+
+def test_sub_deleted_midwindow_prorates_until_deletion(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "end@keep.com", "End", "Keep/平台/基础")
+        _insert_sub_life(conn, "end@keep.com", "cursor", "standard", 40.0, "End", "Keep/平台/基础", None, "2026-05-20")
+        _insert_usage(dc, conn, "end@keep.com", "Keep/平台/基础", "2026-05-18", "api", "Hermes", 55, 0.8, 1)
+        conn.commit()
+
+        rows = _leaderboard(dc, conn, {"days": ["30"]})
+    finally:
+        conn.close()
+
+    row = _row_by_email(rows, "end@keep.com")
+    assert row["cost"] == round(0.8 + 40.0 * dc.prorated_month_fraction("2026-05-14", "2026-05-20"), 4)
+    assert row["subs"] == [{"tool": "cursor", "tier": "standard", "fee": 40.0, "seats": 1, "end": "2026-05-20"}]
+
+
+def test_sub_started_after_window_or_deleted_before_window_zero_and_no_badge(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "future@keep.com", "Future", "Keep/平台/基础")
+        _insert_people(conn, "past@keep.com", "Past", "Keep/平台/基础")
+        _insert_sub_life(conn, "future@keep.com", "codex", "standard", 25.0, "Future", "Keep/平台/基础", "2026-07-01", None)
+        _insert_sub_life(conn, "past@keep.com", "cursor", "standard", 40.0, "Past", "Keep/平台/基础", None, "2026-04-01")
+        _insert_usage(dc, conn, "future@keep.com", "Keep/平台/基础", "2026-06-10", "api", "Hermes", 10, 0.3, 1)
+        _insert_usage(dc, conn, "past@keep.com", "Keep/平台/基础", "2026-06-09", "api", "Hermes", 12, 0.4, 1)
+        conn.commit()
+
+        rows = _leaderboard(dc, conn, {"days": ["30"]})
+    finally:
+        conn.close()
+
+    future = _row_by_email(rows, "future@keep.com")
+    past = _row_by_email(rows, "past@keep.com")
+    assert future["cost"] == 0.3
+    assert future["subs"] == []
+    assert past["cost"] == 0.4
+    assert past["subs"] == []
+
+
+def test_idle_excludes_pre_window_deleted_seat(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "old@keep.com", "Old", "Keep/平台/基础")
+        _insert_people(conn, "idle@keep.com", "Idle", "Keep/平台/基础")
+        _insert_sub_life(conn, "old@keep.com", "cursor", "standard", 40.0, "Old", "Keep/平台/基础", None, "2026-04-01")
+        _insert_sub_life(conn, "idle@keep.com", "codex", "standard", 25.0, "Idle", "Keep/平台/基础", "2026-06-01", None)
+        conn.commit()
+
+        payload = _governance(dc, conn)
+    finally:
+        conn.close()
+
+    assert _idle_subscription(payload) == {
+        "count": 1,
+        "monthly_fee_usd": 25.0,
+        "people": [{"email": "idle@keep.com", "tool": "codex", "fee": 25.0}],
+    }
+
+
+def test_badge_payload_carries_start_end(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "badge@keep.com", "Badge", "Keep/平台/基础")
+        _insert_people(conn, "gone-badge@keep.com", "Gone Badge", "Keep/平台/基础")
+        _insert_sub_life(conn, "badge@keep.com", "claude", "premium", 100.0, "Badge", "Keep/平台/基础", "2026-06-01", None)
+        _insert_sub_life(conn, "gone-badge@keep.com", "cursor", "standard", 40.0, "Gone Badge", "Keep/平台/基础", None, "2026-05-20")
+        _insert_usage(dc, conn, "badge@keep.com", "Keep/平台/基础", "2026-06-10", "api", "Hermes", 50, 0.5, 1)
+        _insert_usage(dc, conn, "gone-badge@keep.com", "Keep/平台/基础", "2026-05-19", "api", "Hermes", 30, 0.2, 1)
+        conn.commit()
+
+        rows = _leaderboard(dc, conn, {"days": ["30"]})
+    finally:
+        conn.close()
+
+    assert _row_by_email(rows, "badge@keep.com")["subs"] == [
+        {"tool": "claude", "tier": "premium", "fee": 100.0, "seats": 1, "start": "2026-06-01"}
+    ]
+    assert _row_by_email(rows, "gone-badge@keep.com")["subs"] == [
+        {"tool": "cursor", "tier": "standard", "fee": 40.0, "seats": 1, "end": "2026-05-20"}
+    ]

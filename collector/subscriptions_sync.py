@@ -9,6 +9,7 @@ from __future__ import print_function
 import datetime
 import json
 import os
+import re
 import sqlite3
 import sys
 
@@ -33,6 +34,13 @@ SHEETS = {
     "cursor": "KvJN7D",
     "windsurf": "fl4xUJ",
 }
+
+
+def _today_str():
+    return datetime.date.today().strftime("%Y-%m-%d")
+
+
+_DEL_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 
 def _die(msg, code):
@@ -70,6 +78,34 @@ def _match_name(text):
     return name[:cut].strip()
 
 
+def _is_deleted(raw):
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw or "").strip().lower()
+    return s in ("true", "1", "yes", "y", "是")
+
+
+def _extract_del_date(remark_text):
+    m = _DEL_DATE_RE.search(remark_text or "")
+    return m.group(1) if m else None
+
+
+def _codex_start(cell):
+    s = (cell or "").strip()
+    return s if re.match(r"^\d{4}-\d{2}-\d{2}$", s) else None
+
+
+def _claude_start(cell):
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})", (cell or "").strip())
+    return ("%s-%s-%s" % (m.group(1), m.group(2), m.group(3))) if m else None
+
+
+def _end_date_for(deleted, remark_text):
+    if not deleted:
+        return None
+    return _extract_del_date(remark_text) or _today_str()
+
+
 def parse_codex_rows(rows):
     out = []
     for i, row in enumerate(rows or []):
@@ -78,6 +114,10 @@ def parse_codex_rows(rows):
         raw_email = _cell(row, 2)
         if not raw_email:
             continue
+        raw_q = row[16] if 16 < len(row) else ""
+        deleted = _is_deleted(raw_q)
+        start_date = _codex_start(_cell(row, 4))
+        remark = _cell(row, 15)
         out.append({
             "tool": "codex",
             "display_name": _cell(row, 5),
@@ -85,6 +125,8 @@ def parse_codex_rows(rows):
             "dept": _cell(row, 6),
             "tier": "standard",
             "monthly_fee_usd": 25.0,
+            "start_date": start_date,
+            "end_date": _end_date_for(deleted, remark),
         })
     return out
 
@@ -99,6 +141,9 @@ def parse_claude_rows(rows):
             continue
         remark = _cell(row, 8)
         premium = "Premium 席位" in remark
+        raw_k = row[10] if 10 < len(row) else ""
+        deleted = _is_deleted(raw_k)
+        start_date = _claude_start(_cell(row, 9))
         out.append({
             "tool": "claude",
             "display_name": _cell(row, 5),
@@ -106,6 +151,8 @@ def parse_claude_rows(rows):
             "dept": _cell(row, 6),
             "tier": "premium" if premium else "standard",
             "monthly_fee_usd": 100.0 if premium else 25.0,
+            "start_date": start_date,
+            "end_date": _end_date_for(deleted, remark),
         })
     return out
 
@@ -125,6 +172,8 @@ def parse_direct_email_rows(rows, tool, fee):
             "dept": "",
             "tier": "standard",
             "monthly_fee_usd": float(fee),
+            "start_date": None,
+            "end_date": None,
         })
     return out
 
@@ -204,6 +253,10 @@ def ensure_tables(conn):
     sub_cols = [row[1] for row in conn.execute("PRAGMA table_info(subscriptions)").fetchall()]
     if "seats" not in sub_cols:
         conn.execute("ALTER TABLE subscriptions ADD COLUMN seats INTEGER NOT NULL DEFAULT 1")
+    if "start_date" not in sub_cols:
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN start_date TEXT")
+    if "end_date" not in sub_cols:
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN end_date TEXT")
 
 
 def write_snapshot(conn, subs, unresolved, synced_at):
@@ -214,8 +267,8 @@ def write_snapshot(conn, subs, unresolved, synced_at):
         for row in subs or []:
             conn.execute("""
                 INSERT OR REPLACE INTO subscriptions
-                    (email, tool, tier, monthly_fee_usd, seats, display_name, dept, synced_at)
-                VALUES (?,?,?,?,?,?,?,?)
+                    (email, tool, tier, monthly_fee_usd, seats, display_name, dept, start_date, end_date, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
             """, (
                 row.get("email") or "",
                 row.get("tool") or "",
@@ -224,6 +277,8 @@ def write_snapshot(conn, subs, unresolved, synced_at):
                 int(row.get("seats") or 1),
                 row.get("display_name") or "",
                 row.get("dept") or "",
+                row.get("start_date"),
+                row.get("end_date"),
                 synced_at,
             ))
         for row in unresolved or []:
@@ -315,12 +370,21 @@ def _aggregate_subscriptions(rows):
                 "seats": 1,
                 "display_name": row.get("display_name") or "",
                 "dept": row.get("dept") or "",
+                "start_date": row.get("start_date"),
+                "end_date": row.get("end_date"),
                 "_best_rank": _seat_rank(row),
             }
             grouped[key] = item
             continue
         item["monthly_fee_usd"] = float(item.get("monthly_fee_usd") or 0) + float(row.get("monthly_fee_usd") or 0)
         item["seats"] = int(item.get("seats") or 0) + 1
+        cur_start = item.get("start_date")
+        new_start = row.get("start_date")
+        item["start_date"] = new_start if cur_start is None else (cur_start if new_start is None else min(cur_start, new_start))
+        if item.get("end_date") is None or row.get("end_date") is None:
+            item["end_date"] = None
+        else:
+            item["end_date"] = max(item.get("end_date"), row.get("end_date"))
         if not item.get("display_name") and row.get("display_name"):
             item["display_name"] = row.get("display_name") or ""
         if not item.get("dept") and row.get("dept"):
@@ -352,6 +416,8 @@ def _build_snapshot(rows_by_tool, people):
                 "monthly_fee_usd": float(resolved.get("monthly_fee_usd") or 0),
                 "display_name": resolved.get("display_name") or "",
                 "dept": resolved.get("dept") or "",
+                "start_date": resolved.get("start_date"),
+                "end_date": resolved.get("end_date"),
             })
         elif miss:
             unresolved.append(miss)
@@ -365,6 +431,8 @@ def _build_snapshot(rows_by_tool, people):
                 "monthly_fee_usd": float(row.get("monthly_fee_usd") or 0),
                 "display_name": row.get("display_name") or "",
                 "dept": row.get("dept") or "",
+                "start_date": row.get("start_date"),
+                "end_date": row.get("end_date"),
             })
     return _aggregate_subscriptions(subs), unresolved
 
