@@ -1185,6 +1185,9 @@ class H(BaseHTTPRequestHandler):
                 "ok": False, "error": "source not allowed",
                 "source": source, "allowed": sorted(HERMES_ALLOWED_SOURCES)})
         client = (p.get("client") or "Hermes").strip() or "Hermes"   # 缺省 'Hermes'
+        # 标签归一:历史上有上报端发小写 'hermes',与官方 'Hermes' 在榜单上裂成两个工具。
+        if client.lower() == "hermes":
+            client = "Hermes"
         date = (p.get("date") or "").strip()
         try:
             # 真校验 YYYY-MM-DD（拒绝 2026-13-40 / 非数字等），date 进 SQL period 列。
@@ -1433,6 +1436,55 @@ class H(BaseHTTPRequestHandler):
             win_e = cost_end if cost_end is not None else today
             for row in result:
                 row["subs"] = _single_tool_subs(subs_by_email, row["email"], sub_tool, win_s, win_e)
+                # 工具榜价格:该工具订阅费按席位区间摊销并入本榜 cost(订阅 token 无网关
+                # 实销,此前恒为 $0 —— sunke 2026-06-13"codex/claude 榜没有价格")。
+                # 与个人榜同口径:lifetime(无窗口)时无界席位按 1.0 个月费计。
+                if sub_tool:
+                    fee_total = 0.0
+                    for seat in subs_by_email.get(row["email"], []):
+                        if (seat.get("tool") or "").lower() != sub_tool:
+                            continue
+                        if cost_start is None and not seat.get("start") and not seat.get("end"):
+                            frac = 1.0
+                        else:
+                            frac = _interval_fraction(win_s, win_e, seat.get("start"), seat.get("end"))
+                        fee_total += float(seat.get("fee") or 0) * frac
+                    if fee_total:
+                        row["cost"] = round(float(row["cost"] or 0) + fee_total, 4)
+
+        # Hermes 榜价格(sunke 2026-06-13):Hermes 上报自带 cost 的行用原值;cost=0 的行
+        # 用上游 LiteLLM 同模型实际单价(sum(cost)/sum(total))推断估价 —— 模型名先精确、
+        # 再取「最后一段去厂商前缀」匹配(tencent/glm-5.1 → glm-5.1);LiteLLM 没有的模型
+        # 不标价。推断价只进本榜展示(cost_est 标记,前端显 ≈$),不进个人榜公司实付。
+        if cli and cli.lower() == "hermes":
+            rate_exact, rate_stripped = {}, {}
+            for m, co, t in conn.execute(
+                    "SELECT model, SUM(cost), SUM(total) FROM usage"
+                    " WHERE source='litellm' AND period_type='day' AND total>0"
+                    " GROUP BY model").fetchall():
+                if t and co:
+                    rate_exact[m or ""] = co / t
+                    rate_stripped.setdefault((m or "").split("/")[-1].lower(), co / t)
+            rep_by_email, est_by_email = {}, {}
+            for em, m, co, t in conn.execute("""
+                SELECT u.email, u.model, SUM(u.cost), SUM(u.total)
+                FROM usage u
+                WHERE %s AND u.source != 'litellm_agent'%s%s
+                GROUP BY u.email, u.model
+            """ % (where, dep_clause, cli_clause), params2).fetchall():
+                if co and co > 0:
+                    rep_by_email[em] = rep_by_email.get(em, 0.0) + co
+                    continue
+                r = rate_exact.get(m or "") or rate_stripped.get((m or "").split("/")[-1].lower())
+                if r and t:
+                    est_by_email[em] = est_by_email.get(em, 0.0) + t * r
+            for row in result:
+                rep = rep_by_email.get(row["email"], 0.0)
+                est = est_by_email.get(row["email"], 0.0)
+                if rep or est:
+                    row["cost"] = round(float(row["cost"] or 0) + rep + est, 4)
+                if est:
+                    row["cost_est"] = True
 
         # 飞书 AI 权益并入个人榜:1 点 = 1 token,计入总量参与排序(孙可 2026-06-12)。
         # 只在主个人榜并入;带 ?client 的工具榜(Claude/Codex/Cursor/LiteLLM/Hermes)不并。

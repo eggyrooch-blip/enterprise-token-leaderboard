@@ -284,7 +284,8 @@ def test_claude_board_attaches_only_claude_badge_and_keeps_gateway_cost(dc, monk
         conn.close()
 
     subbed = _row_by_email(rows, "claude-sub@keep.com")
-    assert subbed["cost"] == 0
+    # 工具榜价格 = 本工具订阅费按窗口摊销(订阅 token 无网关实销,不再恒为 0)
+    assert subbed["cost"] == round(120.0 * ((18 / 31) + (12 / 30)), 4)
     assert subbed["subs"] == [{"tool": "claude", "tier": "premium", "fee": 120.0, "seats": 1}]
     assert _row_by_email(person_rows, "claude-sub@keep.com")["cost"] == round((120.0 + 40.0) * ((18 / 31) + (12 / 30)), 4)
     assert _row_by_email(rows, "claude-none@keep.com")["subs"] == []
@@ -314,7 +315,8 @@ def test_codex_board_attaches_only_codex_badge_and_keeps_gateway_cost(dc, monkey
         conn.close()
 
     subbed = _row_by_email(rows, "codex-sub@keep.com")
-    assert subbed["cost"] == 0
+    # 工具榜价格 = 本工具订阅费按窗口摊销
+    assert subbed["cost"] == round(30.0 * ((18 / 31) + (12 / 30)), 4)
     assert subbed["subs"] == [{"tool": "codex", "tier": "standard", "fee": 30.0, "seats": 1}]
     assert _row_by_email(person_rows, "codex-sub@keep.com")["cost"] == round((30.0 + 120.0) * ((18 / 31) + (12 / 30)), 4)
     assert _row_by_email(rows, "codex-none@keep.com")["subs"] == []
@@ -481,3 +483,46 @@ def test_badge_payload_carries_start_end(dc, monkeypatch, tmp_path):
     assert _row_by_email(rows, "gone-badge@keep.com")["subs"] == [
         {"tool": "cursor", "tier": "standard", "fee": 40.0, "seats": 1, "end": "2026-05-20"}
     ]
+
+
+def _insert_usage_model(dc, conn, email, dept, period, source, client, model, tokens, cost, messages):
+    conn.execute(dc._UPSERT_SQL, (
+        email, dept, "day", period, source, client, "", model,
+        tokens, 0, 0, 0, 0, tokens, cost, messages,
+    ))
+
+
+def test_hermes_board_infers_price_from_litellm_same_model(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        for em in ("h-infer@keep.com", "h-nomatch@keep.com", "h-priced@keep.com"):
+            _insert_people(conn, em, em.split("@")[0], "Keep/平台/基础")
+        # LiteLLM 上游单价: glm-5.1 → $10 / 1000 tok = 0.01/tok
+        _insert_usage_model(dc, conn, "ref@keep.com", "Keep/平台/基础", "2026-06-09",
+                            "litellm", "LiteLLM", "glm-5.1", 1000, 10.0, 1)
+        # Hermes: 厂商前缀模型 cost=0 → 推断 2000 × 0.01 = $20
+        _insert_usage_model(dc, conn, "h-infer@keep.com", "Keep/平台/基础", "2026-06-10",
+                            "hermes", "Hermes", "tencent/glm-5.1", 2000, 0.0, 1)
+        # Hermes: LiteLLM 无此模型 → 不标价
+        _insert_usage_model(dc, conn, "h-nomatch@keep.com", "Keep/平台/基础", "2026-06-10",
+                            "hermes", "Hermes", "mystery-model", 5000, 0.0, 1)
+        # Hermes: 自带 cost → 用原值
+        _insert_usage_model(dc, conn, "h-priced@keep.com", "Keep/平台/基础", "2026-06-10",
+                            "hermes", "Hermes", "claude-opus-4-6", 3000, 7.5, 1)
+        conn.commit()
+
+        rows = _leaderboard(dc, conn, {"client": ["Hermes"], "days": ["30"]})
+        person_rows = _leaderboard(dc, conn, {"days": ["30"]})
+    finally:
+        conn.close()
+
+    infer = _row_by_email(rows, "h-infer@keep.com")
+    assert infer["cost"] == 20.0 and infer.get("cost_est") is True
+    nomatch = _row_by_email(rows, "h-nomatch@keep.com")
+    assert nomatch["cost"] == 0 and "cost_est" not in nomatch
+    priced = _row_by_email(rows, "h-priced@keep.com")
+    assert priced["cost"] == 7.5 and "cost_est" not in priced
+    # 推断价不进个人榜公司实付
+    assert _row_by_email(person_rows, "h-infer@keep.com")["cost"] == 0

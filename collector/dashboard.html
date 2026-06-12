@@ -599,7 +599,8 @@ function render(){
     } else if(CUR==='claude'||CUR==='codex'||CUR==='litellm'||CUR==='hermes'){
       var ccol=toolColor(CUR==='claude'?'Claude Code':(CUR==='codex'?'Codex CLI':(CUR==='litellm'?'LiteLLM':'Hermes')));
       fillHTML='<div class="fill" style="width:'+pct+'%;background:'+ccol+'"></div>';
-      big=compact(mv(x)); small='$'+grp(Math.round(x.cost||0))+(x.messages?(' · '+grp(x.messages)+' 条'):'')+' · '+share.toFixed(1)+'%';
+      // Hermes 推断估价带 cost_est 标记 → 显 ≈$ 提示为估算
+      big=compact(mv(x)); small=(x.cost_est?'≈$':'$')+grp(Math.round(x.cost||0))+(x.messages?(' · '+grp(x.messages)+' 条'):'')+' · '+share.toFixed(1)+'%';
     } else if(isTeam){
       // 部门榜:主指标=人均(已含日均口径);副标题给总量做参考
       fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
