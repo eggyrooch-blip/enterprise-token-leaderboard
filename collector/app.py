@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime, timedelta
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 import asyncpg
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -101,6 +101,51 @@ def _subscription_text(subs: list[dict]) -> str:
         else f'{s.get("tool")}/{s.get("tier")} ${float(s.get("fee") or 0):g}/月'
         for s in subs
     )
+
+
+def _aggregate_rows_to_email(
+    rows: list[Mapping[str, object]],
+    fee_by_email: Mapping[str, float],
+    months: int,
+    profile_by_email: Mapping[str, Mapping[str, str]],
+) -> list[dict[str, object]]:
+    """Collapse usage rows to one row per email, then add subscription fee once."""
+    by_email: dict[str, dict[str, object]] = {}
+    best_dept_tokens: dict[str, int] = {}
+    for row in rows:
+        email = str(row.get("email") or "").strip()
+        if not email:
+            continue
+        total_tokens = int(row.get("total_tokens") or row.get("t") or 0)
+        gateway_cost = float(row.get("gateway_cost") or row.get("c") or 0)
+        api_tokens = int(row.get("api") or 0)
+        subscription_tokens = int(row.get("sub") or 0)
+        dept = str(row.get("dept") or "").strip()
+        profile_dept = str(profile_by_email.get(email, {}).get("dept") or "").strip()
+        person = by_email.get(email)
+        if person is None:
+            by_email[email] = {
+                "email": email,
+                "dept": profile_dept or dept or "unknown",
+                "total_tokens": total_tokens,
+                "gateway_cost": gateway_cost,
+                "api_tokens": api_tokens,
+                "subscription_tokens": subscription_tokens,
+                "cost_usd": 0.0,
+            }
+            best_dept_tokens[email] = total_tokens if dept else -1
+            continue
+        person["total_tokens"] = int(person["total_tokens"] or 0) + total_tokens
+        person["gateway_cost"] = float(person["gateway_cost"] or 0.0) + gateway_cost
+        person["api_tokens"] = int(person["api_tokens"] or 0) + api_tokens
+        person["subscription_tokens"] = int(person["subscription_tokens"] or 0) + subscription_tokens
+        if not profile_dept and dept and total_tokens > best_dept_tokens[email]:
+            person["dept"] = dept
+            best_dept_tokens[email] = total_tokens
+    for email, person in by_email.items():
+        person["gateway_cost"] = round(float(person["gateway_cost"] or 0.0), 4)
+        person["cost_usd"] = round(float(person["gateway_cost"] or 0.0) + fee_by_email.get(email, 0.0) * months, 4)
+    return list(by_email.values())
 
 
 class UsageRecord(BaseModel):
@@ -235,31 +280,21 @@ async def leaderboard(days: int = 30, source: str = "all", limit: int = 100) -> 
         subs_by_email, fee_by_email, profile_by_email = await _fetch_subscriptions(conn)
         rows = await conn.fetch(sql, *args)
     months = _subscription_months(days)
+    aggregated_rows = _aggregate_rows_to_email([dict(r) for r in rows], fee_by_email, months, profile_by_email)
     ranking = []
     seen_emails = set()
     # 公司实付口径：订阅费按窗口触达自然月数整月计；usage cost 只取 api/litellm 实销，
     # 排除 subscription 牌价；纯订阅人也进榜。
-    for r in rows:
+    for r in aggregated_rows:
         email = r["email"]
         seen_emails.add(email)
         ranking.append({
             "email": email,
-            "dept": r["dept"] or profile_by_email.get(email, {}).get("dept") or "unknown",
+            "dept": r["dept"] or "unknown",
             "total_tokens": r["total_tokens"] or 0,
-            "cost_usd": round(float(r["gateway_cost"] or 0) + fee_by_email.get(email, 0.0) * months, 4),
+            "cost_usd": r["cost_usd"] or 0,
             "subs": list(subs_by_email.get(email, [])),
         })
-    if source == "all":
-        for email, subs in subs_by_email.items():
-            if email in seen_emails:
-                continue
-            ranking.append({
-                "email": email,
-                "dept": profile_by_email.get(email, {}).get("dept") or "unknown",
-                "total_tokens": 0,
-                "cost_usd": round(fee_by_email.get(email, 0.0) * months, 4),
-                "subs": list(subs),
-            })
     ranking.sort(key=lambda r: (-int(r["total_tokens"] or 0), -float(r["cost_usd"] or 0), r["email"]))
     return {"days": days, "source": source,
             "ranking": ranking[:limit]}
@@ -307,32 +342,21 @@ async def dashboard(days: int = 30) -> str:
             FROM code_daily WHERE usage_date >= {window}
             GROUP BY dept ORDER BY acc DESC""", days)
     months = _subscription_months(days)
+    aggregated_rows = _aggregate_rows_to_email([dict(r) for r in ppl], fee_by_email, months, profile_by_email)
     ppl_rows = []
     seen_emails = set()
-    for r in ppl:
+    for r in aggregated_rows:
         email = r["email"]
         seen_emails.add(email)
         subs = list(subs_by_email.get(email, []))
         ppl_rows.append({
             "email": email,
-            "dept": r["dept"] or profile_by_email.get(email, {}).get("dept") or "unknown",
-            "t": r["t"] or 0,
-            "c": round(float(r["c"] or 0) + fee_by_email.get(email, 0.0) * months, 4),
-            "api": r["api"] or 0,
-            "sub": r["sub"] or 0,
+            "dept": r["dept"] or "unknown",
+            "t": r["total_tokens"] or 0,
+            "c": r["cost_usd"] or 0,
+            "api": r["api_tokens"] or 0,
+            "sub": r["subscription_tokens"] or 0,
             "subs": subs,
-        })
-    for email, subs in subs_by_email.items():
-        if email in seen_emails:
-            continue
-        ppl_rows.append({
-            "email": email,
-            "dept": profile_by_email.get(email, {}).get("dept") or "unknown",
-            "t": 0,
-            "c": round(fee_by_email.get(email, 0.0) * months, 4),
-            "api": 0,
-            "sub": 0,
-            "subs": list(subs),
         })
     ppl_rows.sort(key=lambda r: (-int(r["t"] or 0), -float(r["c"] or 0), r["email"]))
     ppl_rows = ppl_rows[:50]

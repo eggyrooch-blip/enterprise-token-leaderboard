@@ -1335,30 +1335,6 @@ class H(BaseHTTPRequestHandler):
                 fee_total = sum(float(s.get("fee") or 0) * months for s in subs)
                 row["cost"] = round(float(row["cost"] or 0) + fee_total, 4)
 
-            # 纯订阅用户也要进主个人榜；?client 工具榜不并角标/订阅费，避免混口径。
-            for email, subs in subs_by_email.items():
-                if email in by_email:
-                    continue
-                if (email in departed) and not sd:
-                    continue
-                pr = conn.execute(
-                    "SELECT dept, name, avatar FROM people WHERE email=?",
-                    (email,),
-                ).fetchone()
-                months = _months_for(email)
-                fee_total = sum(float(s.get("fee") or 0) * months for s in subs)
-                row = {
-                    "email": email,
-                    "dept": (_to_keep(pr[0]) if pr and pr[0] else None) or "unknown",
-                    "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
-                    "reasoning": 0, "tokens": 0, "cost": round(fee_total, 4), "messages": 0,
-                    "name": (pr[1] if pr and pr[1] else None) or email.split("@")[0],
-                    "avatar": (pr[2] if pr and pr[2] else None) or "",
-                    "via": "", "departed": email in departed, "composition": [], "subs": list(subs),
-                }
-                result.append(row)
-                by_email[email] = row
-
         # 飞书并入后总量可能变 → 统一算 composition 占比 + 重排
         for row in result:
             tot = row["tokens"] or 0
@@ -1692,6 +1668,31 @@ class H(BaseHTTPRequestHandler):
             ).fetchone()[0]
         except Exception:
             subs_unresolved = 0
+        subs_by_email = load_subscriptions(conn)
+        idle_usage_rows = conn.execute("""
+            SELECT DISTINCT email
+            FROM usage
+            WHERE source != 'litellm_agent' AND COALESCE(email, '') != ''
+        """).fetchall()
+        usage_emails = {r[0] for r in idle_usage_rows if r and r[0]}
+        idle_people = []
+        idle_emails = set()
+        for email, subs in subs_by_email.items():
+            if email in usage_emails:
+                continue
+            idle_emails.add(email)
+            for sub in subs:
+                idle_people.append({
+                    "email": email,
+                    "tool": sub.get("tool") or "",
+                    "fee": float(sub.get("fee") or 0),
+                })
+        # count 按空置订阅人头算；同一人多个 tool 只计 1 人，但 monthly_fee_usd 累加全部订阅行。
+        idle_subscriptions = {
+            "count": len(idle_emails),
+            "monthly_fee_usd": round(sum(float(p["fee"] or 0) for p in idle_people), 4),
+            "people": idle_people,
+        }
 
         max_date = (day_row[1] if day_row else "") or ""
         if max_date:
@@ -1863,7 +1864,10 @@ class H(BaseHTTPRequestHandler):
                 "day": day,
                 "last7": last7,
                 "report_log": report_log,
-                "subscriptions": {"unresolved": _num(subs_unresolved)},
+                "subscriptions": {
+                    "unresolved": _num(subs_unresolved),
+                    "idle": idle_subscriptions,
+                },
                 "sources": sources,
                 "clients": clients,
             },

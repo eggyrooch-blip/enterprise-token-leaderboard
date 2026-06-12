@@ -80,29 +80,40 @@ def _row_by_email(rows, email):
     raise AssertionError("missing row for %s" % email)
 
 
+def _idle_subscription(payload):
+    return payload["summary"]["subscriptions"]["idle"]
+
+
 def test_months_overlapped_counts_distinct_calendar_months(dc):
     assert dc.months_overlapped("2026-06-01", "2026-06-30") == 1
     assert dc.months_overlapped("2026-06-30", "2026-07-01") == 2
     assert dc.months_overlapped("2026-05-31", "2026-07-01") == 3
 
 
-def test_pure_subscription_person_appears_with_fee_only(dc, monkeypatch, tmp_path):
+def test_idle_subscription_person_is_absent_from_leaderboard_and_exposed_in_governance(dc, monkeypatch, tmp_path):
     _freeze_today(monkeypatch, dc, "2026-06-12")
     monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
     conn = dc.db()
     try:
         _insert_people(conn, "solo@keep.com", "Solo", "Keep/平台/基础")
         _insert_sub(conn, "solo@keep.com", "codex", "standard", 25.0, "Solo", "Keep/平台/基础")
+        _insert_sub(conn, "solo@keep.com", "cursor", "standard", 40.0, "Solo", "Keep/平台/基础")
         conn.commit()
 
         rows = _leaderboard(dc, conn, {"days": ["30"]})
+        payload = _governance(dc, conn)
     finally:
         conn.close()
 
-    row = _row_by_email(rows, "solo@keep.com")
-    assert row["tokens"] == 0
-    assert row["cost"] == 50.0
-    assert row["subs"] == [{"tool": "codex", "tier": "standard", "fee": 25.0, "seats": 1}]
+    assert not [row for row in rows if row["email"] == "solo@keep.com"]
+    assert _idle_subscription(payload) == {
+        "count": 1,
+        "monthly_fee_usd": 65.0,
+        "people": [
+            {"email": "solo@keep.com", "tool": "codex", "fee": 25.0},
+            {"email": "solo@keep.com", "tool": "cursor", "fee": 40.0},
+        ],
+    }
 
 
 def test_person_cost_uses_gateway_actual_plus_subscription_fee(dc, monkeypatch, tmp_path):
@@ -117,6 +128,7 @@ def test_person_cost_uses_gateway_actual_plus_subscription_fee(dc, monkeypatch, 
         conn.commit()
 
         rows = _leaderboard(dc, conn, {"days": ["30"]})
+        payload = _governance(dc, conn)
     finally:
         conn.close()
 
@@ -124,6 +136,7 @@ def test_person_cost_uses_gateway_actual_plus_subscription_fee(dc, monkeypatch, 
     assert row["tokens"] == 200
     assert row["cost"] == 203.5
     assert row["subs"] == [{"tool": "claude", "tier": "premium", "fee": 100.0, "seats": 1}]
+    assert _idle_subscription(payload) == {"count": 0, "monthly_fee_usd": 0.0, "people": []}
 
 
 def test_subscription_removal_drops_fee_and_badges(dc, monkeypatch, tmp_path):
@@ -165,7 +178,10 @@ def test_governance_metrics_exposes_subscription_unresolved_count(dc, monkeypatc
     finally:
         conn.close()
 
-    assert payload["summary"]["subscriptions"] == {"unresolved": 1}
+    assert payload["summary"]["subscriptions"] == {
+        "unresolved": 1,
+        "idle": {"count": 0, "monthly_fee_usd": 0.0, "people": []},
+    }
 
 
 def test_subscription_cost_uses_aggregated_fee_row_and_preserves_seats(dc, monkeypatch, tmp_path):
@@ -175,6 +191,7 @@ def test_subscription_cost_uses_aggregated_fee_row_and_preserves_seats(dc, monke
     try:
         _insert_people(conn, "seats@keep.com", "Seats", "Keep/平台/基础")
         _insert_sub(conn, "seats@keep.com", "codex", "standard", 50.0, "Seats", "Keep/平台/基础", seats=2)
+        _insert_usage(dc, conn, "seats@keep.com", "Keep/平台/基础", "2026-06-10", "api", "Hermes", 20, 0.75, 1)
         conn.commit()
 
         rows = _leaderboard(dc, conn, {"days": ["30"]})
@@ -182,5 +199,6 @@ def test_subscription_cost_uses_aggregated_fee_row_and_preserves_seats(dc, monke
         conn.close()
 
     row = _row_by_email(rows, "seats@keep.com")
-    assert row["cost"] == 100.0
+    assert row["tokens"] == 20
+    assert row["cost"] == 100.75
     assert row["subs"] == [{"tool": "codex", "tier": "standard", "fee": 50.0, "seats": 2}]

@@ -360,8 +360,18 @@ function renderGovernance(){
       '<div class="bench">'+m.benchmark+'</div></div>';
   }).join('')+'</div>';
   var unresolved=CACHE.govSummary&&CACHE.govSummary.subscriptions?CACHE.govSummary.subscriptions.unresolved:undefined;
+  var idle=CACHE.govSummary&&CACHE.govSummary.subscriptions?CACHE.govSummary.subscriptions.idle:null;
+  var notes=[];
+  var extra='';
   if(typeof unresolved==='number' && unresolved>=0){
-    body+='<div class="gov-note" style="margin-top:12px"><span class="gov-pill">订阅身份未匹配：'+unresolved+' 条</span>'+(unresolved>0?' 需人工补齐订阅归属后再看个人公司实付。':'')+'</div>';
+    notes.push('<span class="gov-pill">订阅身份未匹配：'+unresolved+' 条</span>');
+    if(unresolved>0) extra=' 需人工补齐订阅归属后再看个人公司实付。';
+  }
+  if(idle && (idle.count||0)>0){
+    notes.push('<span class="gov-pill">闲置/离职订阅席位 '+idle.count+' 人 · 月费 $'+compact(idle.monthly_fee_usd||0)+'（名单见接口）</span>');
+  }
+  if(notes.length){
+    body+='<div class="gov-note" style="margin-top:12px">'+notes.join(' ')+extra+'</div>';
   }
   $('list').innerHTML=body;
 }
