@@ -10,8 +10,7 @@ GUARD = ROOT / "scripts" / "open_source_guard.py"
 
 def run_guard(*args: pathlib.Path, denylist: pathlib.Path | None = None) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
-    if denylist is not None:
-        env["LEAK_DENYLIST"] = str(denylist)
+    env["LEAK_DENYLIST"] = str(denylist) if denylist is not None else os.devnull
     return subprocess.run(
         [sys.executable, str(GUARD), *map(str, args)],
         cwd=ROOT,
