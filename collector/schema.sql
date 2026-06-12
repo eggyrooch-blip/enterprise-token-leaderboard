@@ -58,3 +58,31 @@ CREATE TABLE IF NOT EXISTS device_identity (
     dept        TEXT NOT NULL DEFAULT 'unknown',
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 付费订阅名单：每日从飞书 4 个名单 tab 整表覆盖落库（subscriptions_sync.py）。
+-- 以最新表单为唯一事实：表里新增的人当天获得徽章+计订阅费，被删的人当天摘掉。
+-- 个人榜「公司实付」= 网关实销(usage_daily.source in api/litellm) + 本表月费×覆盖月数。
+-- 订阅徽章(个人榜姓名后)与月费明细均取自本表。tool/tier 取值见列注释。
+CREATE TABLE IF NOT EXISTS subscriptions (
+    email           TEXT          NOT NULL,
+    tool            TEXT          NOT NULL,                       -- 'codex'|'claude'|'cursor'|'windsurf'
+    tier            TEXT          NOT NULL DEFAULT 'standard',    -- 'standard'|'premium'（同人同工具多账号取最高档）
+    monthly_fee_usd NUMERIC(10,2) NOT NULL DEFAULT 0,             -- 同人同工具多坐席的月费之和（已按 seats 聚合）
+    seats           INTEGER       NOT NULL DEFAULT 1,             -- 同人同工具的账号数；单价×seats 已并入 monthly_fee_usd
+    display_name    TEXT          NOT NULL DEFAULT '',
+    dept            TEXT          NOT NULL DEFAULT '',
+    synced_at       TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    PRIMARY KEY (email, tool)
+);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_email ON subscriptions (email);
+
+-- 订阅名单未归位行：名单里解析不到企业邮箱的人（Codex gmail 反查 people 失败/重名歧义），
+-- 不静默丢弃，落本表，看板治理区显示「订阅名单未归位 N 人」待人工补映射。
+CREATE TABLE IF NOT EXISTS subscriptions_unresolved (
+    tool         TEXT        NOT NULL,
+    display_name TEXT        NOT NULL DEFAULT '',
+    raw_email    TEXT        NOT NULL DEFAULT '',
+    dept         TEXT        NOT NULL DEFAULT '',
+    reason       TEXT        NOT NULL,                            -- 'no_match'|'ambiguous'
+    synced_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);

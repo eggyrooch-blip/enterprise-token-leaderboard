@@ -1,0 +1,12 @@
+[Unit]
+Description=每日触发 subscriptions-sync.service (飞书订阅名单整表覆盖同步)
+
+[Timer]
+# 启动后 5 分钟先跑一次, 之后每天 03:30 跑. Persistent 补上停机期间漏掉的触发.
+OnBootSec=5min
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=subscriptions-sync.service
+
+[Install]
+WantedBy=timers.target

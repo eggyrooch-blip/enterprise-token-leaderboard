@@ -291,6 +291,9 @@ def db():
         usage_date TEXT NOT NULL, biz_type TEXT NOT NULL, biz_name TEXT DEFAULT '',
         credits REAL DEFAULT 0, user_count INTEGER DEFAULT 0,
         PRIMARY KEY(usage_date, biz_type))""")
+    # 订阅快照表由独立同步器维护，这里只保证 dev collector 本地库必有同 schema。
+    import subscriptions_sync
+    subscriptions_sync.ensure_tables(c)
     c.commit()
     return c
 
@@ -313,6 +316,53 @@ def num(r, *keys):
                 except (TypeError, ValueError, OverflowError):
                     pass
     return 0
+
+
+def _coerce_date(v):
+    """datetime/date/ISO 字符串 -> date。"""
+    if isinstance(v, datetime.datetime):
+        return v.date()
+    if isinstance(v, datetime.date):
+        return v
+    return datetime.datetime.strptime(str(v), "%Y-%m-%d").date()
+
+
+def months_overlapped(start, end):
+    """闭区间 [start,end] 触达的自然月数。
+
+    例如 2026-06-01~2026-06-30 => 1，2026-06-30~2026-07-01 => 2。
+    若 end < start，按 1 月处理，避免坏数据把订阅费算成 0 或负数。
+    """
+    start_d = _coerce_date(start)
+    end_d = _coerce_date(end)
+    if end_d < start_d:
+        return 1
+    return (end_d.year - start_d.year) * 12 + (end_d.month - start_d.month) + 1
+
+
+def load_subscriptions(conn):
+    """subscriptions 表 -> {email: [{tool,tier,fee}, ...]}。
+
+    表不存在/为空时返回空 dict，便于旧库或局部测试直接复用。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT email, tool, tier, monthly_fee_usd, seats FROM subscriptions ORDER BY email, tool"
+        ).fetchall()
+    except Exception:
+        return {}
+    out = {}
+    for r in rows:
+        email = r[0] or ""
+        if not email:
+            continue
+        out.setdefault(email, []).append({
+            "tool": r[1] or "",
+            "tier": r[2] or "standard",
+            "fee": float(r[3] or 0),
+            "seats": int(r[4] or 1),
+        })
+    return out
 
 
 _CLIENT_LABELS = {
@@ -557,6 +607,31 @@ def _range_clause(qs, prefix=""):
         cutoff = (datetime.date.today() - datetime.timedelta(days=days - 1)).isoformat()
         return ("%speriod_type='day' AND %speriod >= ?" % (p, p), [cutoff])
     return ("%speriod_type='lifetime'" % p, [])
+
+
+def _cost_window(qs):
+    """个人榜订阅费的全局窗口。
+
+    显式 from/to 或 days=N 时直接给出闭区间；默认 lifetime/all 返回 (None, None)，
+    由个人榜按「每个人最早 usage.day → today」补齐。纯订阅且无 usage 的人默认算 1 个月。
+    """
+    today = datetime.date.today()
+    frm = (qs.get("from") or [None])[0]
+    to = (qs.get("to") or [None])[0]
+    if frm or to:
+        start = _coerce_date(frm or to or today)
+        end = _coerce_date(to or frm or today)
+        if frm and not to:
+            end = today
+        return start, end
+    raw = (qs.get("days") or [None])[0]
+    try:
+        days = int(raw) if raw not in (None, "", "all") else None
+    except (TypeError, ValueError):
+        days = None
+    if days and days > 0:
+        return today - datetime.timedelta(days=days - 1), today
+    return None, None
 
 
 def _show_departed(qs):
@@ -1145,6 +1220,8 @@ class H(BaseHTTPRequestHandler):
         sd = _show_departed(qs)
         dep_clause = _departed_filter(sd, "u.")
         departed = _departed_set(conn)
+        cost_start, cost_end = _cost_window(qs)
+        today = datetime.date.today()
         # 可选 ?client=Claude Code|Codex CLI|... → 只统计该工具(Claude 榜 / Codex 榜复用此端点)
         cli = (qs.get("client") or [None])[0]
         cli_clause = " AND u.client = ?" if cli else ""
@@ -1153,7 +1230,9 @@ class H(BaseHTTPRequestHandler):
         rows = conn.execute("""
             SELECT u.email, MAX(u.dept),
                    SUM(u.input), SUM(u.output), SUM(u.cache_read), SUM(u.cache_write),
-                   SUM(u.reasoning), SUM(u.total), SUM(u.cost), SUM(u.messages),
+                   SUM(u.reasoning), SUM(u.total),
+                   SUM(CASE WHEN u.source IN ('litellm','api') THEN u.cost ELSE 0 END),
+                   SUM(u.messages),
                    MAX(p.name), MAX(p.avatar),
                    (SELECT rl.via FROM report_log rl WHERE rl.email = u.email
                     ORDER BY rl.reported_at DESC LIMIT 1),
@@ -1183,12 +1262,14 @@ class H(BaseHTTPRequestHandler):
                 "input": r[2] or 0, "output": r[3] or 0,
                 "cache_read": r[4] or 0, "cache_write": r[5] or 0,
                 "reasoning": r[6] or 0, "tokens": r[7] or 0,
+                # 个人榜 cost 口径改为公司实付：这里只先放网关真实花费，订阅费稍后按窗口叠加。
                 "cost": round(r[8] or 0, 4), "messages": r[9] or 0,
                 "name": r[10] or (r[0] or "").split("@")[0],
                 "avatar": r[11] or "",
                 "via": r[12] or "",   # 最近一次订阅制上报来源:manual=手工补报(看板打角标)
                 "departed": r[0] in departed,
                 "composition": list(comp.get(r[0], [])),   # pct 等飞书并入后统一算
+                "subs": [],
             }
             result.append(row)
             by_email[r[0]] = row
@@ -1217,12 +1298,66 @@ class H(BaseHTTPRequestHandler):
                            "reasoning": 0, "tokens": 0, "cost": 0, "messages": 0,
                            "name": (pr[1] if pr and pr[1] else None) or fname or fem.split("@")[0],
                            "avatar": (pr[2] if pr and pr[2] else None) or favatar or "",
-                           "via": "", "departed": fem in departed, "composition": []}
+                           "via": "", "departed": fem in departed, "composition": [],
+                           "subs": []}
                     result.append(row)
                     by_email[fem] = row
                 row["tokens"] = (row["tokens"] or 0) + credits
                 row["feishu_credits"] = credits   # 单列飞书点数,前端可标注「含飞书 X 点」
                 row["composition"].append({"client": "飞书AI权益", "tokens": credits})
+
+            subs_by_email = load_subscriptions(conn)
+            usage_window_start = {}
+            if cost_start is None:
+                for mr in conn.execute("""
+                    SELECT u.email, MIN(u.period)
+                    FROM usage u
+                    WHERE u.period_type='day' AND u.source != 'litellm_agent'%s
+                    GROUP BY u.email
+                """ % cli_clause, ([cli] if cli else [])).fetchall():
+                    if mr[0] and mr[1]:
+                        usage_window_start[mr[0]] = mr[1]
+
+            def _months_for(email):
+                if cost_start is not None and cost_end is not None:
+                    return months_overlapped(cost_start, cost_end)
+                if usage_window_start.get(email):
+                    return months_overlapped(usage_window_start[email], today)
+                # lifetime/all 且此人没有任何 usage 明细时，纯订阅用户按 1 个月算。
+                return 1
+
+            for row in result:
+                subs = list(subs_by_email.get(row["email"], []))
+                row["subs"] = subs
+                if not subs:
+                    continue
+                months = _months_for(row["email"])
+                fee_total = sum(float(s.get("fee") or 0) * months for s in subs)
+                row["cost"] = round(float(row["cost"] or 0) + fee_total, 4)
+
+            # 纯订阅用户也要进主个人榜；?client 工具榜不并角标/订阅费，避免混口径。
+            for email, subs in subs_by_email.items():
+                if email in by_email:
+                    continue
+                if (email in departed) and not sd:
+                    continue
+                pr = conn.execute(
+                    "SELECT dept, name, avatar FROM people WHERE email=?",
+                    (email,),
+                ).fetchone()
+                months = _months_for(email)
+                fee_total = sum(float(s.get("fee") or 0) * months for s in subs)
+                row = {
+                    "email": email,
+                    "dept": (_to_keep(pr[0]) if pr and pr[0] else None) or "unknown",
+                    "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+                    "reasoning": 0, "tokens": 0, "cost": round(fee_total, 4), "messages": 0,
+                    "name": (pr[1] if pr and pr[1] else None) or email.split("@")[0],
+                    "avatar": (pr[2] if pr and pr[2] else None) or "",
+                    "via": "", "departed": email in departed, "composition": [], "subs": list(subs),
+                }
+                result.append(row)
+                by_email[email] = row
 
         # 飞书并入后总量可能变 → 统一算 composition 占比 + 重排
         for row in result:
@@ -1551,6 +1686,12 @@ class H(BaseHTTPRequestHandler):
                    MAX(reported_at)
             FROM report_log
         """).fetchone()
+        try:
+            subs_unresolved = conn.execute(
+                "SELECT COUNT(*) FROM subscriptions_unresolved"
+            ).fetchone()[0]
+        except Exception:
+            subs_unresolved = 0
 
         max_date = (day_row[1] if day_row else "") or ""
         if max_date:
@@ -1722,6 +1863,7 @@ class H(BaseHTTPRequestHandler):
                 "day": day,
                 "last7": last7,
                 "report_log": report_log,
+                "subscriptions": {"unresolved": _num(subs_unresolved)},
                 "sources": sources,
                 "clients": clients,
             },

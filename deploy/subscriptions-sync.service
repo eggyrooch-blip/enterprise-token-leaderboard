@@ -1,0 +1,18 @@
+[Unit]
+Description=飞书订阅名单同步 → tokreport SQLite (subscriptions 整表覆盖, 订阅徽章/公司实付来源)
+After=network-online.target tokreport-collector.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=it
+WorkingDirectory=__REMOTE_DIR__
+EnvironmentFile=__REMOTE_DIR__/.env
+# 与 collector 写同一个库; FEISHU_APP_ID/FEISHU_APP_SECRET 从 .env 读, 不落代码
+Environment=DEV_DB=__REMOTE_DIR__/tok.db
+ExecStart=__PYTHON__ __REMOTE_DIR__/subscriptions_sync.py
+# 读 4 个名单 tab + 整表覆盖一次, 失败由 timer 次日重试
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=subscriptions-sync

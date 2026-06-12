@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import List, Optional
 
 import asyncpg
@@ -40,6 +40,67 @@ def require_token(authorization: str = Header(default="")) -> None:
         raise HTTPException(401, "missing bearer token")
     if authorization.split(" ", 1)[1] not in API_TOKENS:
         raise HTTPException(403, "invalid token")
+
+
+def _coerce_date(v: date | str) -> date:
+    if isinstance(v, date):
+        return v
+    return datetime.strptime(str(v), "%Y-%m-%d").date()
+
+
+def months_overlapped(start: date | str, end: date | str) -> int:
+    """闭区间 [start, end] 触达的自然月数。"""
+    start_d = _coerce_date(start)
+    end_d = _coerce_date(end)
+    if end_d < start_d:
+        return 1
+    return (end_d.year - start_d.year) * 12 + (end_d.month - start_d.month) + 1
+
+
+def _subscription_months(days: int) -> int:
+    today = date.today()
+    span = max(int(days or 1), 1)
+    start = today - timedelta(days=span - 1)
+    return months_overlapped(start, today)
+
+
+async def _fetch_subscriptions(conn: asyncpg.Connection) -> tuple[dict[str, list[dict]], dict[str, float], dict[str, dict[str, str]]]:
+    rows = await conn.fetch(
+        """
+        SELECT email, tool, tier, monthly_fee_usd, seats, display_name, dept
+        FROM subscriptions
+        ORDER BY email, tool, tier
+        """
+    )
+    subs_by_email: dict[str, list[dict]] = {}
+    fee_by_email: dict[str, float] = {}
+    profile_by_email: dict[str, dict[str, str]] = {}
+    for r in rows:
+        email = (r["email"] or "").strip()
+        if not email:
+            continue
+        subs_by_email.setdefault(email, []).append({
+            "tool": r["tool"],
+            "tier": r["tier"],
+            "fee": float(r["monthly_fee_usd"] or 0),
+            "seats": int(r["seats"] or 1),
+        })
+        fee_by_email[email] = fee_by_email.get(email, 0.0) + float(r["monthly_fee_usd"] or 0)
+        profile = profile_by_email.setdefault(email, {})
+        if r["display_name"] and not profile.get("display_name"):
+            profile["display_name"] = r["display_name"]
+        if r["dept"] and not profile.get("dept"):
+            profile["dept"] = r["dept"]
+    return subs_by_email, fee_by_email, profile_by_email
+
+
+def _subscription_text(subs: list[dict]) -> str:
+    return "；".join(
+        f'{s.get("tool")}/{s.get("tier")} ${float(s.get("fee") or 0):g}/月'
+        f' ×{int(s.get("seats") or 1)}' if int(s.get("seats") or 1) > 1
+        else f'{s.get("tool")}/{s.get("tier")} ${float(s.get("fee") or 0):g}/月'
+        for s in subs
+    )
 
 
 class UsageRecord(BaseModel):
@@ -160,22 +221,48 @@ async def leaderboard(days: int = 30, source: str = "all", limit: int = 100) -> 
     args: list = [days]
     if source != "all":
         args.append(source)
-    args.append(limit)
     sql = f"""
         SELECT email, dept,
-               SUM(total_tokens) AS total_tokens,
-               SUM(cost_usd)     AS cost_usd
+               COALESCE(SUM(total_tokens), 0) AS total_tokens,
+               COALESCE(SUM(cost_usd) FILTER (WHERE source IN ('api','litellm')), 0) AS gateway_cost
         FROM usage_daily
         WHERE usage_date >= current_date - ($1::int - 1)
         {where_source}
         GROUP BY email, dept
-        ORDER BY total_tokens DESC
-        LIMIT ${len(args)};
+        ORDER BY total_tokens DESC, email ASC;
     """
     async with _pool.acquire() as conn:
+        subs_by_email, fee_by_email, profile_by_email = await _fetch_subscriptions(conn)
         rows = await conn.fetch(sql, *args)
+    months = _subscription_months(days)
+    ranking = []
+    seen_emails = set()
+    # 公司实付口径：订阅费按窗口触达自然月数整月计；usage cost 只取 api/litellm 实销，
+    # 排除 subscription 牌价；纯订阅人也进榜。
+    for r in rows:
+        email = r["email"]
+        seen_emails.add(email)
+        ranking.append({
+            "email": email,
+            "dept": r["dept"] or profile_by_email.get(email, {}).get("dept") or "unknown",
+            "total_tokens": r["total_tokens"] or 0,
+            "cost_usd": round(float(r["gateway_cost"] or 0) + fee_by_email.get(email, 0.0) * months, 4),
+            "subs": list(subs_by_email.get(email, [])),
+        })
+    if source == "all":
+        for email, subs in subs_by_email.items():
+            if email in seen_emails:
+                continue
+            ranking.append({
+                "email": email,
+                "dept": profile_by_email.get(email, {}).get("dept") or "unknown",
+                "total_tokens": 0,
+                "cost_usd": round(fee_by_email.get(email, 0.0) * months, 4),
+                "subs": list(subs),
+            })
+    ranking.sort(key=lambda r: (-int(r["total_tokens"] or 0), -float(r["cost_usd"] or 0), r["email"]))
     return {"days": days, "source": source,
-            "ranking": [dict(r) for r in rows]}
+            "ranking": ranking[:limit]}
 
 
 @app.get("/healthz")
@@ -199,12 +286,14 @@ async def dashboard(days: int = 30) -> str:
     assert _pool is not None
     window = "current_date - ($1::int - 1)"
     async with _pool.acquire() as conn:
+        subs_by_email, fee_by_email, profile_by_email = await _fetch_subscriptions(conn)
         ppl = await conn.fetch(f"""
-            SELECT email, dept, SUM(total_tokens) t, ROUND(SUM(cost_usd),2) c,
-                   SUM(total_tokens) FILTER (WHERE source='api') api,
-                   SUM(total_tokens) FILTER (WHERE source='subscription') sub
+            SELECT email, dept, COALESCE(SUM(total_tokens), 0) t,
+                   COALESCE(SUM(cost_usd) FILTER (WHERE source IN ('api','litellm')), 0) c,
+                   COALESCE(SUM(total_tokens) FILTER (WHERE source='api'), 0) api,
+                   COALESCE(SUM(total_tokens) FILTER (WHERE source='subscription'), 0) sub
             FROM usage_daily WHERE usage_date >= {window}
-            GROUP BY email, dept ORDER BY t DESC LIMIT 50""", days)
+            GROUP BY email, dept""", days)
         depts = await conn.fetch(f"""
             SELECT dept, SUM(total_tokens) t, ROUND(SUM(cost_usd),2) c
             FROM usage_daily WHERE usage_date >= {window}
@@ -217,14 +306,45 @@ async def dashboard(days: int = 30) -> str:
                    ROUND(100.0*SUM(lines_accepted)/NULLIF(SUM(lines_suggested),0),1) rate
             FROM code_daily WHERE usage_date >= {window}
             GROUP BY dept ORDER BY acc DESC""", days)
+    months = _subscription_months(days)
+    ppl_rows = []
+    seen_emails = set()
+    for r in ppl:
+        email = r["email"]
+        seen_emails.add(email)
+        subs = list(subs_by_email.get(email, []))
+        ppl_rows.append({
+            "email": email,
+            "dept": r["dept"] or profile_by_email.get(email, {}).get("dept") or "unknown",
+            "t": r["t"] or 0,
+            "c": round(float(r["c"] or 0) + fee_by_email.get(email, 0.0) * months, 4),
+            "api": r["api"] or 0,
+            "sub": r["sub"] or 0,
+            "subs": subs,
+        })
+    for email, subs in subs_by_email.items():
+        if email in seen_emails:
+            continue
+        ppl_rows.append({
+            "email": email,
+            "dept": profile_by_email.get(email, {}).get("dept") or "unknown",
+            "t": 0,
+            "c": round(fee_by_email.get(email, 0.0) * months, 4),
+            "api": 0,
+            "sub": 0,
+            "subs": list(subs),
+        })
+    ppl_rows.sort(key=lambda r: (-int(r["t"] or 0), -float(r["c"] or 0), r["email"]))
+    ppl_rows = ppl_rows[:50]
 
     def fmt(n):
         return f"{int(n or 0):,}"
 
     sections = [
-        _table("个人 Token 榜 (Top 50)", ["#", "邮箱", "部门", "Token", "其中 API", "其中订阅", "成本$"],
-               [(i + 1, r["email"], r["dept"], fmt(r["t"]), fmt(r["api"]), fmt(r["sub"]), r["c"] or 0)
-                for i, r in enumerate(ppl)]),
+        _table("个人 Token 榜 (Top 50)", ["#", "邮箱", "部门", "Token", "其中 API", "其中订阅", "订阅套餐", "公司实付$"],
+               [(i + 1, r["email"], r["dept"], fmt(r["t"]), fmt(r["api"]), fmt(r["sub"]),
+                 _subscription_text(r["subs"]) or "-", r["c"] or 0)
+                for i, r in enumerate(ppl_rows)]),
         _table("部门 Token 榜", ["部门", "Token", "成本$"],
                [(r["dept"], fmt(r["t"]), r["c"] or 0) for r in depts]),
         _table("工具维度", ["工具", "Token"], [(r["tool"], fmt(r["t"])) for r in tools]),

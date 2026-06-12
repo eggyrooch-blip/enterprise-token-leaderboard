@@ -180,3 +180,42 @@ ssh it@collector.example.com 'sudo systemctl list-timers litellm-sync.timer'    
 # 只读演练（本机，不写库）：
 LITELLM_BASE_URL=... LITELLM_MASTER_KEY=... python3 collector/litellm_collector.py --dry-run
 ```
+
+---
+
+## 飞书订阅名单同步（2026-06-12 新增）
+
+每天从飞书表 `WuK7sLkIthIn2Htrz2BcIiipnEb` 读 4 个名单 tab，**以最新表单为准整表覆盖**
+落库 `subscriptions` + `subscriptions_unresolved` 两张表。表里新增的人当天获得订阅徽章并
+计订阅费，被删的人当天摘掉徽章并停止计费（`清退` tab 不读）。
+
+**名单与计费**：
+- Codex `aGseou`（注册邮箱多为 gmail，用「飞书实名」反查 `people` 表得企业邮箱）— $25/月
+- Claude `6SIHS`（身份 = `<飞书 user_id>@keep.com`；备注含「Premium 席位」→ $100，否则 $25）
+- Cursor `KvJN7D`（表内即 @keep.com）— $40/月
+- Windsurf `fl4xUJ`（表内即 @keep.com）— $30/月
+- Codex 解析不到企业邮箱或重名歧义的人**不静默丢弃**，落 `subscriptions_unresolved`
+  （reason=`no_match`|`ambiguous`），看板治理区显示「订阅名单未归位 N 人」待人工补映射。
+
+**归属与个人榜「公司实付」**：个人榜成本列改为公司实付 = 网关实销
+（`usage_daily.source in ('api','litellm')`）+ 该人当前订阅月费之和 × 区间覆盖的自然月数
+（整月口径，不按天折算）。订阅制工具 token 量照常展示，但不再按 API 牌价折算成成本。
+
+**运行方式**：`subscriptions-sync.timer` 每天 03:30 触发 `subscriptions_sync.py`（oneshot），
+与 collector 同宿主、纯标准库（py3.6.8）、直接写 `tok.db`，免 HTTP 自上报、不依赖孙可 Mac。
+
+**幂等**：每次跑都在单事务内 `DELETE` 两表全部行再整批 `INSERT OR REPLACE` 重写 →
+连跑两次行集不变。
+
+**前置**：`pipeline/.env` 里需含 `FEISHU_APP_ID` + `FEISHU_APP_SECRET`（飞书 bot 应用凭证，
+从 env 读，**绝不落代码/文档**；已验证 bot 身份可读该表全部 tab）。`deploy.sh` 安装 service+timer
+时同步 `enable --now`。
+
+**手动运维**：
+```bash
+ssh it@collector.example.com 'sudo systemctl start subscriptions-sync.service'   # 立即跑一次
+ssh it@collector.example.com 'sudo journalctl -u subscriptions-sync -n 30 --no-pager'  # 看日志
+ssh it@collector.example.com 'sudo systemctl list-timers subscriptions-sync.timer'     # 看下次触发
+# 只读演练（本机，不写库，打印 4 tab 解析人数 + unresolved 计数）：
+FEISHU_APP_ID=... FEISHU_APP_SECRET=... python3 collector/subscriptions_sync.py --dry-run
+```
