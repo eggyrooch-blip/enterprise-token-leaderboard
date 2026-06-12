@@ -272,9 +272,9 @@ var SUB_LOGOS={
 };
 function subLogoHtml(s){
   var tool=String(s.tool||'').toLowerCase(), tier=String(s.tier||'standard').toLowerCase();
-  var logo=SUB_LOGOS[tool], seats=Number(s.seats)||1, seatText=seats>1?' ×'+seats:'';
+  var logo=SUB_LOGOS[tool], seats=Number(s.seats)||1, seatText=seats>1?'（'+seats+' 席共计）':'';  // fee 已是各席之和,标「共计」防读成 单价×席数
   var title=titleCaseWord(tool)+' '+titleCaseWord(tier), start=s.start?String(s.start):'', end=s.end?String(s.end):'';
-  var ended=!!end, tip=title+' · $'+(Number(s.fee)||0)+'/月'+seatText;
+  var ended=!!end, tip=title+' · '+seatText+'$'+(Number(s.fee)||0)+'/月';
   if(ended) tip=title+' · $'+(Number(s.fee)||0)+'/月 · '+(start||'?')+' ~ '+end+' 已删除';
   else if(start) tip+=' · 自 '+start;
   var cls=(tier==='premium'?' premium':'')+(ended?' ended':'');

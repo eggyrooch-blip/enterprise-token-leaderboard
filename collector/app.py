@@ -212,9 +212,10 @@ async def _fetch_subscriptions(conn: asyncpg.Connection) -> tuple[dict[str, list
 
 
 def _subscription_text(subs: list[dict]) -> str:
+    # fee 已是各席位之和；多席标「N 席共计」而非「×N」，避免读成 单价×席数。
     return "；".join(
-        f'{s.get("tool")}/{s.get("tier")} ${float(s.get("fee") or 0):g}/月'
-        f' ×{int(s.get("seats") or 1)}' if int(s.get("seats") or 1) > 1
+        f'{s.get("tool")}/{s.get("tier")} {int(s.get("seats") or 1)} 席共计 ${float(s.get("fee") or 0):g}/月'
+        if int(s.get("seats") or 1) > 1
         else f'{s.get("tool")}/{s.get("tier")} ${float(s.get("fee") or 0):g}/月'
         for s in subs
     )
