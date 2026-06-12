@@ -556,3 +556,30 @@ def test_hermes_gateway_priced_row_not_double_counted_and_mixed_model_infers(dc,
     assert gw["cost"] == 7.5, gw["cost"]
     mix = _row_by_email(rows, "h-mix@keep.com")
     assert mix["cost"] == 27.5 and mix.get("cost_est") is True, mix["cost"]
+
+
+def test_tool_board_lifetime_mode_matches_person_board_proration(dc, monkeypatch, tmp_path):
+    """无 days/from-to(全部模式)时工具榜摊销窗口须与个人榜一致(评审修复回归)。"""
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "lt@keep.com", "Lt", "Keep/平台/基础")
+        _insert_sub_life(conn, "lt@keep.com", "claude", "premium", 120.0, "Lt", "Keep/平台/基础", "2026-06-01", None)
+        # lifetime 行 + day 行(最早用量日 2026-05-01)
+        _insert_usage(dc, conn, "lt@keep.com", "Keep/平台/基础", "2026-05-01", "subscription", "Claude Code", 100, 1.0, 1)
+        conn.execute(dc._UPSERT_SQL, (
+            "lt@keep.com", "Keep/平台/基础", "lifetime", "all", "subscription", "Claude Code", "", "model-x",
+            100, 0, 0, 0, 0, 100, 1.0, 1,
+        ))
+        conn.commit()
+
+        board = _leaderboard(dc, conn, {"client": ["Claude Code"]})
+        person = _leaderboard(dc, conn, {})
+    finally:
+        conn.close()
+
+    # 窗口=05-01..06-12,席位 06-01 起 → 120×12/30=48;两榜一致
+    expected = round(120.0 * (12 / 30), 4)
+    assert _row_by_email(person, "lt@keep.com")["cost"] == expected
+    assert _row_by_email(board, "lt@keep.com")["cost"] == expected

@@ -1432,19 +1432,32 @@ class H(BaseHTTPRequestHandler):
         subs_by_email = load_subscriptions(conn)
         sub_tool = _CLIENT_TO_SUB_TOOL.get(cli)
         if cli:
-            win_s = cost_start if cost_start is not None else today
-            win_e = cost_end if cost_end is not None else today
+            # lifetime(无窗口)时与个人榜同口径:窗口取「该人最早用量日 → 今天」,
+            # 都没有时才退化为今天;无界席位在完全无用量时按 1.0 个月费计。
+            cli_window_start = {}
+            if cost_start is None:
+                for mr in conn.execute("""
+                    SELECT u.email, MIN(u.period)
+                    FROM usage u
+                    WHERE u.period_type='day' AND u.source != 'litellm_agent'%s
+                    GROUP BY u.email
+                """ % cli_clause, ([cli] if cli else [])).fetchall():
+                    if mr[0] and mr[1]:
+                        cli_window_start[mr[0]] = mr[1]
             for row in result:
+                if cost_start is not None and cost_end is not None:
+                    win_s, win_e = cost_start, cost_end
+                else:
+                    win_s, win_e = cli_window_start.get(row["email"]) or today, today
                 row["subs"] = _single_tool_subs(subs_by_email, row["email"], sub_tool, win_s, win_e)
                 # 工具榜价格:该工具订阅费按席位区间摊销并入本榜 cost(订阅 token 无网关
                 # 实销,此前恒为 $0 —— sunke 2026-06-13"codex/claude 榜没有价格")。
-                # 与个人榜同口径:lifetime(无窗口)时无界席位按 1.0 个月费计。
                 if sub_tool:
                     fee_total = 0.0
                     for seat in subs_by_email.get(row["email"], []):
                         if (seat.get("tool") or "").lower() != sub_tool:
                             continue
-                        if cost_start is None and not seat.get("start") and not seat.get("end"):
+                        if cost_start is None and cli_window_start.get(row["email"]) is None and                                 not seat.get("start") and not seat.get("end"):
                             frac = 1.0
                         else:
                             frac = _interval_fraction(win_s, win_e, seat.get("start"), seat.get("end"))
