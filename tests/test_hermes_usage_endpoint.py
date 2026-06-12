@@ -235,13 +235,61 @@ def test_hermes_people_autofill_preserves_existing_complete_people_row(monkeypat
     )
 
 
+def test_hermes_autofill_scans_existing_usage_missing_people(monkeypatch):
+    class FakeFC:
+        def root_department_id(self):
+            return "root"
+
+        def user_by_email(self, email, root):
+            assert root == "root"
+            data = {
+                "old@example.com": ("历史用户", "Keep/CFO 线/法务部"),
+                "fresh@example.com": ("新用户", "Keep/客户服务中心/客服运营部"),
+            }
+            if email not in data:
+                return None
+            name, dept = data[email]
+            return {"full_name": name, "avatar": "https://avatar.example/%s.png" % name, "department_path": dept}
+
+    fake_mod = types.ModuleType("feilian_client")
+    fake_mod.FeilianClient = lambda: FakeFC()
+    monkeypatch.setitem(sys.modules, "feilian_client", fake_mod)
+    monkeypatch.setattr(dev_collector, "_fc", None)
+
+    conn = _conn()
+    dev_collector._upsert_hermes_usage(
+        conn,
+        "hermes",
+        "Hermes",
+        "2026-06-11",
+        [{"email": "old@example.com", "model": "m", "input_tokens": 10, "output_tokens": 1}],
+    )
+
+    filled = dev_collector._autofill_people_for_hermes_usage(
+        conn,
+        "hermes",
+        "Hermes",
+        [{"email": "fresh@example.com", "model": "m", "input_tokens": 7, "output_tokens": 8}],
+    )
+
+    assert filled == 2
+    assert conn.execute("SELECT name,dept FROM people WHERE email='old@example.com'").fetchone() == (
+        "历史用户",
+        "Keep/CFO 线/法务部",
+    )
+    assert conn.execute("SELECT name,dept FROM people WHERE email='fresh@example.com'").fetchone() == (
+        "新用户",
+        "Keep/客户服务中心/客服运营部",
+    )
+
+
 def test_usage_report_commits_usage_before_people_autofill(monkeypatch, tmp_path):
     db_path = tmp_path / "tok.db"
     monkeypatch.setattr(dev_collector, "DB", str(db_path))
     monkeypatch.setattr(dev_collector, "TOKENS", {"devtoken"})
     observed = []
 
-    def observe_committed_usage(_conn, _records):
+    def observe_committed_usage(_conn, _source, _client, _records):
         with sqlite3.connect(str(db_path)) as probe:
             observed.append(
                 probe.execute(
@@ -251,7 +299,7 @@ def test_usage_report_commits_usage_before_people_autofill(monkeypatch, tmp_path
             )
         return 0
 
-    monkeypatch.setattr(dev_collector, "_autofill_people_for_hermes_records", observe_committed_usage)
+    monkeypatch.setattr(dev_collector, "_autofill_people_for_hermes_usage", observe_committed_usage)
     server = dev_collector.ThreadingHTTPServer(("127.0.0.1", 0), dev_collector.H)
     thread = threading.Thread(target=server.serve_forever)
     thread.daemon = True

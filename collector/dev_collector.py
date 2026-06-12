@@ -178,6 +178,33 @@ def _autofill_people_for_hermes_records(conn, records):
     return _autofill_people_for_emails(conn, emails)
 
 
+def _autofill_people_for_hermes_usage(conn, source, client, records):
+    emails = []
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        email = rec.get("email")
+        model = rec.get("model")
+        if not isinstance(email, str) or not email.strip() or not isinstance(model, str) or not model.strip():
+            continue
+        total = num(rec, "total_tokens", "total")
+        if total <= 0:
+            total = num(rec, "input_tokens", "input") + num(rec, "output_tokens", "output")
+        if total > 0:
+            emails.append(email)
+    rows = conn.execute(
+        """
+        SELECT DISTINCT u.email
+        FROM usage u LEFT JOIN people p ON p.email = u.email
+        WHERE u.source = ? AND u.client = ? AND u.period_type = 'lifetime' AND u.total > 0
+          AND (p.email IS NULL OR COALESCE(p.name,'') = '' OR COALESCE(p.dept,'') = '' OR p.dept = 'unknown')
+        """,
+        (source, client),
+    ).fetchall()
+    emails.extend(r[0] for r in rows)
+    return _autofill_people_for_emails(conn, emails)
+
+
 # ---------------------------------------------------------------------------
 # 数据库
 # ---------------------------------------------------------------------------
@@ -920,7 +947,7 @@ class H(BaseHTTPRequestHandler):
         fill_conn = None
         try:
             fill_conn = db()
-            people_filled = _autofill_people_for_hermes_records(fill_conn, records)
+            people_filled = _autofill_people_for_hermes_usage(fill_conn, source, client, records)
             fill_conn.commit()
         except Exception:
             people_filled = 0
