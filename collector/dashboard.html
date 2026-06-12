@@ -232,6 +232,10 @@
         <button data-m="total" class="on">总量</button>
         <button data-m="daily">日均</button>
       </div>
+      <div class="seg-ctl" id="sortCtl" title="Token 榜讲谁用得狠,消费榜讲公司为谁花得多" style="display:none">
+        <button data-s="token" class="on">按 Token</button>
+        <button data-s="cost">按消费</button>
+      </div>
     </div>
     <div class="card" id="list"><div class="empty">加载中…</div></div>
 
@@ -240,7 +244,7 @@
 
 <script>
 var CACHE={}, CUR="person", RANGE_FROM="", RANGE_TO="", META_DONE=false;
-var METRIC="total", SHOW_DEPARTED=false, META_MIN="", META_MAX="";
+var METRIC="total", SORT="token", SHOW_DEPARTED=false, META_MIN="", META_MAX="";
 // 部门榜(树)展开状态:记住展开了哪些完整 dept 路径。null=尚未初始化(首次按 depth<=1 展开)。
 var TEAM_EXPANDED=null;
 // 计算用于"日均"的天数:优先用选中的时间范围,否则用 /v1/meta 的 min/max。天数<1 兜底 1。
@@ -256,6 +260,7 @@ function rangeDays(){
 function metricTok(n){n=n||0; return Math.round(METRIC==='daily' ? n/rangeDays() : n);}
 // 成本$口径:与 token 一致 —— 总量直接返回,日均除以天数。调用方仍按各自的 Math.round 显示。
 function metricCost(n){n=n||0; return METRIC==='daily' ? n/rangeDays() : n;}
+function syncSortCtl(){var e=$('sortCtl'); if(e)e.style.display=(CUR==='person')?'inline-flex':'none';}
 function compact(n){n=n||0; if(n>=1e8)return (n/1e8).toFixed(n>=1e9?1:2)+' 亿'; if(n>=1e4)return (n/1e4).toFixed(1)+' 万'; return (n).toLocaleString('en-US');}
 function grp(n){return (n||0).toLocaleString('en-US');}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
@@ -504,15 +509,19 @@ function renderTeamTree(){
   });
 }
 function render(){
+  syncSortCtl();
   if(CUR==='governance'){renderGovernance();return;}
   if(CUR==='feishu'){renderFeishu();return;}    // 飞书 AI 权益=额度盘+个人榜,单位「点」,独立渲染
   if(CUR==='team'){renderTeamTree();return;}   // 部门榜=可下钻树,独立渲染,不走通用行逻辑
   var rows=CACHE[CUR]||[];
+  var isPersonCost=(CUR==='person' && SORT==='cost');
+  if(isPersonCost) rows=(CACHE.person||[]).slice().sort(function(a,b){return (b.cost||0)-(a.cost||0);});
   if(!rows.length){$('list').innerHTML='<div class="empty">暂无数据 — 等采集端上报后自动出现</div>';return;}
   var isCur=(CUR==='cursor');
   var isTeam=(CUR==='team');
   // 部门榜主指标=人均(tokens/使用人数);其余榜=总 token。再叠加 日均(除天数)。
   var mv=function(x){
+    if(isPersonCost) return metricCost(x.cost||0);
     var base = isTeam ? ((x.tokens||0)/((x.people||0)||1)) : (x.tokens||0);
     return metricTok(base);
   };
@@ -554,12 +563,18 @@ function render(){
     var pct=Math.max(2,mv(x)/max*100), share=tot?(mv(x)/tot*100):0;
     var big, small, fillHTML;
     if(CUR==='person' && x.composition && x.composition.length){
-      // 分色堆叠条表达构成(颜色见顶部图例);右侧只留主力工具一行,不堆长文字
-      var segs=x.composition.map(function(s){return '<span class="seg" style="width:'+s.pct+'%;background:'+toolColor(s.client)+'" title="'+s.client+' '+s.pct+'%"></span>';}).join('');
-      fillHTML='<div class="fill stacked" style="width:'+pct+'%">'+segs+'</div>';
-      big=compact(mv(x));                              // 日均模式自动除天数
       var top=x.composition[0];
-      small='主力 '+shortTool(top.client)+' '+top.pct+'% · $'+grp(Math.round(metricCost(x.cost||0)));
+      if(isPersonCost){
+        fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
+        big='$'+grp(Math.round(mv(x)));
+        small='总 '+compact(metricTok(x.tokens||0))+' · 主力 '+shortTool(top.client)+' '+top.pct+'% · '+share.toFixed(1)+'%';
+      } else {
+        // 分色堆叠条表达构成(颜色见顶部图例);右侧只留主力工具一行,不堆长文字
+        var segs=x.composition.map(function(s){return '<span class="seg" style="width:'+s.pct+'%;background:'+toolColor(s.client)+'" title="'+s.client+' '+s.pct+'%"></span>';}).join('');
+        fillHTML='<div class="fill stacked" style="width:'+pct+'%">'+segs+'</div>';
+        big=compact(mv(x));                              // 日均模式自动除天数
+        small='主力 '+shortTool(top.client)+' '+top.pct+'% · $'+grp(Math.round(metricCost(x.cost||0)));
+      }
     } else if(isCur){
       fillHTML='<div class="fill" style="width:'+pct+'%;background:'+toolColor("Cursor")+'"></div>';
       big=compact(mv(x)); small='$'+grp(Math.round(x.cost||0))+' · '+grp(x.requests||0)+' 次 · '+share.toFixed(1)+'%';
@@ -572,6 +587,10 @@ function render(){
       fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
       big=compact(mv(x))+'/人';
       small='总 '+compact(metricTok(x.tokens||0))+' · $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%';
+    } else if(isPersonCost){
+      fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
+      big='$'+grp(Math.round(mv(x)));
+      small='总 '+compact(metricTok(x.tokens||0))+' · '+share.toFixed(1)+'%';
     } else {
       fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
       big=compact(mv(x)); small='$'+grp(Math.round(CUR==='person'?metricCost(x.cost||0):(x.cost||0)))+(x.messages?(' · '+grp(x.messages)+' 条'):'')+' · '+share.toFixed(1)+'%';
@@ -593,13 +612,17 @@ function render(){
 }
 document.querySelectorAll('.tab').forEach(function(b){
   b.onclick=function(){document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('on')});
-    b.classList.add('on');CUR=b.dataset.t;render();};
+    b.classList.add('on');CUR=b.dataset.t;syncSortCtl();render();};
 });
 // 总量/日均 切换:在"全部"模式下两者数据不同(总量=lifetime 累计,日均=day 桶区间和),
 // 必须重新 load();统一都 load() 简单且无回归(选了范围时数据相同,load 仅多一次同样请求)。
 document.querySelectorAll('#metricCtl button').forEach(function(b){
   b.onclick=function(){document.querySelectorAll('#metricCtl button').forEach(function(x){x.classList.remove('on')});
     b.classList.add('on');METRIC=b.dataset.m;load();};
+});
+document.querySelectorAll('#sortCtl button').forEach(function(b){
+  b.onclick=function(){document.querySelectorAll('#sortCtl button').forEach(function(x){x.classList.remove('on')});
+    b.classList.add('on');SORT=b.dataset.s;render();};
 });
 // 显示离职 开关:改变请求(带 show_departed=1)需重新 load
 $('depToggle').onclick=function(){
