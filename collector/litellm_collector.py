@@ -40,6 +40,7 @@ from __future__ import print_function
 import datetime
 import json
 import os
+import re
 import sqlite3
 import sys
 from collections import defaultdict
@@ -81,6 +82,7 @@ PROBE_ALIAS_PREFIXES = tuple(
 # 区别于 PROBE_ALIAS_PREFIXES(前缀匹配);精确匹配避免误伤(如 'ss' 不会连累 'ss-platform')。
 PROBE_ALIASES = set(
     a.strip() for a in os.environ.get("LITELLM_PROBE_ALIASES", "").split(",") if a.strip())
+APPROVAL_SUFFIX_RE = re.compile(r"-\d{6,}$")
 # 身份合并:把同一人的分身/外部邮箱归并到规范真人邮箱。与 cursor_sync 共享同一 helper(同表同逻辑)。
 # 惰性读 env,故 import 顺序无所谓。值含真实员工邮箱,只在生产 env 配置(LITELLM_EMAIL_MERGE_MAP)。
 from email_merge import merge_email  # noqa: E402  (同目录共享模块,运行目录在 sys.path)
@@ -375,6 +377,19 @@ def build_rows(results, key_map, users, agent_team_id, alias_by_id):
                     # 归属兜底②: 运营手工钉死的 alias→邮箱 覆盖表
                     if not email and alias in KEY_OWNER_OVERRIDES:
                         email = KEY_OWNER_OVERRIDES[alias]
+                    if not email:
+                        candidate = APPROVAL_SUFFIX_RE.sub("", alias)
+                        if candidate and candidate != alias:
+                            if candidate in KEY_OWNER_OVERRIDES:
+                                email = KEY_OWNER_OVERRIDES[candidate]
+                                pname = pname or users_by_email.get(email.lower(), {}).get("name") or ""
+                            else:
+                                local = candidate.lower()
+                                for user_email, user_rec in users_by_email.items():
+                                    if user_email.split("@", 1)[0].lower() == local:
+                                        email = user_email
+                                        pname = pname or user_rec.get("name") or ""
+                                        break
                     # 都没有 → 合成身份(裸 key/探针, 确无真人 owner)
                     if not email:
                         email = ("litellm-user:" + uid) if uid else ("litellm-key:" + alias)

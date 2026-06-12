@@ -142,6 +142,33 @@ def test_owner_override_map_pins_email(L):
     assert "ops@example.com" in _lifetime_emails(rows)
 
 
+def test_approval_suffix_alias_resolves_by_user_localpart(L):
+    users = {"u-zhang": {"email": "zhangyiqi@keep.com", "name": "张一淇"}}
+    rows, names, *_ = L.build_rows([_activity("zhangyiqi-202606030074")], {}, users, "", {})
+    assert "zhangyiqi@keep.com" in _lifetime_emails(rows)
+    assert dict(names)["zhangyiqi@keep.com"] == ("张一淇", False)
+
+
+def test_approval_suffix_alias_resolves_by_owner_override(L):
+    rows, *_ = L.build_rows([_activity("legacy-admin-202606030074")], {}, {}, "", {})
+    assert "ops@example.com" in _lifetime_emails(rows)
+
+
+def test_approval_suffix_alias_without_match_stays_synthetic(L):
+    rows, *_ = L.build_rows([_activity("unknown-admin-202606030074")], {}, {}, "", {})
+    assert "litellm-key:unknown-admin-202606030074" in _lifetime_emails(rows)
+
+
+def test_approval_suffix_requires_six_or_more_trailing_digits(L):
+    users = {"u-zhang": {"email": "zhangyiqi@keep.com", "name": "张一淇"}}
+    rows, *_ = L.build_rows([_activity("zhangyiqi-12345"),
+                             _activity("zhangyiqi-ticket-abc")], {}, users, "", {})
+    emails = _lifetime_emails(rows)
+    assert "litellm-key:zhangyiqi-12345" in emails
+    assert "litellm-key:zhangyiqi-ticket-abc" in emails
+    assert "zhangyiqi@keep.com" not in emails
+
+
 def test_real_aliased_key_without_owner_is_kept_not_dropped(L):
     # 有真实别名(非 token 前缀)但暂无 owner 的已删 key: 仍保留为合成身份, 不当噪音误删。
     rows, *_ = L.build_rows([_activity("zhang-coding")], {}, {}, "", {})

@@ -39,6 +39,15 @@ from urllib.parse import parse_qs, urlparse
 # 配置
 # ---------------------------------------------------------------------------
 DB = os.environ.get("DEV_DB", "/tmp/tok.db")
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+PACKAGE_CNY = _env_float("FEISHU_PACKAGE_CNY", 99000)
+PACKAGE_POINTS = _env_float("FEISHU_PACKAGE_POINTS", 2000000)
+CNY_PER_USD = _env_float("CNY_PER_USD", 7.15)
+FEISHU_USD_PER_POINT = (PACKAGE_CNY / PACKAGE_POINTS / CNY_PER_USD) if PACKAGE_POINTS and CNY_PER_USD else 0.0
 TOKENS = {t.strip() for t in os.environ.get("COLLECTOR_API_TOKENS", "devtoken").split(",") if t.strip()}
 PORT = int(os.environ.get("PORT", "8090"))
 
@@ -1311,12 +1320,17 @@ class H(BaseHTTPRequestHandler):
         ?show_departed=1 才纳入离职。"""
         # usage_date 区间(默认近 30 天),统一走 _feishu_range。
         rng, params = _feishu_range(qs)
+        billing = {"usd_per_point": FEISHU_USD_PER_POINT, "package_cny": PACKAGE_CNY,
+                   "package_points": PACKAGE_POINTS, "cny_per_usd": CNY_PER_USD,
+                   "package_usd": (PACKAGE_CNY / CNY_PER_USD) if CNY_PER_USD else 0.0}
 
         span = conn.execute("SELECT min(usage_date), max(usage_date) FROM feishu_member"
                             " WHERE 1=1%s" % rng, params).fetchone()
         if not span or not span[0]:
-            return self._send(200, {"period_start": None, "period_end": None, "quota": [],
-                                    "members": [], "dept": [], "trend": []})
+            payload = {"period_start": None, "period_end": None, "quota": [],
+                       "members": [], "dept": [], "trend": []}
+            payload.update(billing)
+            return self._send(200, payload)
         ps, pe = span[0], span[1]
         sd = _show_departed(qs)
         dep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
@@ -1343,8 +1357,10 @@ class H(BaseHTTPRequestHandler):
                  for r in conn.execute(
                      "SELECT usage_date,biz_type,credits,user_count FROM feishu_trend"
                      " ORDER BY usage_date").fetchall()]
-        self._send(200, {"period_start": ps, "period_end": pe,
-                         "quota": quota, "members": members, "dept": dept, "trend": trend})
+        payload = {"period_start": ps, "period_end": pe,
+                   "quota": quota, "members": members, "dept": dept, "trend": trend}
+        payload.update(billing)
+        self._send(200, payload)
 
     def _leaderboard(self, conn, qs):
         """按人聚合(区间 ?days=N 或全部),join people 取中文姓名+头像+完整部门路径。
@@ -1446,6 +1462,9 @@ class H(BaseHTTPRequestHandler):
                     by_email[fem] = row
                 row["tokens"] = (row["tokens"] or 0) + credits
                 row["feishu_credits"] = credits   # 单列飞书点数,前端可标注「含飞书 X 点」
+                fc = round(credits * FEISHU_USD_PER_POINT, 4)
+                row["feishu_cost"] = fc
+                row["cost"] = round(float(row["cost"] or 0) + credits * FEISHU_USD_PER_POINT, 4)
                 row["composition"].append({"client": "飞书AI权益", "tokens": credits})
 
             usage_window_start = {}

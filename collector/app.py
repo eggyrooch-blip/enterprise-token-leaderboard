@@ -269,6 +269,7 @@ def _aggregate_rows_to_email(
             best_dept_tokens[email] = total_tokens
     for email, person in by_email.items():
         person["gateway_cost"] = round(float(person["gateway_cost"] or 0.0), 4)
+        # Feishu billing is dev_collector-only; app.py has no feishu_member table.
         person["cost_usd"] = round(float(person["gateway_cost"] or 0.0) + fee_by_email.get(email, 0.0) * fee_fraction, 4)
     return list(by_email.values())
 

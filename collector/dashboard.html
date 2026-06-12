@@ -226,8 +226,8 @@
       <button class="tab" data-t="litellm"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/></svg>LiteLLM 榜</button>
       <button class="tab" data-t="hermes"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4Z"/></svg>Hermes 榜</button>
       <button class="tab" data-t="agent"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>Agent 榜</button>
-      <button class="tab" data-t="governance"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>大厂治理指标</button>
       <button class="tab" data-t="feishu"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 5.4L20 8l-4 4 1 6-5-2.8L7 18l1-6-4-4 5.6-.6L12 2Z"/></svg>飞书 AI 权益</button>
+      <button class="tab" data-t="governance"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>大厂治理指标</button>
       <div class="seg-ctl" id="metricCtl" title="榜单按总量,或除以天数(日均)显示;日均模式下 token 全榜折算,成本$仅个人榜折算(其余榜成本始终总量)">
         <button data-m="total" class="on">总量</button>
         <button data-m="daily">日均</button>
@@ -395,6 +395,9 @@ function renderFeishu(){
   var d=CACHE.feishu||{}; var q=d.quota||[], ppl=d.members||[];
   if(!ppl.length && !q.length){$('list').innerHTML='<div class="empty">暂无飞书 AI 权益数据 — 等采集端上报后自动出现</div>';return;}
   var FNAME={AI_credits:'AI 通用额度', aily_credits:'飞书 aily 额度'};
+  // 点数→美元单价(后端 /v1/feishu 下发,前端不写死),用于个人榜公司实付与额度盘套餐美元价。
+  var usdPerPoint=+d.usd_per_point||0;
+  function usd(points){return '$'+(points*usdPerPoint).toFixed(2);}
   var quotaHTML=q.map(function(x){
     var used=x.used||0, quota=x.quota||0;
     var usedPct=quota?Math.min(100,used/quota*100):0, remPct=quota?(100-usedPct):0;
@@ -412,12 +415,26 @@ function renderFeishu(){
       : '<span class="av fb">'+fb+'</span>';
     var pct=Math.max(2,(x.credits||0)/max*100);
     var small=(x.aily_credits?('aily '+compact(x.aily_credits)+' · '):'')+'AI '+compact(x.ai_credits||0);
+    var dollar=usdPerPoint?(' · ≈'+usd(x.credits||0)):'';
     return '<div class="r"><span class="rk num '+(i===0?'first':'')+'">'+(i+1)+'</span>'+av+
       '<div class="nm">'+name+'<div class="sub">'+stripKeep(x.dept||'')+'</div></div>'+
       '<div class="track"><div class="fill" style="width:'+pct+'%"></div></div>'+
-      '<div class="val"><div class="t num">'+compact(x.credits||0)+' 点</div><div class="s num">'+small+'</div></div></div>';
+      '<div class="val"><div class="t num">'+compact(x.credits||0)+' 点'+dollar+'</div><div class="s num">'+small+'</div></div></div>';
   }).join('');
-  $('list').innerHTML='<div class="fs-unit">单位：点（飞书 AI 权益消耗，与上方 token 为不同口径，不加总）</div>'+
+  // 额度盘套餐美元价(全包):优先用后端下发的 package_usd,缺失则按 points×单价兜底。
+  var pkgUsd=(+d.package_usd)||0;
+  var pkgPoints=(+d.package_points)||0;
+  var pkgUsdTxt=usdPerPoint?('<div class="fs-q-pkg">套餐总价 ≈$'+(pkgUsd||pkgPoints*usdPerPoint).toLocaleString(undefined,{maximumFractionDigits:0})+'</div>'):'';
+  // 口径说明:点数→千点美元单价 + 汇率(均可配,后端下发);点数成本计入个人榜公司实付。
+  var cny=(+d.package_cny)||0, cnyPerUsd=(+d.cny_per_usd)||0;
+  var per1k=(usdPerPoint*1000).toFixed(2);
+  var cnyTxt=cny?('¥'+cny.toLocaleString(undefined,{maximumFractionDigits:0})):'¥99,000';
+  var ptsTxt=pkgPoints?(pkgPoints/10000).toLocaleString(undefined,{maximumFractionDigits:0})+'万点':'200万点';
+  var fxTxt=cnyPerUsd?cnyPerUsd.toString():'7.15';
+  var caption=usdPerPoint
+    ? ('计费:'+cnyTxt+'/'+ptsTxt+' ≈ $'+per1k+'/千点(汇率 '+fxTxt+',可配);点数成本计入个人榜公司实付（点数仍按 1点=1token 并入 token 总量）')
+    : '单位：点（飞书 AI 权益消耗，与上方 token 为不同口径，不加总）';
+  $('list').innerHTML='<div class="fs-unit">'+caption+'</div>'+pkgUsdTxt+
     '<div class="fs-quota">'+quotaHTML+'</div>'+
     '<div class="fs-sec-t">个人消耗榜<span class="fs-per">'+(d.period_start||'—')+' ~ '+(d.period_end||'—')+'</span></div>'+body;
 }
