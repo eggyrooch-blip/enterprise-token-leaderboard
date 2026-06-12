@@ -7,6 +7,7 @@
      点数永不与 token 加总, aily 取最新一个周期快照。
 这些断言在改动前会失败(旧 _teams 无 credits/per_capita_credits, 外包堆在合作商节点)。
 """
+import datetime
 import importlib
 import pathlib
 import sqlite3
@@ -42,13 +43,14 @@ def test_normalize_is_idempotent_for_non_outsource(dc):
 
 
 def _schema(conn):
+    # feishu_member 按天 schema(usage_date 替代 period_start/period_end,孙可 2026-06-12)。
     conn.executescript(
         """
         CREATE TABLE usage(email TEXT, dept TEXT, period_type TEXT, period TEXT,
             source TEXT, client TEXT, total INTEGER, cost REAL, messages INTEGER);
         CREATE TABLE people(email TEXT PRIMARY KEY, name TEXT, avatar TEXT, dept TEXT);
         CREATE TABLE feishu_member(email TEXT, name TEXT, dept TEXT, feature_key TEXT,
-            credits REAL, period_start TEXT, period_end TEXT, avatar TEXT);
+            credits REAL, usage_date TEXT, avatar TEXT, entity_id TEXT);
         CREATE TABLE departed(email TEXT PRIMARY KEY);
         """
     )
@@ -63,13 +65,17 @@ def _person(conn, email, dept):
     conn.execute("INSERT OR REPLACE INTO people VALUES(?,?,?,?)", (email, email.split("@")[0], "", dept))
 
 
-def _aily(conn, email, dept, credits, period="2026-06-01", feature="aily_credits"):
+# 部门榜:token 侧空 qs=lifetime;feishu 侧空 qs=近30天 → 默认 aily 日期用「今天」落在窗口内。
+_RECENT = datetime.date.today().isoformat()
+
+
+def _aily(conn, email, dept, credits, day=None, feature="aily_credits"):
     conn.execute("INSERT INTO feishu_member VALUES(?,?,?,?,?,?,?,?)",
-                 (email, email.split("@")[0], dept, feature, credits, period, "2026-06-07", ""))
+                 (email, email.split("@")[0], dept, feature, credits, day or _RECENT, "", ""))
 
 
-def _teams(dc, conn, monkeypatch, headcount=None):
-    """直接调用 H._teams，捕获 payload。headcount 注入避免触网。"""
+def _teams(dc, conn, monkeypatch, headcount=None, qs=None):
+    """直接调用 H._teams，捕获 payload。headcount 注入避免触网。qs 默认空(token=lifetime)。"""
     monkeypatch.setattr(dc, "_dept_headcount_map", lambda: dict(headcount or {}))
     captured = {}
 
@@ -78,7 +84,7 @@ def _teams(dc, conn, monkeypatch, headcount=None):
             captured["code"] = code
             captured["obj"] = obj
 
-    dc.H._teams(Fake(), conn, {})
+    dc.H._teams(Fake(), conn, {} if qs is None else qs)
     return {t["dept"]: t for t in captured["obj"]["teams"]}
 
 
@@ -171,13 +177,30 @@ def test_credits_count_all_feishu_features_not_only_aily(dc, monkeypatch):
     assert grp["aily_people"] == 1
 
 
-def test_aily_uses_latest_period_snapshot_only(dc, monkeypatch):
+def test_aily_sums_all_days_in_range(dc, monkeypatch):
+    """改按天后:部门榜 aily 在所选区间内按天累加(不再是「只取最新周期快照」死数据)。
+    孙可 2026-06-12:月累计快照污染部门榜,改成跟随区间逐日求和。"""
     conn = sqlite3.connect(":memory:")
     _schema(conn)
-    _aily(conn, "x@keep.com", "Keep/B/组", 999, period="2026-05-01")   # 旧周期
-    _aily(conn, "x@keep.com", "Keep/B/组", 1200, period="2026-06-01")  # 最新周期
+    _aily(conn, "x@keep.com", "Keep/B/组", 999, day="2026-06-05")
+    _aily(conn, "x@keep.com", "Keep/B/组", 1200, day="2026-06-06")
     _person(conn, "x@keep.com", "Keep/B/组")
     conn.commit()
-    teams = _teams(dc, conn, monkeypatch, {})
+    teams = _teams(dc, conn, monkeypatch, headcount={},
+                   qs={"from": ["2026-06-01"], "to": ["2026-06-30"]})   # 区间含两天
 
-    assert teams["Keep/B/组"]["credits"] == 1200.0  # 只取最新周期, 不累加旧周期
+    assert teams["Keep/B/组"]["credits"] == 2199.0  # 区间内两天累加 999+1200
+
+
+def test_aily_respects_selected_range(dc, monkeypatch):
+    """区间过滤:落在所选 from/to 之外的天不计入部门榜(证明不再是死的全量快照)。"""
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    _aily(conn, "x@keep.com", "Keep/B/组", 999, day="2026-05-01")    # 区间外
+    _aily(conn, "x@keep.com", "Keep/B/组", 1200, day="2026-06-06")   # 区间内
+    _person(conn, "x@keep.com", "Keep/B/组")
+    conn.commit()
+    teams = _teams(dc, conn, monkeypatch, headcount={},
+                   qs={"from": ["2026-06-01"], "to": ["2026-06-30"]})
+
+    assert teams["Keep/B/组"]["credits"] == 1200.0  # 只算 6 月那天,5-01 被区间排除

@@ -7,6 +7,7 @@
   3. 外部供应商(合作商-W / 带 (SP码) / 裸公司名)平铺 → _normalize_dept_path 收口到 Keep/外部合作商/<公司>。
 改动前这些断言会失败。
 """
+import datetime
 import importlib
 import pathlib
 import sqlite3
@@ -56,10 +57,15 @@ def _schema(conn):
             source TEXT, client TEXT, total INTEGER, cost REAL, messages INTEGER);
         CREATE TABLE people(email TEXT PRIMARY KEY, name TEXT, avatar TEXT, dept TEXT);
         CREATE TABLE feishu_member(email TEXT, name TEXT, dept TEXT, feature_key TEXT,
-            credits REAL, period_start TEXT, period_end TEXT, avatar TEXT);
+            credits REAL, usage_date TEXT, avatar TEXT, entity_id TEXT);
         CREATE TABLE departed(email TEXT PRIMARY KEY);
         """
     )
+
+
+# 部门榜:token 侧空 qs=lifetime(数 lifetime 行);feishu 侧空 qs=近30天 → aily 测试数据
+# 用「今天」日期保证落在窗口内、与运行日期解耦。
+_RECENT = datetime.date.today().isoformat()
 
 
 def _teams(dc, conn, monkeypatch, headcount=None):
@@ -102,7 +108,7 @@ def test_unresolved_aily_user_dropped_not_uncategorized(dc, monkeypatch):
     conn = sqlite3.connect(":memory:")
     _schema(conn)
     conn.execute("INSERT INTO feishu_member VALUES('luorui@keep.com','罗锐','品质组',"
-                 "'aily_credits',300,'2026-06-01','2026-06-07','')")
+                 "'aily_credits',300,?,'','')", (_RECENT,))
     conn.commit()  # 裸非 SP 组名、无 people 行 → 解析失败
     teams = _teams(dc, conn, monkeypatch, {})
     assert all("未归类" not in d for d in teams)
@@ -126,7 +132,7 @@ def test_resolved_users_not_dropped(dc, monkeypatch):
     _schema(conn)
     conn.execute("INSERT INTO usage VALUES('a@keep.com','Keep/CFO 线/法务部','lifetime','all','subscription','Claude Code',900,1,5)")
     conn.execute("INSERT OR REPLACE INTO people VALUES('a@keep.com','a','','Keep/CFO 线/法务部')")
-    conn.execute("INSERT INTO feishu_member VALUES('wb@keep.com','文洁','四川乔木禾电子商务有限公司(SP000442)','aily_credits',80,'2026-06-01','2026-06-07','')")
+    conn.execute("INSERT INTO feishu_member VALUES('wb@keep.com','文洁','四川乔木禾电子商务有限公司(SP000442)','aily_credits',80,?,'','')", (_RECENT,))
     conn.commit()
     teams = _teams(dc, conn, monkeypatch, {})
     assert "Keep/CFO 线/法务部" in teams
@@ -140,7 +146,7 @@ def test_bare_sp_aily_user_routes_to_external_not_uncategorized(dc, monkeypatch)
     conn = sqlite3.connect(":memory:")
     _schema(conn)
     conn.execute("INSERT INTO feishu_member VALUES('wb-x@keep.com','文洁',"
-                 "'四川乔木禾电子商务有限公司(SP000442)','aily_credits',80,'2026-06-01','2026-06-07','')")
+                 "'四川乔木禾电子商务有限公司(SP000442)','aily_credits',80,?,'','')", (_RECENT,))
     conn.commit()  # 注意:无 people 行(纯 aily 外包)
     teams = _teams(dc, conn, monkeypatch, {})
 

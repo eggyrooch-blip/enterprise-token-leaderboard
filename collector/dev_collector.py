@@ -1323,26 +1323,42 @@ class H(BaseHTTPRequestHandler):
                 n["messages"] += p["msg"]
                 n["token_users"].add(email)
 
-        # aily(飞书 AI 权益)并入部门榜:取最新一个周期快照(与 token 的 7/30 天筛选解耦)。
-        # 单位「点」credits,不与 token 加总;aily 的人并进活跃集 → 活跃渗透取并集。
-        period = (conn.execute("SELECT max(period_start) FROM feishu_member").fetchone()
-                  or [None])[0]
-        if period:
-            fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
-            aily_rows = conn.execute(
-                "SELECT email, MAX(dept), SUM(credits) FROM feishu_member"
-                " WHERE period_start=?%s GROUP BY email HAVING SUM(credits)>0" % fdep,
-                (period,)).fetchall()
-            for email, fdept, credits in aily_rows:
-                # people.dept 优先,否则用 feishu_member.dept;统一过 _to_keep —— 裸供应商(SP码)
-                # 也收口到外部合作商,不再因「不以 Keep 开头」误落未归类(codex 评审发现)。
-                cd = _to_keep(pdept.get(email)) or _to_keep(fdept)
-                if not cd:
-                    continue   # 飞连查不到真实部门(离职/飞连外纯飞书用户)→ 跳过,不进未归类(孙可 2026-06-11)
-                for anc in _ancestors(cd):
-                    n = _node(anc)
-                    n["credits"] += credits or 0
-                    n["aily_users"].add(email)
+        # aily(飞书 AI 权益)并入部门榜:按天聚合,跟随所选区间(与 token 同窗口,默认近30天),
+        # 不再取「最新月快照」死数据(孙可 2026-06-12:月累计污染部门榜)。单位「点」credits,
+        # 不与 token 加总;aily 的人并进活跃集 → 活跃渗透取并集。
+        frm = (qs.get("from") or [None])[0]
+        to = (qs.get("to") or [None])[0]
+        rawd = (qs.get("days") or [None])[0]
+        fconds, fparams = [], []
+        if frm or to:
+            if frm:
+                fconds.append("usage_date >= ?"); fparams.append(frm)
+            if to:
+                fconds.append("usage_date <= ?"); fparams.append(to)
+        else:
+            try:
+                fdays = int(rawd) if rawd not in (None, "", "all") else 30
+            except (TypeError, ValueError):
+                fdays = 30
+            if fdays and fdays > 0:
+                fcut = (datetime.date.today() - datetime.timedelta(days=fdays - 1)).isoformat()
+                fconds.append("usage_date >= ?"); fparams.append(fcut)
+        frng = (" AND " + " AND ".join(fconds)) if fconds else ""
+        fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
+        aily_rows = conn.execute(
+            "SELECT email, MAX(dept), SUM(credits) FROM feishu_member"
+            " WHERE 1=1%s%s GROUP BY email HAVING SUM(credits)>0" % (frng, fdep),
+            fparams).fetchall()
+        for email, fdept, credits in aily_rows:
+            # people.dept 优先,否则用 feishu_member.dept;统一过 _to_keep —— 裸供应商(SP码)
+            # 也收口到外部合作商,不再因「不以 Keep 开头」误落未归类(codex 评审发现)。
+            cd = _to_keep(pdept.get(email)) or _to_keep(fdept)
+            if not cd:
+                continue   # 飞连查不到真实部门(离职/飞连外纯飞书用户)→ 跳过,不进未归类(孙可 2026-06-11)
+            for anc in _ancestors(cd):
+                n = _node(anc)
+                n["credits"] += credits or 0
+                n["aily_users"].add(email)
 
         result = []
         for path, n in nodes.items():
