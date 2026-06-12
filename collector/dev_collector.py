@@ -44,10 +44,6 @@ def _env_float(name, default):
         return float(os.environ.get(name, default))
     except (TypeError, ValueError):
         return float(default)
-PACKAGE_CNY = _env_float("FEISHU_PACKAGE_CNY", 99000)
-PACKAGE_POINTS = _env_float("FEISHU_PACKAGE_POINTS", 2000000)
-CNY_PER_USD = _env_float("CNY_PER_USD", 7.15)
-FEISHU_USD_PER_POINT = (PACKAGE_CNY / PACKAGE_POINTS / CNY_PER_USD) if PACKAGE_POINTS and CNY_PER_USD else 0.0
 TOKENS = {t.strip() for t in os.environ.get("COLLECTOR_API_TOKENS", "devtoken").split(",") if t.strip()}
 PORT = int(os.environ.get("PORT", "8090"))
 
@@ -61,6 +57,12 @@ for _ENV in (os.path.join(_d, "..", "pipeline", ".env"), os.path.join(_d, ".env"
             if _l and not _l.startswith("#") and "=" in _l:
                 _k, _v = _l.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
+
+# 飞书 AI 权益计费常量 —— 必须在 .env 加载之后取值,否则 .env 里的覆盖不生效。
+PACKAGE_CNY = _env_float("FEISHU_PACKAGE_CNY", 99000)
+PACKAGE_POINTS = _env_float("FEISHU_PACKAGE_POINTS", 2000000)
+CNY_PER_USD = _env_float("CNY_PER_USD", 7.15)
+FEISHU_USD_PER_POINT = (PACKAGE_CNY / PACKAGE_POINTS / CNY_PER_USD) if PACKAGE_POINTS and CNY_PER_USD else 0.0
 
 _fc = None
 _serial_cache = {}  # type: dict

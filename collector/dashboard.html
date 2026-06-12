@@ -431,8 +431,9 @@ function renderFeishu(){
   var cnyTxt=cny?('¥'+cny.toLocaleString(undefined,{maximumFractionDigits:0})):'¥99,000';
   var ptsTxt=pkgPoints?(pkgPoints/10000).toLocaleString(undefined,{maximumFractionDigits:0})+'万点':'200万点';
   var fxTxt=cnyPerUsd?cnyPerUsd.toString():'7.15';
+  var cnyPerPt=(pkgPoints&&cny)?(cny/pkgPoints).toFixed(4):'0.0495';
   var caption=usdPerPoint
-    ? ('计费:'+cnyTxt+'/'+ptsTxt+' ≈ $'+per1k+'/千点(汇率 '+fxTxt+',可配);点数成本计入个人榜公司实付（点数仍按 1点=1token 并入 token 总量）')
+    ? ('计费:'+cnyTxt+'/'+ptsTxt+' = ¥'+cnyPerPt+'/点 ≈ $'+per1k+'/千点(汇率 '+fxTxt+',可配);点数成本计入个人榜公司实付（点数仍按 1点=1token 并入 token 总量）')
     : '单位：点（飞书 AI 权益消耗，与上方 token 为不同口径，不加总）';
   $('list').innerHTML='<div class="fs-unit">'+caption+'</div>'+pkgUsdTxt+
     '<div class="fs-quota">'+quotaHTML+'</div>'+
