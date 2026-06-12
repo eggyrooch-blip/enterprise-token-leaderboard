@@ -301,6 +301,8 @@ def _full_conn():
         CREATE TABLE people(email TEXT PRIMARY KEY, name TEXT, avatar TEXT, dept TEXT);
         CREATE TABLE departed(email TEXT PRIMARY KEY);
         CREATE TABLE report_log(serial TEXT, email TEXT, via TEXT, reported_at TEXT);
+        CREATE TABLE feishu_member(email TEXT, name TEXT, dept TEXT, feature_key TEXT,
+            credits REAL, usage_date TEXT, avatar TEXT, entity_id TEXT);
     """)
     return conn
 
@@ -339,6 +341,64 @@ def test_personal_board_falls_back_to_usage_dept_when_no_people_path(dc):
     conn.commit()
     lb = _leaderboard(dc, conn)
     assert lb["Bob"]["dept"] == "某团队别名"
+
+
+def _insert_feishu(conn, email, dept, credits, day=None, feature="aily_credits"):
+    conn.execute("INSERT INTO feishu_member VALUES(?,?,?,?,?,?,?,?)",
+                 (email, email.split("@")[0], dept, feature, credits, day or _RECENT, "", ""))
+
+
+def test_feishu_credits_merge_into_personal_board(dc):
+    """飞书 AI 点数 1点=1token 并入个人榜总量,参与排序,并入工具构成(孙可 2026-06-12)。"""
+    conn = _full_conn()
+    _usage_row(conn, "coder@keep.com", "Keep/A/组", "subscription", "Claude Code", 1000)
+    _insert_feishu(conn, "coder@keep.com", "Keep/A/组", 300)
+    conn.commit()
+    r = _leaderboard(dc, conn)["coder"]
+    assert r["tokens"] == 1300                 # 1000 token + 300 点(1:1)
+    assert r["feishu_credits"] == 300
+    clients = {c["client"]: c["tokens"] for c in r["composition"]}
+    assert clients["飞书AI权益"] == 300 and clients["Claude Code"] == 1000
+
+
+def test_feishu_only_user_appears_in_personal_board(dc):
+    """纯飞书用户(无 token 用量)也进个人榜,tokens=credits。"""
+    conn = _full_conn()
+    _insert_feishu(conn, "ailyonly@keep.com", "Keep/B/组", 500)
+    conn.commit()
+    r = _leaderboard(dc, conn)["ailyonly"]
+    assert r["tokens"] == 500 and r["feishu_credits"] == 500
+    assert r["input"] == 0 and r["messages"] == 0
+
+
+def test_feishu_not_merged_in_client_filtered_board(dc):
+    """带 ?client= 的工具榜(Claude/Codex/...)不并入飞书点数。"""
+    conn = _full_conn()
+    _usage_row(conn, "coder@keep.com", "Keep/A/组", "subscription", "Claude Code", 1000)
+    _insert_feishu(conn, "coder@keep.com", "Keep/A/组", 300)
+    conn.commit()
+    cap = {}
+    class Fake:
+        def _send(self, code, obj): cap["obj"] = obj
+    dc.H._leaderboard(Fake(), conn, {"client": ["Claude Code"]})
+    r = {x["name"]: x for x in cap["obj"]["leaderboard"]}["coder"]
+    assert r["tokens"] == 1000 and "feishu_credits" not in r   # 工具榜不含飞书点数
+
+
+def test_feishu_credits_respect_range_in_personal_board(dc):
+    """区间过滤:范围外的飞书点数不计入个人榜。"""
+    conn = _full_conn()
+    _usage_row(conn, "coder@keep.com", "Keep/A/组", "subscription", "Claude Code", 1000)
+    _insert_feishu(conn, "coder@keep.com", "Keep/A/组", 300, day="2026-05-01")  # 区间外
+    _insert_feishu(conn, "coder@keep.com", "Keep/A/组", 70, day="2026-06-06")   # 区间内
+    conn.commit()
+    cap = {}
+    class Fake:
+        def _send(self, code, obj): cap["obj"] = obj
+    dc.H._leaderboard(Fake(), conn, {"from": ["2026-06-01"], "to": ["2026-06-30"]})
+    # 注:带 from/to 后 token 侧走 day 桶,这里 usage 是 lifetime → token 不计;只验飞书区间
+    r = {x["name"]: x for x in cap["obj"]["leaderboard"]}["coder"]
+    assert r["feishu_credits"] == 70           # 只算 6 月那笔,5-01 被排除
 
 
 def _cursor_board(dc, conn):

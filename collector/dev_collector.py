@@ -565,6 +565,31 @@ def _show_departed(qs):
     return str(raw).strip().lower() in ("1", "true", "yes")
 
 
+def _feishu_range(qs):
+    """飞书 feishu_member.usage_date 区间 → (sql_fragment, params)。语义同 _range_clause:
+    ?from=&to= 优先,否则 ?days=N,默认近 30 天。fragment 形如 ' AND usage_date >= ?',
+    可直接拼在 'WHERE 1=1' 之后。统一一处,防止 _feishu/_teams/_leaderboard 三处漂移
+    (2026-06-12 _teams 漏改 period_start 致全看板 500 的教训)。"""
+    frm = (qs.get("from") or [None])[0]
+    to = (qs.get("to") or [None])[0]
+    raw = (qs.get("days") or [None])[0]
+    conds, params = [], []
+    if frm or to:
+        if frm:
+            conds.append("usage_date >= ?"); params.append(frm)
+        if to:
+            conds.append("usage_date <= ?"); params.append(to)
+    else:
+        try:
+            days = int(raw) if raw not in (None, "", "all") else 30
+        except (TypeError, ValueError):
+            days = 30
+        if days and days > 0:
+            cutoff = (datetime.date.today() - datetime.timedelta(days=days - 1)).isoformat()
+            conds.append("usage_date >= ?"); params.append(cutoff)
+    return ((" AND " + " AND ".join(conds)) if conds else ""), params
+
+
 def _departed_set(conn):
     """departed 表里的全部 email → set(小写无关，按存入原样)。一次查询，按行判定用。"""
     try:
@@ -1076,25 +1101,8 @@ class H(BaseHTTPRequestHandler):
         """飞书 AI 权益(独立板块,单位=点)。按天聚合:额度盘 + 全员逐人榜 + 部门榜 + 趋势。
         区间同 token 榜:?from=&to= 或 ?days=N(usage_date 上过滤);默认近 30 天(=回填窗口)。
         ?show_departed=1 才纳入离职。"""
-        # usage_date 区间(默认近 30 天)。复用全局 from/to/days 语义,但落在 usage_date 列上。
-        frm = (qs.get("from") or [None])[0]
-        to = (qs.get("to") or [None])[0]
-        raw = (qs.get("days") or [None])[0]
-        conds, params = [], []
-        if frm or to:
-            if frm:
-                conds.append("usage_date >= ?"); params.append(frm)
-            if to:
-                conds.append("usage_date <= ?"); params.append(to)
-        else:
-            try:
-                days = int(raw) if raw not in (None, "", "all") else 30
-            except (TypeError, ValueError):
-                days = 30
-            if days and days > 0:
-                cutoff = (datetime.date.today() - datetime.timedelta(days=days - 1)).isoformat()
-                conds.append("usage_date >= ?"); params.append(cutoff)
-        rng = (" AND " + " AND ".join(conds)) if conds else ""
+        # usage_date 区间(默认近 30 天),统一走 _feishu_range。
+        rng, params = _feishu_range(qs)
 
         span = conn.execute("SELECT min(usage_date), max(usage_date) FROM feishu_member"
                             " WHERE 1=1%s" % rng, params).fetchone()
@@ -1166,25 +1174,63 @@ class H(BaseHTTPRequestHandler):
         """ % (where, dep_clause, cli_clause), params2).fetchall():
             comp.setdefault(cr[0], []).append({"client": cr[1], "tokens": cr[2] or 0})
         result = []
+        by_email = {}
         for r in rows:
-            total = r[7] or 0
-            parts = sorted(comp.get(r[0], []), key=lambda x: x["tokens"], reverse=True)
-            for x in parts:
-                x["pct"] = round(x["tokens"] / total * 100, 1) if total else 0
             # 部门优先用 people.dept(飞连自愈的全路径),裸的 MAX(u.dept) 只兜底 ——
             # 否则 LiteLLM 团队别名(裸"技术平台部")会被 MAX 误选盖掉飞连全路径(中文排在 'K' 之后)。
-            result.append({
+            row = {
                 "email": r[0], "dept": _to_keep(r[13]) or _normalize_dept_path(r[1]),
                 "input": r[2] or 0, "output": r[3] or 0,
                 "cache_read": r[4] or 0, "cache_write": r[5] or 0,
-                "reasoning": r[6] or 0, "tokens": total,
+                "reasoning": r[6] or 0, "tokens": r[7] or 0,
                 "cost": round(r[8] or 0, 4), "messages": r[9] or 0,
                 "name": r[10] or (r[0] or "").split("@")[0],
                 "avatar": r[11] or "",
                 "via": r[12] or "",   # 最近一次订阅制上报来源:manual=手工补报(看板打角标)
                 "departed": r[0] in departed,
-                "composition": parts,
-            })
+                "composition": list(comp.get(r[0], [])),   # pct 等飞书并入后统一算
+            }
+            result.append(row)
+            by_email[r[0]] = row
+
+        # 飞书 AI 权益并入个人榜:1 点 = 1 token,计入总量参与排序(孙可 2026-06-12)。
+        # 只在主个人榜并入;带 ?client 的工具榜(Claude/Codex/Cursor/LiteLLM/Hermes)不并。
+        # 纯飞书用户(无 token 用量)也建行进榜,排序靠后无妨(孙可:不用显出来)。
+        if not cli:
+            frng, fparams = _feishu_range(qs)
+            fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
+            for fr in conn.execute(
+                "SELECT email, MAX(name), MAX(dept), MAX(avatar), SUM(credits)"
+                " FROM feishu_member WHERE 1=1%s%s"
+                " GROUP BY email HAVING SUM(credits)>0" % (frng, fdep), fparams).fetchall():
+                fem, fname, fdept, favatar, credits = fr[0], fr[1], fr[2], fr[3], fr[4] or 0
+                if credits <= 0:
+                    continue
+                row = by_email.get(fem)
+                if row is None:
+                    pr = conn.execute("SELECT dept,name,avatar FROM people WHERE email=?",
+                                      (fem,)).fetchone()
+                    dept = (_to_keep(pr[0]) if pr and pr[0] else None) \
+                        or _to_keep(fdept) or _normalize_dept_path(fdept) or "unknown"
+                    row = {"email": fem, "dept": dept,
+                           "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+                           "reasoning": 0, "tokens": 0, "cost": 0, "messages": 0,
+                           "name": (pr[1] if pr and pr[1] else None) or fname or fem.split("@")[0],
+                           "avatar": (pr[2] if pr and pr[2] else None) or favatar or "",
+                           "via": "", "departed": fem in departed, "composition": []}
+                    result.append(row)
+                    by_email[fem] = row
+                row["tokens"] = (row["tokens"] or 0) + credits
+                row["feishu_credits"] = credits   # 单列飞书点数,前端可标注「含飞书 X 点」
+                row["composition"].append({"client": "飞书AI权益", "tokens": credits})
+
+        # 飞书并入后总量可能变 → 统一算 composition 占比 + 重排
+        for row in result:
+            tot = row["tokens"] or 0
+            for x in row["composition"]:
+                x["pct"] = round(x["tokens"] / tot * 100, 1) if tot else 0
+            row["composition"].sort(key=lambda x: x["tokens"], reverse=True)
+        result.sort(key=lambda x: x["tokens"] or 0, reverse=True)
         self._send(200, {"leaderboard": result})
 
     def _agent_leaderboard(self, conn, qs):
@@ -1326,24 +1372,7 @@ class H(BaseHTTPRequestHandler):
         # aily(飞书 AI 权益)并入部门榜:按天聚合,跟随所选区间(与 token 同窗口,默认近30天),
         # 不再取「最新月快照」死数据(孙可 2026-06-12:月累计污染部门榜)。单位「点」credits,
         # 不与 token 加总;aily 的人并进活跃集 → 活跃渗透取并集。
-        frm = (qs.get("from") or [None])[0]
-        to = (qs.get("to") or [None])[0]
-        rawd = (qs.get("days") or [None])[0]
-        fconds, fparams = [], []
-        if frm or to:
-            if frm:
-                fconds.append("usage_date >= ?"); fparams.append(frm)
-            if to:
-                fconds.append("usage_date <= ?"); fparams.append(to)
-        else:
-            try:
-                fdays = int(rawd) if rawd not in (None, "", "all") else 30
-            except (TypeError, ValueError):
-                fdays = 30
-            if fdays and fdays > 0:
-                fcut = (datetime.date.today() - datetime.timedelta(days=fdays - 1)).isoformat()
-                fconds.append("usage_date >= ?"); fparams.append(fcut)
-        frng = (" AND " + " AND ".join(fconds)) if fconds else ""
+        frng, fparams = _feishu_range(qs)
         fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
         aily_rows = conn.execute(
             "SELECT email, MAX(dept), SUM(credits) FROM feishu_member"
