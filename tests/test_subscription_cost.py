@@ -526,3 +526,33 @@ def test_hermes_board_infers_price_from_litellm_same_model(dc, monkeypatch, tmp_
     assert priced["cost"] == 7.5 and "cost_est" not in priced
     # 推断价不进个人榜公司实付
     assert _row_by_email(person_rows, "h-infer@keep.com")["cost"] == 0
+
+
+def test_hermes_gateway_priced_row_not_double_counted_and_mixed_model_infers(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "h-gw@keep.com", "HGw", "Keep/平台/基础")
+        _insert_people(conn, "h-mix@keep.com", "HMix", "Keep/平台/基础")
+        # 上游单价: glm-5.1 → 0.01/tok
+        _insert_usage_model(dc, conn, "ref@keep.com", "Keep/平台/基础", "2026-06-09",
+                            "litellm", "LiteLLM", "glm-5.1", 1000, 10.0, 1)
+        # 网关 source 的 Hermes 行: cost 已进主查询,不得重复累加 → 总额恰为 7.5
+        _insert_usage_model(dc, conn, "h-gw@keep.com", "Keep/平台/基础", "2026-06-10",
+                            "api", "Hermes", "claude-opus-4-6", 3000, 7.5, 1)
+        # 同人同模型混合: 带价行(hermes source, $7.5) + 零价行(2000 tok 应推断 $20)
+        _insert_usage_model(dc, conn, "h-mix@keep.com", "Keep/平台/基础", "2026-06-10",
+                            "hermes", "Hermes", "glm-5.1", 3000, 7.5, 1)
+        _insert_usage_model(dc, conn, "h-mix@keep.com", "Keep/平台/基础", "2026-06-11",
+                            "hermes", "Hermes", "glm-5.1", 2000, 0.0, 1)
+        conn.commit()
+
+        rows = _leaderboard(dc, conn, {"client": ["Hermes"], "days": ["30"]})
+    finally:
+        conn.close()
+
+    gw = _row_by_email(rows, "h-gw@keep.com")
+    assert gw["cost"] == 7.5, gw["cost"]
+    mix = _row_by_email(rows, "h-mix@keep.com")
+    assert mix["cost"] == 27.5 and mix.get("cost_est") is True, mix["cost"]

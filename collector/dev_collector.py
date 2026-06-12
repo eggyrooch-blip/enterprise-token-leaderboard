@@ -1466,18 +1466,23 @@ class H(BaseHTTPRequestHandler):
                     rate_exact[m or ""] = co / t
                     rate_stripped.setdefault((m or "").split("/")[-1].lower(), co / t)
             rep_by_email, est_by_email = {}, {}
-            for em, m, co, t in conn.execute("""
-                SELECT u.email, u.model, SUM(u.cost), SUM(u.total)
+            # rep 只累计「非网关 source 自带的 cost」—— api/litellm 的成本主查询已并入
+            # row.cost,再加就是重复计费;est 只对 cost=0 的那部分 token 推断,同人同
+            # 模型「带价行+零价行」混合时零价部分照样推断(按行内 CASE 拆分,不看组总)。
+            for em, m, rep_cost, zero_tok in conn.execute("""
+                SELECT u.email, u.model,
+                       SUM(CASE WHEN u.cost > 0 AND u.source NOT IN ('litellm','api')
+                                THEN u.cost ELSE 0 END),
+                       SUM(CASE WHEN u.cost <= 0 THEN u.total ELSE 0 END)
                 FROM usage u
                 WHERE %s AND u.source != 'litellm_agent'%s%s
                 GROUP BY u.email, u.model
             """ % (where, dep_clause, cli_clause), params2).fetchall():
-                if co and co > 0:
-                    rep_by_email[em] = rep_by_email.get(em, 0.0) + co
-                    continue
+                if rep_cost and rep_cost > 0:
+                    rep_by_email[em] = rep_by_email.get(em, 0.0) + rep_cost
                 r = rate_exact.get(m or "") or rate_stripped.get((m or "").split("/")[-1].lower())
-                if r and t:
-                    est_by_email[em] = est_by_email.get(em, 0.0) + t * r
+                if r and zero_tok:
+                    est_by_email[em] = est_by_email.get(em, 0.0) + zero_tok * r
             for row in result:
                 rep = rep_by_email.get(row["email"], 0.0)
                 est = est_by_email.get(row["email"], 0.0)
