@@ -227,17 +227,25 @@ def resolve_codex_identity(member, people_index):
 
 
 def ensure_tables(conn):
+    # 旧库是「同人同工具聚合成一行 + seats 计数」的模型；新模型改为「一席一行」，
+    # 主键 (email, tool, seat)。检测到老表(无 seat 列)直接 DROP 重建 —— 本表每天整表覆盖，
+    # 丢弃旧行安全(次日同步即重灌)，不做逐列 ALTER 迁移。
+    existing = [row[1] for row in conn.execute("PRAGMA table_info(subscriptions)").fetchall()]
+    if existing and "seat" not in existing:
+        conn.execute("DROP TABLE subscriptions")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions(
             email TEXT NOT NULL,
             tool TEXT NOT NULL,
+            seat INTEGER NOT NULL DEFAULT 1,
             tier TEXT NOT NULL DEFAULT 'standard',
             monthly_fee_usd REAL NOT NULL DEFAULT 0,
-            seats INTEGER NOT NULL DEFAULT 1,
             display_name TEXT DEFAULT '',
             dept TEXT DEFAULT '',
+            start_date TEXT,
+            end_date TEXT,
             synced_at TEXT NOT NULL,
-            PRIMARY KEY(email, tool)
+            PRIMARY KEY(email, tool, seat)
         )
     """)
     conn.execute("""
@@ -250,13 +258,6 @@ def ensure_tables(conn):
             synced_at TEXT NOT NULL
         )
     """)
-    sub_cols = [row[1] for row in conn.execute("PRAGMA table_info(subscriptions)").fetchall()]
-    if "seats" not in sub_cols:
-        conn.execute("ALTER TABLE subscriptions ADD COLUMN seats INTEGER NOT NULL DEFAULT 1")
-    if "start_date" not in sub_cols:
-        conn.execute("ALTER TABLE subscriptions ADD COLUMN start_date TEXT")
-    if "end_date" not in sub_cols:
-        conn.execute("ALTER TABLE subscriptions ADD COLUMN end_date TEXT")
 
 
 def write_snapshot(conn, subs, unresolved, synced_at):
@@ -267,14 +268,14 @@ def write_snapshot(conn, subs, unresolved, synced_at):
         for row in subs or []:
             conn.execute("""
                 INSERT OR REPLACE INTO subscriptions
-                    (email, tool, tier, monthly_fee_usd, seats, display_name, dept, start_date, end_date, synced_at)
+                    (email, tool, seat, tier, monthly_fee_usd, display_name, dept, start_date, end_date, synced_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?)
             """, (
                 row.get("email") or "",
                 row.get("tool") or "",
+                int(row.get("seat") or 1),
                 row.get("tier") or "standard",
                 float(row.get("monthly_fee_usd") or 0),
-                int(row.get("seats") or 1),
                 row.get("display_name") or "",
                 row.get("dept") or "",
                 row.get("start_date"),
@@ -346,95 +347,48 @@ def _load_people(conn):
     return [{"email": r[0] or "", "name": r[1] or "", "dept": r[2] or ""} for r in rows]
 
 
-def _seat_rank(row):
-    fee = float(row.get("monthly_fee_usd") or 0)
-    tier = row.get("tier") or "standard"
-    return (fee, 1 if tier == "premium" else 0)
-
-
-def _aggregate_subscriptions(rows):
-    grouped = {}
-    for row in rows or []:
-        email = row.get("email") or ""
-        tool = row.get("tool") or ""
-        if not email or not tool:
-            continue
-        key = (email, tool)
-        item = grouped.get(key)
-        if item is None:
-            item = {
-                "email": email,
-                "tool": tool,
-                "tier": row.get("tier") or "standard",
-                "monthly_fee_usd": float(row.get("monthly_fee_usd") or 0),
-                "seats": 1,
-                "display_name": row.get("display_name") or "",
-                "dept": row.get("dept") or "",
-                "start_date": row.get("start_date"),
-                "end_date": row.get("end_date"),
-                "_best_rank": _seat_rank(row),
-            }
-            grouped[key] = item
-            continue
-        item["monthly_fee_usd"] = float(item.get("monthly_fee_usd") or 0) + float(row.get("monthly_fee_usd") or 0)
-        item["seats"] = int(item.get("seats") or 0) + 1
-        cur_start = item.get("start_date")
-        new_start = row.get("start_date")
-        item["start_date"] = new_start if cur_start is None else (cur_start if new_start is None else min(cur_start, new_start))
-        if item.get("end_date") is None or row.get("end_date") is None:
-            item["end_date"] = None
-        else:
-            item["end_date"] = max(item.get("end_date"), row.get("end_date"))
-        if not item.get("display_name") and row.get("display_name"):
-            item["display_name"] = row.get("display_name") or ""
-        if not item.get("dept") and row.get("dept"):
-            item["dept"] = row.get("dept") or ""
-        rank = _seat_rank(row)
-        if rank > item.get("_best_rank"):
-            item["tier"] = row.get("tier") or "standard"
-            item["_best_rank"] = rank
-    out = []
-    for key in sorted(grouped):
-        item = dict(grouped[key])
-        item.pop("_best_rank", None)
-        out.append(item)
-    return out
+def _seat_row(email, src, seat):
+    """单席行：保留各账号自己的 tier/月费/生命周期区间，不与同人同工具的其他席位合并。"""
+    return {
+        "email": email,
+        "tool": src.get("tool") or "",
+        "seat": seat,
+        "tier": src.get("tier") or "standard",
+        "monthly_fee_usd": float(src.get("monthly_fee_usd") or 0),
+        "display_name": src.get("display_name") or "",
+        "dept": src.get("dept") or "",
+        "start_date": src.get("start_date"),
+        "end_date": src.get("end_date"),
+    }
 
 
 def _build_snapshot(rows_by_tool, people):
+    """一席一行：每个名单条目就是一行，seat 在 (email,tool) 内按输入(表单)顺序 1..N 枚举。
+    同人同工具的多账号不再合并 —— 一个在用席位 + 一个已删除席位各自按自己的区间计费/挂徽章，
+    杜绝「两份月费、无终止日」的旧聚合超收。"""
     people_index = index_people(people)
     subs = []
     unresolved = []
+    seat_counter = {}   # (email, tool) -> 已分配席位数,保证 seat 在该键内递增且确定
+
+    def _emit(email, src):
+        tool = src.get("tool") or ""
+        key = (email, tool)
+        seat = seat_counter.get(key, 0) + 1
+        seat_counter[key] = seat
+        subs.append(_seat_row(email, src, seat))
 
     for row in rows_by_tool.get("codex") or []:
         resolved, miss = resolve_codex_identity(row, people_index)
         if resolved:
-            subs.append({
-                "email": resolved.get("email") or "",
-                "tool": resolved.get("tool") or "",
-                "tier": resolved.get("tier") or "standard",
-                "monthly_fee_usd": float(resolved.get("monthly_fee_usd") or 0),
-                "display_name": resolved.get("display_name") or "",
-                "dept": resolved.get("dept") or "",
-                "start_date": resolved.get("start_date"),
-                "end_date": resolved.get("end_date"),
-            })
+            _emit(resolved.get("email") or "", resolved)
         elif miss:
             unresolved.append(miss)
 
     for tool in ("claude", "cursor", "windsurf"):
         for row in rows_by_tool.get(tool) or []:
-            subs.append({
-                "email": row.get("raw_email") or "",
-                "tool": row.get("tool") or "",
-                "tier": row.get("tier") or "standard",
-                "monthly_fee_usd": float(row.get("monthly_fee_usd") or 0),
-                "display_name": row.get("display_name") or "",
-                "dept": row.get("dept") or "",
-                "start_date": row.get("start_date"),
-                "end_date": row.get("end_date"),
-            })
-    return _aggregate_subscriptions(subs), unresolved
+            _emit(row.get("raw_email") or "", row)
+    return subs, unresolved
 
 
 def _print_summary(rows_by_tool, subs, unresolved):

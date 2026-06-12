@@ -129,13 +129,16 @@ def test_prorated_month_fraction_examples(monkeypatch):
     assert app.prorated_month_fraction("2026-06-12", "2026-06-11") == 1.0
 
 
-def test_subscription_fraction_uses_days_window(monkeypatch):
+def test_interval_fraction_window_math(monkeypatch):
+    # 旧 _subscription_fraction(整窗平铺)已删,活路径是 _interval_fraction(窗口∩席位区间)。
     app = _load_app_module(monkeypatch)
-    _freeze_today(monkeypatch, app, "2026-06-12")
 
-    assert app._subscription_fraction(7) == pytest.approx(7 / 30)
-    assert app._subscription_fraction(30) == pytest.approx((18 / 31) + (12 / 30))
-    assert app._subscription_fraction(30 + 1) != 1.0
+    assert app._interval_fraction("2026-06-06", "2026-06-12", None, None) == pytest.approx(7 / 30)
+    assert app._interval_fraction("2026-05-14", "2026-06-12", None, None) == pytest.approx((18 / 31) + (12 / 30))
+    # 席位区间裁剪窗口:开通晚于窗口起点 → 只摊销开通后的天数
+    assert app._interval_fraction("2026-05-14", "2026-06-12", "2026-06-01", None) == pytest.approx(12 / 30)
+    # 删除早于窗口起点 → 0
+    assert app._interval_fraction("2026-05-14", "2026-06-12", None, "2026-04-01") == 0.0
 
 
 def test_leaderboard_and_dashboard_skip_roster_only_subscription_rows(monkeypatch):

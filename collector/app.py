@@ -85,13 +85,6 @@ def prorated_month_fraction(start: date | str, end: date | str) -> float:
     return fraction
 
 
-def _subscription_fraction(days: int) -> float:
-    today = date.today()
-    span = max(int(days or 1), 1)
-    start = today - timedelta(days=span - 1)
-    return prorated_month_fraction(start, today)
-
-
 def _interval_fraction(
     win_start: date | str, win_end: date | str,
     sub_start: date | str | None, sub_end: date | str | None,
@@ -133,10 +126,47 @@ def _prorate_subscriptions(
             kept.append(sub)
             total += float(sub.get("fee") or 0) * frac
         if kept:
-            filtered[email] = kept
+            filtered[email] = _group_subs(kept)
         if total:
             prorated_fee[email] = total
     return prorated_fee, filtered
+
+
+_TIER_RANK = {"premium": 2, "standard": 1}
+
+
+def _group_subs(seat_rows: list[dict]) -> list[dict]:
+    """席位行 → 按工具聚合的徽章 payload（与 dev_collector._group_subs 同语义）。
+
+    fee=在窗席位月费之和，seats=在窗席位数，tier=最高席别；start 仅当所有席位
+    都有开通日时取最早；end 仅当所有席位都已删除时取最晚。
+    """
+    grouped: dict[str, dict] = {}
+    for s_ in seat_rows:
+        tool = s_.get("tool") or ""
+        g = grouped.get(tool)
+        if g is None:
+            g = {"tool": tool, "tier": s_.get("tier") or "standard",
+                 "fee": 0.0, "seats": 0, "_starts": [], "_ends": []}
+            grouped[tool] = g
+        g["fee"] += float(s_.get("fee") or 0)
+        g["seats"] += 1
+        if _TIER_RANK.get(s_.get("tier") or "standard", 0) > _TIER_RANK.get(g["tier"], 0):
+            g["tier"] = s_.get("tier")
+        g["_starts"].append(s_.get("start"))
+        g["_ends"].append(s_.get("end"))
+    out = []
+    for tool in sorted(grouped):
+        g = grouped[tool]
+        starts = g.pop("_starts")
+        ends = g.pop("_ends")
+        g["fee"] = round(g["fee"], 4)
+        if starts and all(starts):
+            g["start"] = min(starts)
+        if ends and all(ends):
+            g["end"] = max(ends)
+        out.append(g)
+    return out
 
 
 def _row_get(row: Mapping[str, object], key: str) -> object | None:
@@ -149,10 +179,10 @@ def _row_get(row: Mapping[str, object], key: str) -> object | None:
 async def _fetch_subscriptions(conn: asyncpg.Connection) -> tuple[dict[str, list[dict]], dict[str, float], dict[str, dict[str, str]]]:
     rows = await conn.fetch(
         """
-        SELECT email, tool, tier, monthly_fee_usd, seats, display_name, dept,
+        SELECT email, tool, seat, tier, monthly_fee_usd, display_name, dept,
                start_date, end_date
         FROM subscriptions
-        ORDER BY email, tool, tier
+        ORDER BY email, tool, seat
         """
     )
     subs_by_email: dict[str, list[dict]] = {}
@@ -162,18 +192,15 @@ async def _fetch_subscriptions(conn: asyncpg.Connection) -> tuple[dict[str, list
         email = (r["email"] or "").strip()
         if not email:
             continue
+        # 一席一行：start/end 为本席位自己的生命周期区间（None=无界），
+        # 对外徽章 payload 由 _group_subs 聚合。
         sub = {
-            "tool": r["tool"],
-            "tier": r["tier"],
+            "tool": (r["tool"] or "").lower(),
+            "tier": r["tier"] or "standard",
             "fee": float(r["monthly_fee_usd"] or 0),
-            "seats": int(r["seats"] or 1),
+            "start": _row_get(r, "start_date") or None,
+            "end": _row_get(r, "end_date") or None,
         }
-        start_date = _row_get(r, "start_date")
-        end_date = _row_get(r, "end_date")
-        if start_date:
-            sub["start"] = start_date
-        if end_date:
-            sub["end"] = end_date
         subs_by_email.setdefault(email, []).append(sub)
         fee_by_email[email] = fee_by_email.get(email, 0.0) + float(r["monthly_fee_usd"] or 0)
         profile = profile_by_email.setdefault(email, {})
@@ -417,7 +444,7 @@ async def dashboard(days: int = 30) -> str:
     assert _pool is not None
     window = "current_date - ($1::int - 1)"
     async with _pool.acquire() as conn:
-        subs_by_email, fee_by_email, profile_by_email = await _fetch_subscriptions(conn)
+        subs_by_email, _, profile_by_email = await _fetch_subscriptions(conn)
         ppl = await conn.fetch(f"""
             SELECT email, dept, COALESCE(SUM(total_tokens), 0) t,
                    COALESCE(SUM(cost_usd) FILTER (WHERE source IN ('api','litellm')), 0) c,
@@ -437,8 +464,9 @@ async def dashboard(days: int = 30) -> str:
                    ROUND(100.0*SUM(lines_accepted)/NULLIF(SUM(lines_suggested),0),1) rate
             FROM code_daily WHERE usage_date >= {window}
             GROUP BY dept ORDER BY acc DESC""", days)
-    fee_fraction = _subscription_fraction(days)
-    aggregated_rows = _aggregate_rows_to_email([dict(r) for r in ppl], fee_by_email, fee_fraction, profile_by_email)
+    # 与 /v1/leaderboard 同口径：每席位按生命周期区间∩窗口摊销;无重叠席位不计费不挂徽章。
+    prorated_fee_by_email, subs_by_email = _prorate_subscriptions(subs_by_email, days)
+    aggregated_rows = _aggregate_rows_to_email([dict(r) for r in ppl], prorated_fee_by_email, 1.0, profile_by_email)
     ppl_rows = []
     seen_emails = set()
     for r in aggregated_rows:

@@ -384,6 +384,25 @@ def _interval_fraction(win_start, win_end, sub_start, sub_end):
     return prorated_month_fraction(eff_s, eff_e)
 
 
+def _window_dates(qs):
+    """qs → (win_start, win_end) date 对；无窗口参数(lifetime)返回 None。"""
+    frm = (qs.get("from") or [None])[0]
+    to = (qs.get("to") or [None])[0]
+    today = datetime.date.today()
+    if frm or to:
+        ws = _coerce_date(frm) if frm else datetime.date(1970, 1, 1)
+        we = _coerce_date(to) if to else today
+        return ws, we
+    raw = (qs.get("days") or [None])[0]
+    try:
+        days = int(raw) if raw not in (None, "", "all") else None
+    except (TypeError, ValueError):
+        days = None
+    if days and days > 0:
+        return today - datetime.timedelta(days=days - 1), today
+    return None
+
+
 def _interval_overlaps(win_start, win_end, sub_start, sub_end):
     ws = _coerce_date(win_start)
     we = _coerce_date(win_end)
@@ -393,14 +412,16 @@ def _interval_overlaps(win_start, win_end, sub_start, sub_end):
 
 
 def load_subscriptions(conn):
-    """subscriptions 表 -> {email: [{tool,tier,fee,seats[,start][,end]}, ...]}。
+    """subscriptions 表(一席一行) -> {email: [seat_row, ...]}。
 
+    seat_row = {tool, tier, fee, start, end}（start/end 可为 None=无界）。
     表不存在/为空时返回空 dict，便于旧库或局部测试直接复用。
+    对外(API payload)按工具聚合用 _group_subs()。
     """
     try:
         rows = conn.execute(
-            "SELECT email, tool, tier, monthly_fee_usd, seats, start_date, end_date"
-            " FROM subscriptions ORDER BY email, tool"
+            "SELECT email, tool, tier, monthly_fee_usd, start_date, end_date"
+            " FROM subscriptions ORDER BY email, tool, seat"
         ).fetchall()
     except Exception:
         return {}
@@ -409,17 +430,51 @@ def load_subscriptions(conn):
         email = r[0] or ""
         if not email:
             continue
-        item = {
-            "tool": r[1] or "",
+        out.setdefault(email, []).append({
+            "tool": (r[1] or "").lower(),
             "tier": r[2] or "standard",
             "fee": float(r[3] or 0),
-            "seats": int(r[4] or 1),
-        }
-        if r[5]:
-            item["start"] = r[5]
-        if r[6]:
-            item["end"] = r[6]
-        out.setdefault(email, []).append(item)
+            "start": r[4] or None,
+            "end": r[5] or None,
+        })
+    return out
+
+
+_TIER_RANK = {"premium": 2, "standard": 1}
+
+
+def _group_subs(seat_rows):
+    """席位行 → 按工具聚合的徽章 payload。调用方先做窗口重叠过滤。
+
+    每工具一个徽章：fee=在窗席位月费之和，seats=在窗席位数，tier=最高席别；
+    start 仅当所有席位都有开通日时取最早；end 仅当所有席位都已删除时取最晚
+    （任一席仍活跃 → 不带 end，前端不灰显）。
+    """
+    grouped = {}
+    for s in seat_rows:
+        tool = s.get("tool") or ""
+        g = grouped.get(tool)
+        if g is None:
+            g = {"tool": tool, "tier": s.get("tier") or "standard",
+                 "fee": 0.0, "seats": 0, "_starts": [], "_ends": []}
+            grouped[tool] = g
+        g["fee"] += float(s.get("fee") or 0)
+        g["seats"] += 1
+        if _TIER_RANK.get(s.get("tier") or "standard", 0) > _TIER_RANK.get(g["tier"], 0):
+            g["tier"] = s.get("tier")
+        g["_starts"].append(s.get("start"))
+        g["_ends"].append(s.get("end"))
+    out = []
+    for tool in sorted(grouped):
+        g = grouped[tool]
+        starts = g.pop("_starts")
+        ends = g.pop("_ends")
+        g["fee"] = round(g["fee"], 4)
+        if starts and all(starts):
+            g["start"] = min(starts)
+        if ends and all(ends):
+            g["end"] = max(ends)
+        out.append(g)
     return out
 
 
@@ -439,17 +494,18 @@ _CLIENT_TO_SUB_TOOL = {
 
 
 def _single_tool_subs(subs_by_email, email, tool, win_start=None, win_end=None):
-    # 工具榜只挂同工具的单个订阅徽标,复用个人榜 subs 结构避免前端分叉。
+    # 工具榜只挂同工具的订阅徽标(多席位聚合成一个),复用个人榜 subs 结构避免前端分叉。
     if not tool:
         return []
+    kept = []
     for sub in subs_by_email.get(email, []):
         if (sub.get("tool") or "").lower() != tool:
             continue
         if win_start is not None and win_end is not None and not _interval_overlaps(
                 win_start, win_end, sub.get("start"), sub.get("end")):
             continue
-        return [sub]
-    return []
+        kept.append(sub)
+    return _group_subs(kept)
 
 # 用 INSERT OR REPLACE 而非 ON CONFLICT DO UPDATE：
 # 后者需 SQLite ≥3.24，而部署目标(CentOS7)是 3.7.17。
@@ -1228,7 +1284,7 @@ class H(BaseHTTPRequestHandler):
             if path == "/v1/meta":
                 return self._meta(conn)
             if path == "/v1/governance_metrics":
-                return self._governance_metrics(conn)
+                return self._governance_metrics(conn, qs)
             if path == "/v1/feishu":
                 return self._feishu(conn, qs)
             if path == "/v1/raw":
@@ -1423,7 +1479,7 @@ class H(BaseHTTPRequestHandler):
                         continue
                     kept.append(sub)
                     fee_total += float(sub.get("fee") or 0) * frac
-                row["subs"] = kept
+                row["subs"] = _group_subs(kept)
                 if not kept:
                     continue
                 row["cost"] = round(float(row["cost"] or 0) + fee_total, 4)
@@ -1699,7 +1755,7 @@ class H(BaseHTTPRequestHandler):
             })
         self._send(200, {"email": email_filter, "trend": result})
 
-    def _governance_metrics(self, conn):
+    def _governance_metrics(self, conn, qs=None):
         """当前 SQLite 能直接计算的治理指标。
 
         只使用聚合 usage/report_log 数据；不读取 prompt、代码正文或任何凭证。
@@ -1769,34 +1825,38 @@ class H(BaseHTTPRequestHandler):
         except Exception:
             subs_unresolved = 0
         subs_by_email = load_subscriptions(conn)
-        idle_usage_rows = conn.execute("""
-            SELECT DISTINCT email
-            FROM usage
-            WHERE source != 'litellm_agent' AND COALESCE(email, '') != ''
-        """).fetchall()
+        # 闲置判定与榜单同窗口（?days/?from-to；缺省 lifetime）。
+        # - usage 过滤走 _range_clause(qs)：窗口内有任何用量的人不算闲置；
+        # - 席位过滤：席位区间须与窗口重叠 —— 窗口前已删除的席位是「已退订」而非闲置，
+        #   不进闲置计数/月费；lifetime 模式取「今天仍在订」。
+        qs = qs or {}
+        idle_where, idle_params = _range_clause(qs)
+        idle_usage_rows = conn.execute(
+            "SELECT DISTINCT email FROM usage "
+            "WHERE %s AND source != 'litellm_agent' AND COALESCE(email, '') != ''" % idle_where,
+            idle_params,
+        ).fetchall()
         usage_emails = {r[0] for r in idle_usage_rows if r and r[0]}
-        # 闲置只算「此刻仍生效」的席位：已删除(end_date 早于今天)的席位是「已退订」而非闲置，
-        # 不进闲置计数/月费。窗口给到 [today, today] 即「现在是否仍在订阅区间内」。
-        idle_window = datetime.date.today()
-        idle_people = []
+        today_d = datetime.date.today()
+        idle_win_s, idle_win_e = _window_dates(qs) or (today_d, today_d)
+        idle_fee_by = {}
         idle_emails = set()
         for email, subs in subs_by_email.items():
             if email in usage_emails:
                 continue
             for sub in subs:
-                if not _interval_overlaps(idle_window, idle_window,
+                if not _interval_overlaps(idle_win_s, idle_win_e,
                                           sub.get("start"), sub.get("end")):
                     continue
                 idle_emails.add(email)
-                idle_people.append({
-                    "email": email,
-                    "tool": sub.get("tool") or "",
-                    "fee": float(sub.get("fee") or 0),
-                })
-        # count 按空置订阅人头算；同一人多个 tool 只计 1 人，但 monthly_fee_usd 累加全部订阅行。
+                key = (email, sub.get("tool") or "")
+                idle_fee_by[key] = idle_fee_by.get(key, 0.0) + float(sub.get("fee") or 0)
+        idle_people = [{"email": k[0], "tool": k[1], "fee": round(v, 4)}
+                       for k, v in sorted(idle_fee_by.items())]
+        # count 按空置订阅人头算；同一人多个 tool 只计 1 人，但 monthly_fee_usd 累加全部席位。
         idle_subscriptions = {
             "count": len(idle_emails),
-            "monthly_fee_usd": round(sum(float(p["fee"] or 0) for p in idle_people), 4),
+            "monthly_fee_usd": round(sum(p["fee"] for p in idle_people), 4),
             "people": idle_people,
         }
 

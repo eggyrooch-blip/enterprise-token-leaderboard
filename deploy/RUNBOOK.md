@@ -219,3 +219,11 @@ ssh it@collector.example.com 'sudo systemctl list-timers subscriptions-sync.time
 # 只读演练（本机，不写库，打印 4 tab 解析人数 + unresolved 计数）：
 FEISHU_APP_ID=... FEISHU_APP_SECRET=... python3 collector/subscriptions_sync.py --dry-run
 ```
+
+## 订阅数据与 Postgres 路径的边界（如实说明）
+
+`subscriptions_sync.py` 当前只写 SQLite（`DEV_DB`，即生产部署的 `dev_collector` 路径,
+服务器 `~/tokreport/tok.db`）。FastAPI/Postgres 版 `app.py` 实现了**相同的计算逻辑**
+（按席位区间摊销/徽章聚合/闲置治理,由 tests/ 断言两端一致）,但其 `subscriptions`
+表需要使用方自行灌数——Postgres 写入器是后续工作,当前未实现。生产事实来源以
+SQLite 部署为准。

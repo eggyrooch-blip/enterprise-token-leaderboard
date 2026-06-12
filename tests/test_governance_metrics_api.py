@@ -57,7 +57,7 @@ def test_governance_metrics_api_computes_available_metrics(monkeypatch, tmp_path
         conn.commit()
 
         handler = _DummyHandler()
-        dev_collector.H._governance_metrics(handler, conn)
+        dev_collector.H._governance_metrics(handler, conn, {})
     finally:
         conn.close()
 

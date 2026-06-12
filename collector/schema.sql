@@ -60,21 +60,23 @@ CREATE TABLE IF NOT EXISTS device_identity (
 );
 
 -- 付费订阅名单：每日从飞书 4 个名单 tab 整表覆盖落库（subscriptions_sync.py）。
--- 以最新表单为唯一事实：表里新增的人当天获得徽章+计订阅费，被删的人当天摘掉。
--- 个人榜「公司实付」= 网关实销(usage_daily.source in api/litellm) + 本表月费×覆盖月数。
--- 订阅徽章(个人榜姓名后)与月费明细均取自本表。tool/tier 取值见列注释。
+-- 一席一行（同人同工具多账号 = 多行,seat 1..N 按表内顺序编号）：每个席位有独立的
+-- [start_date, end_date] 生命周期区间,已删席位带 end_date 停止计费,活跃席位继续。
+-- 个人榜「公司实付」= 网关实销(usage_daily.source in api/litellm)
+--                  + Σ每席位 月费×(查询窗口∩席位区间 的按天摊销系数)。
+-- 订阅徽章(个人/工具榜姓名后)按工具聚合席位渲染。tool/tier 取值见列注释。
 CREATE TABLE IF NOT EXISTS subscriptions (
     email           TEXT          NOT NULL,
     tool            TEXT          NOT NULL,                       -- 'codex'|'claude'|'cursor'|'windsurf'
-    tier            TEXT          NOT NULL DEFAULT 'standard',    -- 'standard'|'premium'（同人同工具多账号取最高档）
-    monthly_fee_usd NUMERIC(10,2) NOT NULL DEFAULT 0,             -- 同人同工具多坐席的月费之和（已按 seats 聚合）
-    seats           INTEGER       NOT NULL DEFAULT 1,             -- 同人同工具的账号数；单价×seats 已并入 monthly_fee_usd
+    seat            INTEGER       NOT NULL DEFAULT 1,             -- 席位序号(同人同工具 1..N)
+    tier            TEXT          NOT NULL DEFAULT 'standard',    -- 'standard'|'premium'
+    monthly_fee_usd NUMERIC(10,2) NOT NULL DEFAULT 0,             -- 本席位单价(不再聚合)
     display_name    TEXT          NOT NULL DEFAULT '',
     dept            TEXT          NOT NULL DEFAULT '',
-    start_date      TEXT,                                        -- 订阅起始(加入日期); NULL=无下界
-    end_date        TEXT,                                        -- 订阅终止(删除日期); NULL=仍生效
+    start_date      TEXT,                                        -- 本席位开通日; NULL=无下界
+    end_date        TEXT,                                        -- 本席位删除日; NULL=仍生效
     synced_at       TIMESTAMPTZ   NOT NULL DEFAULT now(),
-    PRIMARY KEY (email, tool)
+    PRIMARY KEY (email, tool, seat)
 );
 CREATE INDEX IF NOT EXISTS idx_subscriptions_email ON subscriptions (email);
 

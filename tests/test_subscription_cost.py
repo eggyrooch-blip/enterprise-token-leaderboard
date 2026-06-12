@@ -50,9 +50,9 @@ def _cursor_rows(dc, conn, qs):
     return handler.payload["cursor"]
 
 
-def _governance(dc, conn):
+def _governance(dc, conn, qs=None):
     handler = _DummyHandler()
-    dc.H._governance_metrics(handler, conn)
+    dc.H._governance_metrics(handler, conn, qs or {})
     assert handler.code == 200
     return handler.payload
 
@@ -71,12 +71,12 @@ def _insert_people(conn, email, name, dept, avatar=""):
     )
 
 
-def _insert_sub(conn, email, tool, tier, fee, name, dept, seats=1, synced_at="2026-06-12T10:00:00Z"):
+def _insert_sub(conn, email, tool, tier, fee, name, dept, seat=1, synced_at="2026-06-12T10:00:00Z"):
     conn.execute(
         "INSERT OR REPLACE INTO subscriptions"
-        "(email, tool, tier, monthly_fee_usd, seats, display_name, dept, synced_at)"
+        "(email, tool, seat, tier, monthly_fee_usd, display_name, dept, synced_at)"
         " VALUES (?,?,?,?,?,?,?,?)",
-        (email, tool, tier, fee, seats, name, dept, synced_at),
+        (email, tool, seat, tier, fee, name, dept, synced_at),
     )
 
 
@@ -136,7 +136,7 @@ def test_person_cost_uses_gateway_actual_plus_subscription_fee(dc, monkeypatch, 
         conn.commit()
 
         rows = _leaderboard(dc, conn, {"days": ["30"]})
-        payload = _governance(dc, conn)
+        payload = _governance(dc, conn, {"days": ["30"]})
     finally:
         conn.close()
 
@@ -199,7 +199,8 @@ def test_subscription_cost_uses_aggregated_fee_row_and_preserves_seats(dc, monke
     conn = dc.db()
     try:
         _insert_people(conn, "seats@keep.com", "Seats", "Keep/平台/基础")
-        _insert_sub(conn, "seats@keep.com", "codex", "standard", 50.0, "Seats", "Keep/平台/基础", seats=2)
+        _insert_sub(conn, "seats@keep.com", "codex", "standard", 25.0, "Seats", "Keep/平台/基础", seat=1)
+        _insert_sub(conn, "seats@keep.com", "codex", "standard", 25.0, "Seats", "Keep/平台/基础", seat=2)
         _insert_usage(dc, conn, "seats@keep.com", "Keep/平台/基础", "2026-06-10", "api", "Hermes", 20, 0.75, 1)
         conn.commit()
 
@@ -219,7 +220,9 @@ def test_subscription_cost_prorates_fee_inside_one_month_and_keeps_stored_seat_m
     conn = dc.db()
     try:
         _insert_people(conn, "premium@keep.com", "Premium", "Keep/平台/基础")
-        _insert_sub(conn, "premium@keep.com", "claude", "premium", 240.0, "Premium", "Keep/平台/基础", seats=3)
+        _insert_sub(conn, "premium@keep.com", "claude", "premium", 80.0, "Premium", "Keep/平台/基础", seat=1)
+        _insert_sub(conn, "premium@keep.com", "claude", "premium", 80.0, "Premium", "Keep/平台/基础", seat=2)
+        _insert_sub(conn, "premium@keep.com", "claude", "premium", 80.0, "Premium", "Keep/平台/基础", seat=3)
         _insert_usage(dc, conn, "premium@keep.com", "Keep/平台/基础", "2026-06-06", "api", "Hermes", 10, 0.5, 1)
         conn.commit()
 
@@ -318,12 +321,12 @@ def test_codex_board_attaches_only_codex_badge_and_keeps_gateway_cost(dc, monkey
     assert _row_by_email(rows, "codex-leak@keep.com")["subs"] == []
 
 
-def _insert_sub_life(conn, email, tool, tier, fee, name, dept, start, end, seats=1, synced_at="2026-06-12T10:00:00Z"):
+def _insert_sub_life(conn, email, tool, tier, fee, name, dept, start, end, seat=1, synced_at="2026-06-12T10:00:00Z"):
     conn.execute(
         "INSERT OR REPLACE INTO subscriptions"
-        "(email, tool, tier, monthly_fee_usd, seats, display_name, dept, start_date, end_date, synced_at)"
+        "(email, tool, seat, tier, monthly_fee_usd, display_name, dept, start_date, end_date, synced_at)"
         " VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (email, tool, tier, fee, seats, name, dept, start, end, synced_at),
+        (email, tool, seat, tier, fee, name, dept, start, end, synced_at),
     )
 
 
@@ -363,6 +366,49 @@ def test_sub_deleted_midwindow_prorates_until_deletion(dc, monkeypatch, tmp_path
     row = _row_by_email(rows, "end@keep.com")
     assert row["cost"] == round(0.8 + 40.0 * dc.prorated_month_fraction("2026-05-14", "2026-05-20"), 4)
     assert row["subs"] == [{"tool": "cursor", "tier": "standard", "fee": 40.0, "seats": 1, "end": "2026-05-20"}]
+
+
+def test_multi_seat_active_plus_deleted(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "combo@keep.com", "Combo", "Keep/平台/基础")
+        _insert_sub_life(conn, "combo@keep.com", "codex", "standard", 25.0, "Combo", "Keep/平台/基础", None, None, seat=1)
+        _insert_sub_life(conn, "combo@keep.com", "codex", "standard", 25.0, "Combo", "Keep/平台/基础", None, "2026-05-20", seat=2)
+        _insert_usage(dc, conn, "combo@keep.com", "Keep/平台/基础", "2026-06-10", "api", "Hermes", 40, 0.6, 1)
+        conn.commit()
+
+        rows = _leaderboard(dc, conn, {"days": ["30"]})
+    finally:
+        conn.close()
+
+    row = _row_by_email(rows, "combo@keep.com")
+    expected = 0.6
+    expected += 25.0 * dc.prorated_month_fraction("2026-05-14", "2026-06-12")
+    expected += 25.0 * dc.prorated_month_fraction("2026-05-14", "2026-05-20")
+    assert row["cost"] == round(expected, 4)
+    assert row["subs"] == [{"tool": "codex", "tier": "standard", "fee": 50.0, "seats": 2}]
+
+
+def test_window_after_deleted_seat_shows_one_seat(dc, monkeypatch, tmp_path):
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "combo@keep.com", "Combo", "Keep/平台/基础")
+        _insert_sub_life(conn, "combo@keep.com", "codex", "standard", 25.0, "Combo", "Keep/平台/基础", None, None, seat=1)
+        _insert_sub_life(conn, "combo@keep.com", "codex", "standard", 25.0, "Combo", "Keep/平台/基础", None, "2026-05-20", seat=2)
+        _insert_usage(dc, conn, "combo@keep.com", "Keep/平台/基础", "2026-06-10", "api", "Hermes", 40, 0.6, 1)
+        conn.commit()
+
+        rows = _leaderboard(dc, conn, {"days": ["7"]})
+    finally:
+        conn.close()
+
+    row = _row_by_email(rows, "combo@keep.com")
+    assert row["cost"] == round(0.6 + 25.0 * dc.prorated_month_fraction("2026-06-06", "2026-06-12"), 4)
+    assert row["subs"] == [{"tool": "codex", "tier": "standard", "fee": 25.0, "seats": 1}]
 
 
 def test_sub_started_after_window_or_deleted_before_window_zero_and_no_badge(dc, monkeypatch, tmp_path):

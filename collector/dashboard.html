@@ -228,7 +228,7 @@
       <button class="tab" data-t="agent"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>Agent 榜</button>
       <button class="tab" data-t="governance"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>大厂治理指标</button>
       <button class="tab" data-t="feishu"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 5.4L20 8l-4 4 1 6-5-2.8L7 18l1-6-4-4 5.6-.6L12 2Z"/></svg>飞书 AI 权益</button>
-      <div class="seg-ctl" id="metricCtl" title="榜单按总量,或除以天数(日均)显示;日均模式下 token 与成本$同时除以天数">
+      <div class="seg-ctl" id="metricCtl" title="榜单按总量,或除以天数(日均)显示;日均模式下 token 全榜折算,成本$仅个人榜折算(其余榜成本始终总量)">
         <button data-m="total" class="on">总量</button>
         <button data-m="daily">日均</button>
       </div>
@@ -334,7 +334,7 @@ async function load(){
   var [lb,tm,tool,model,cur,ag,gov,cc,cx,ll,hm,fs]=await Promise.all([
     j('/v1/leaderboard'+q), j('/v1/teams'+q),
     j('/v1/breakdown?by=client'+qa), j('/v1/breakdown?by=model'+qa), j('/v1/cursor'+q),
-    j('/v1/agent_leaderboard'+q), j('/v1/governance_metrics'),
+    j('/v1/agent_leaderboard'+q), j('/v1/governance_metrics'+q),
     j('/v1/leaderboard?client='+encodeURIComponent('Claude Code')+qa),
     j('/v1/leaderboard?client='+encodeURIComponent('Codex CLI')+qa),
     j('/v1/leaderboard?client='+encodeURIComponent('LiteLLM')+qa),   // LiteLLM 榜=网关用量(已自动排除 agent)
@@ -476,7 +476,7 @@ function renderTeamTree(){
       var big=compact(mv(x))+'/人';
       // 人均点数(飞书 aily,单位「点」)与 token 分列,不加总;只在该部门有 aily 用量时显示
       var creditTag=(x.per_capita_credits>0)?(' · 人均 '+compact(x.per_capita_credits)+' 点'):'';
-      var small='总 '+compact(metricTok(x.tokens||0))+' · $'+grp(Math.round(metricCost(x.cost||0)))+' · '+share.toFixed(1)+'%'+creditTag;
+      var small='总 '+compact(metricTok(x.tokens||0))+' · $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%'+creditTag;
       var pad=depth*18;                                 // 每级缩进 18px,层级靠缩进体现
       // 有子节点的行:整行可点(data-path + 手型光标),点哪都展开/收起,不必精准点三角
       var rowAttr=hasKids?(' data-path="'+encodeURIComponent(x.dept)+'" style="cursor:pointer"'):'';
@@ -562,19 +562,19 @@ function render(){
       small='主力 '+shortTool(top.client)+' '+top.pct+'% · $'+grp(Math.round(metricCost(x.cost||0)));
     } else if(isCur){
       fillHTML='<div class="fill" style="width:'+pct+'%;background:'+toolColor("Cursor")+'"></div>';
-      big=compact(mv(x)); small='$'+grp(Math.round(metricCost(x.cost||0)))+' · '+grp(x.requests||0)+' 次 · '+share.toFixed(1)+'%';
+      big=compact(mv(x)); small='$'+grp(Math.round(x.cost||0))+' · '+grp(x.requests||0)+' 次 · '+share.toFixed(1)+'%';
     } else if(CUR==='claude'||CUR==='codex'||CUR==='litellm'||CUR==='hermes'){
       var ccol=toolColor(CUR==='claude'?'Claude Code':(CUR==='codex'?'Codex CLI':(CUR==='litellm'?'LiteLLM':'Hermes')));
       fillHTML='<div class="fill" style="width:'+pct+'%;background:'+ccol+'"></div>';
-      big=compact(mv(x)); small='$'+grp(Math.round(metricCost(x.cost||0)))+(x.messages?(' · '+grp(x.messages)+' 条'):'')+' · '+share.toFixed(1)+'%';
+      big=compact(mv(x)); small='$'+grp(Math.round(x.cost||0))+(x.messages?(' · '+grp(x.messages)+' 条'):'')+' · '+share.toFixed(1)+'%';
     } else if(isTeam){
       // 部门榜:主指标=人均(已含日均口径);副标题给总量做参考
       fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
       big=compact(mv(x))+'/人';
-      small='总 '+compact(metricTok(x.tokens||0))+' · $'+grp(Math.round(metricCost(x.cost||0)))+' · '+share.toFixed(1)+'%';
+      small='总 '+compact(metricTok(x.tokens||0))+' · $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%';
     } else {
       fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
-      big=compact(mv(x)); small='$'+grp(Math.round(metricCost(x.cost||0)))+(x.messages?(' · '+grp(x.messages)+' 条'):'')+' · '+share.toFixed(1)+'%';
+      big=compact(mv(x)); small='$'+grp(Math.round(CUR==='person'?metricCost(x.cost||0):(x.cost||0)))+(x.messages?(' · '+grp(x.messages)+' 条'):'')+' · '+share.toFixed(1)+'%';
     }
     return '<div class="r"><span class="rk num '+(i===0?'first':'')+'">'+(i+1)+'</span>'+av+
       '<div class="nm">'+name+(sub?'<div class="sub">'+sub+'</div>':'')+'</div>'+

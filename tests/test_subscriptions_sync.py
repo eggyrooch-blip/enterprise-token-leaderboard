@@ -185,18 +185,18 @@ def test_write_snapshot_full_replace_is_idempotent_and_removes_deleted_people():
         {
             "email": "alice@keep.com",
             "tool": "codex",
+            "seat": 1,
             "tier": "standard",
             "monthly_fee_usd": 25.0,
-            "seats": 1,
             "display_name": "Alice",
             "dept": "Keep/平台/基础",
         },
         {
             "email": "bob@keep.com",
             "tool": "claude",
+            "seat": 1,
             "tier": "premium",
             "monthly_fee_usd": 100.0,
-            "seats": 1,
             "display_name": "Bob",
             "dept": "Keep/平台/应用",
         },
@@ -212,31 +212,31 @@ def test_write_snapshot_full_replace_is_idempotent_and_removes_deleted_people():
     subscriptions_sync.write_snapshot(conn, subs, unresolved, "2026-06-12T10:00:00Z")
     subscriptions_sync.write_snapshot(conn, subs, unresolved, "2026-06-12T10:00:00Z")
     rows = conn.execute(
-        "SELECT email, tool, tier, monthly_fee_usd FROM subscriptions ORDER BY email, tool"
+        "SELECT email, tool, seat, tier, monthly_fee_usd FROM subscriptions ORDER BY email, tool, seat"
     ).fetchall()
     unresolved_rows = conn.execute(
         "SELECT tool, display_name, raw_email, reason FROM subscriptions_unresolved"
     ).fetchall()
 
     assert rows == [
-        ("alice@keep.com", "codex", "standard", 25.0),
-        ("bob@keep.com", "claude", "premium", 100.0),
+        ("alice@keep.com", "codex", 1, "standard", 25.0),
+        ("bob@keep.com", "claude", 1, "premium", 100.0),
     ]
     assert unresolved_rows == [("codex", "Ghost", "ghost@gmail.com", "no_match")]
 
     subscriptions_sync.write_snapshot(conn, subs[:1], [], "2026-06-13T10:00:00Z")
     rows = conn.execute(
-        "SELECT email, tool FROM subscriptions ORDER BY email, tool"
+        "SELECT email, tool, seat FROM subscriptions ORDER BY email, tool, seat"
     ).fetchall()
     unresolved_count = conn.execute(
         "SELECT COUNT(*) FROM subscriptions_unresolved"
     ).fetchone()[0]
 
-    assert rows == [("alice@keep.com", "codex")]
+    assert rows == [("alice@keep.com", "codex", 1)]
     assert unresolved_count == 0
 
 
-def test_build_snapshot_aggregates_seats_per_email_and_tool():
+def test_build_snapshot_keeps_one_row_per_seat_in_input_order():
     people = [
         {"email": "alice@keep.com", "name": "Alice", "dept": "Keep/平台/基础"},
     ]
@@ -287,10 +287,10 @@ def test_build_snapshot_aggregates_seats_per_email_and_tool():
     assert subs == [
         {
             "email": "alice@keep.com",
-            "tool": "claude",
-            "tier": "premium",
-            "monthly_fee_usd": 125.0,
-            "seats": 2,
+            "tool": "codex",
+            "seat": 1,
+            "tier": "standard",
+            "monthly_fee_usd": 25.0,
             "display_name": "Alice",
             "dept": "Keep/平台/基础",
             "start_date": None,
@@ -299,9 +299,31 @@ def test_build_snapshot_aggregates_seats_per_email_and_tool():
         {
             "email": "alice@keep.com",
             "tool": "codex",
+            "seat": 2,
             "tier": "standard",
-            "monthly_fee_usd": 50.0,
-            "seats": 2,
+            "monthly_fee_usd": 25.0,
+            "display_name": "Alice",
+            "dept": "Keep/平台/基础",
+            "start_date": None,
+            "end_date": None,
+        },
+        {
+            "email": "alice@keep.com",
+            "tool": "claude",
+            "seat": 1,
+            "tier": "standard",
+            "monthly_fee_usd": 25.0,
+            "display_name": "Alice",
+            "dept": "Keep/平台/基础",
+            "start_date": None,
+            "end_date": None,
+        },
+        {
+            "email": "alice@keep.com",
+            "tool": "claude",
+            "seat": 2,
+            "tier": "premium",
+            "monthly_fee_usd": 100.0,
             "display_name": "Alice",
             "dept": "Keep/平台/基础",
             "start_date": None,
@@ -348,11 +370,68 @@ def test_parse_claude_lifecycle_dates():
     assert parsed[2]["end_date"] is None
 
 
-def test_aggregate_lifecycle_min_start_max_end_null_wins():
-    merged = subscriptions_sync._aggregate_subscriptions([
+def test_build_snapshot_preserves_lifecycle_per_seat():
+    people = [
+        {"email": "alice@keep.com", "name": "Alice", "dept": "Keep/平台/基础"},
+        {"email": "bob@keep.com", "name": "Bob", "dept": "Keep/平台/应用"},
+    ]
+    rows_by_tool = {
+        "codex": [
+            {
+                "tool": "codex",
+                "display_name": "Alice",
+                "raw_email": "alice+1@gmail.com",
+                "dept": "Keep/平台/基础",
+                "tier": "standard",
+                "monthly_fee_usd": 25.0,
+                "start_date": "2026-05-01",
+                "end_date": "2026-06-10",
+            },
+            {
+                "tool": "codex",
+                "display_name": "Alice",
+                "raw_email": "alice+2@gmail.com",
+                "dept": "Keep/平台/基础",
+                "tier": "standard",
+                "monthly_fee_usd": 25.0,
+                "start_date": "2026-06-01",
+                "end_date": None,
+            },
+        ],
+        "claude": [
+            {
+                "tool": "claude",
+                "display_name": "Bob",
+                "raw_email": "bob@keep.com",
+                "dept": "Keep/平台/应用",
+                "tier": "premium",
+                "monthly_fee_usd": 100.0,
+                "start_date": "2026-05-02",
+                "end_date": "2026-06-08",
+            },
+            {
+                "tool": "claude",
+                "display_name": "Bob",
+                "raw_email": "bob@keep.com",
+                "dept": "Keep/平台/应用",
+                "tier": "premium",
+                "monthly_fee_usd": 100.0,
+                "start_date": "2026-05-20",
+                "end_date": "2026-06-11",
+            },
+        ],
+        "cursor": [],
+        "windsurf": [],
+    }
+
+    subs, unresolved = subscriptions_sync._build_snapshot(rows_by_tool, people)
+
+    assert unresolved == []
+    assert subs == [
         {
             "email": "alice@keep.com",
             "tool": "codex",
+            "seat": 1,
             "tier": "standard",
             "monthly_fee_usd": 25.0,
             "display_name": "Alice",
@@ -363,6 +442,7 @@ def test_aggregate_lifecycle_min_start_max_end_null_wins():
         {
             "email": "alice@keep.com",
             "tool": "codex",
+            "seat": 2,
             "tier": "standard",
             "monthly_fee_usd": 25.0,
             "display_name": "Alice",
@@ -373,6 +453,7 @@ def test_aggregate_lifecycle_min_start_max_end_null_wins():
         {
             "email": "bob@keep.com",
             "tool": "claude",
+            "seat": 1,
             "tier": "premium",
             "monthly_fee_usd": 100.0,
             "display_name": "Bob",
@@ -383,6 +464,7 @@ def test_aggregate_lifecycle_min_start_max_end_null_wins():
         {
             "email": "bob@keep.com",
             "tool": "claude",
+            "seat": 2,
             "tier": "premium",
             "monthly_fee_usd": 100.0,
             "display_name": "Bob",
@@ -390,12 +472,7 @@ def test_aggregate_lifecycle_min_start_max_end_null_wins():
             "start_date": "2026-05-20",
             "end_date": "2026-06-11",
         },
-    ])
-
-    assert merged[0]["start_date"] == "2026-05-01"
-    assert merged[0]["end_date"] is None
-    assert merged[1]["start_date"] == "2026-05-02"
-    assert merged[1]["end_date"] == "2026-06-11"
+    ]
 
 
 def test_write_snapshot_roundtrips_dates():
@@ -406,9 +483,9 @@ def test_write_snapshot_roundtrips_dates():
         {
             "email": "alice@keep.com",
             "tool": "codex",
+            "seat": 1,
             "tier": "standard",
             "monthly_fee_usd": 25.0,
-            "seats": 1,
             "display_name": "Alice",
             "dept": "Keep/平台/基础",
             "start_date": "2026-06-03",
@@ -417,8 +494,8 @@ def test_write_snapshot_roundtrips_dates():
     ], [], "2026-06-12T10:00:00Z")
 
     row = conn.execute(
-        "SELECT start_date, end_date FROM subscriptions WHERE email=? AND tool=?",
+        "SELECT seat, start_date, end_date FROM subscriptions WHERE email=? AND tool=?",
         ("alice@keep.com", "codex"),
     ).fetchone()
 
-    assert row == ("2026-06-03", "2026-06-10")
+    assert row == (1, "2026-06-03", "2026-06-10")
