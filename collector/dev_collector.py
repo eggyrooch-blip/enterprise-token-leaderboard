@@ -110,6 +110,74 @@ def _resolve_serial(serial):
     return out
 
 
+def _autofill_people_for_emails(conn, emails):
+    """Best-effort email -> people backfill for explicit-email ingest paths.
+
+    Hermes already sends the canonical company email, but the leaderboard needs
+    the `people` row for Chinese name/avatar/full department.  This is optional:
+    Feilian failures must never block token ingestion.
+    """
+    pending = []
+    seen = set()
+    for raw in emails or []:
+        email = raw.strip() if isinstance(raw, str) else ""
+        if not email or "@" not in email or email in seen:
+            continue
+        seen.add(email)
+        row = conn.execute("SELECT name, avatar, dept FROM people WHERE email=?", (email,)).fetchone()
+        if row and (row[0] or row[1]) and _to_keep(row[2]):
+            continue
+        pending.append(email)
+    if not pending:
+        return 0
+
+    global _fc
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        if _fc is None:
+            from feilian_client import FeilianClient
+            _fc = FeilianClient()
+        root = _fc.root_department_id()
+    except Exception:
+        return 0
+
+    filled = 0
+    for email in pending:
+        try:
+            user = _fc.user_by_email(email, root)
+        except Exception:
+            continue
+        if not user:
+            continue
+        name = user.get("full_name") or ""
+        avatar = user.get("avatar") or ""
+        dept = user.get("department_path") or ""
+        if not name or not dept:
+            continue
+        conn.execute(
+            "INSERT OR REPLACE INTO people(email, name, avatar, dept) VALUES(?,?,?,?)",
+            (email, name, avatar, dept))
+        filled += 1
+    return filled
+
+
+def _autofill_people_for_hermes_records(conn, records):
+    emails = []
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        email = rec.get("email")
+        model = rec.get("model")
+        if not isinstance(email, str) or not email.strip() or not isinstance(model, str) or not model.strip():
+            continue
+        total = num(rec, "total_tokens", "total")
+        if total <= 0:
+            total = num(rec, "input_tokens", "input") + num(rec, "output_tokens", "output")
+        if total > 0:
+            emails.append(email)
+    return _autofill_people_for_emails(conn, emails)
+
+
 # ---------------------------------------------------------------------------
 # 数据库
 # ---------------------------------------------------------------------------
@@ -848,7 +916,22 @@ class H(BaseHTTPRequestHandler):
         written, skipped = _upsert_hermes_usage(conn, source, client, date, records)
         conn.commit()
         conn.close()
-        self._send(200, {"ok": True, "written": written, "skipped": skipped})
+        people_filled = 0
+        fill_conn = None
+        try:
+            fill_conn = db()
+            people_filled = _autofill_people_for_hermes_records(fill_conn, records)
+            fill_conn.commit()
+        except Exception:
+            people_filled = 0
+        finally:
+            if fill_conn is not None:
+                try:
+                    fill_conn.close()
+                except Exception:
+                    pass
+        self._send(200, {"ok": True, "written": written, "skipped": skipped,
+                         "people_filled": people_filled})
 
     def _tokscale_report(self):
         """接收 {serial, email, hostname, models:{entries:[...]}, monthly:{entries:[...]}}

@@ -4,7 +4,12 @@ Covers the codex-review hardening: within-payload summing (not overwrite),
 malformed-record skipping (no zero-overwrite), and day/month/lifetime idempotency.
 """
 import importlib.util
+import json
 import sqlite3
+import sys
+import threading
+import types
+import urllib.request
 from pathlib import Path
 
 _MOD_PATH = Path(__file__).resolve().parents[1] / "collector" / "dev_collector.py"
@@ -16,6 +21,7 @@ _spec.loader.exec_module(dev_collector)
 def _conn():
     conn = sqlite3.connect(":memory:")
     conn.executescript(dev_collector._CREATE_TABLE)
+    conn.execute("CREATE TABLE IF NOT EXISTS people(email TEXT PRIMARY KEY, name TEXT, avatar TEXT, dept TEXT)")
     return conn
 
 
@@ -139,3 +145,134 @@ def test_delete_is_scoped_to_source_only():
     )
     survived = conn.execute("SELECT total FROM usage WHERE source='litellm'").fetchone()
     assert survived == (2,)
+
+
+def test_hermes_usage_autofills_people_from_feilian(monkeypatch):
+    class FakeFC:
+        def root_department_id(self):
+            return "root"
+
+        def user_by_email(self, email, root):
+            assert root == "root"
+            if email == "fresh@keep.com":
+                return {
+                    "full_name": "新用户",
+                    "avatar": "https://avatar.example/fresh.png",
+                    "department_path": "Keep/客户服务中心/客服运营部/运营支持组",
+                }
+            return None
+
+    fake_mod = types.ModuleType("feilian_client")
+    fake_mod.FeilianClient = lambda: FakeFC()
+    monkeypatch.setitem(sys.modules, "feilian_client", fake_mod)
+    monkeypatch.setattr(dev_collector, "_fc", None)
+
+    conn = _conn()
+    payload = [
+        {
+            "email": "fresh@keep.com",
+            "dept": "unknown",
+            "model": "m",
+            "input_tokens": 7,
+            "output_tokens": 8,
+        }
+    ]
+    dev_collector._upsert_hermes_usage(conn, "hermes", "Hermes", "2026-06-12", payload)
+    filled = dev_collector._autofill_people_for_emails(conn, ["fresh@keep.com"])
+
+    assert filled == 1
+    assert conn.execute("SELECT name,dept FROM people WHERE email='fresh@keep.com'").fetchone() == (
+        "新用户",
+        "Keep/客户服务中心/客服运营部/运营支持组",
+    )
+
+
+def test_hermes_people_autofill_is_best_effort_when_feilian_fails(monkeypatch):
+    class BrokenFC:
+        def root_department_id(self):
+            raise RuntimeError("feilian unavailable")
+
+    fake_mod = types.ModuleType("feilian_client")
+    fake_mod.FeilianClient = lambda: BrokenFC()
+    monkeypatch.setitem(sys.modules, "feilian_client", fake_mod)
+    monkeypatch.setattr(dev_collector, "_fc", None)
+
+    conn = _conn()
+    filled = dev_collector._autofill_people_for_emails(conn, ["fresh@keep.com"])
+
+    assert filled == 0
+    assert conn.execute("SELECT COUNT(*) FROM people").fetchone() == (0,)
+
+
+def test_hermes_people_autofill_preserves_existing_complete_people_row(monkeypatch):
+    class FakeFC:
+        def root_department_id(self):
+            return "root"
+
+        def user_by_email(self, email, root):
+            return {
+                "full_name": "错误覆盖",
+                "avatar": "https://avatar.example/wrong.png",
+                "department_path": "Keep/错误部门",
+            }
+
+    fake_mod = types.ModuleType("feilian_client")
+    fake_mod.FeilianClient = lambda: FakeFC()
+    monkeypatch.setitem(sys.modules, "feilian_client", fake_mod)
+    monkeypatch.setattr(dev_collector, "_fc", None)
+
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO people(email,name,avatar,dept) VALUES(?,?,?,?)",
+        ("known@keep.com", "已知用户", "https://avatar.example/known.png", "Keep/技术平台部/基础技术部/IT 组"),
+    )
+    filled = dev_collector._autofill_people_for_emails(conn, ["known@keep.com"])
+
+    assert filled == 0
+    assert conn.execute("SELECT name,dept FROM people WHERE email='known@keep.com'").fetchone() == (
+        "已知用户",
+        "Keep/技术平台部/基础技术部/IT 组",
+    )
+
+
+def test_usage_report_commits_usage_before_people_autofill(monkeypatch, tmp_path):
+    db_path = tmp_path / "tok.db"
+    monkeypatch.setattr(dev_collector, "DB", str(db_path))
+    observed = []
+
+    def observe_committed_usage(_conn, _records):
+        with sqlite3.connect(str(db_path)) as probe:
+            observed.append(
+                probe.execute(
+                    "SELECT total FROM usage WHERE email=? AND client=? AND period_type=?",
+                    ("fresh@keep.com", "Hermes", "day"),
+                ).fetchone()
+            )
+        return 0
+
+    monkeypatch.setattr(dev_collector, "_autofill_people_for_hermes_records", observe_committed_usage)
+    server = dev_collector.ThreadingHTTPServer(("127.0.0.1", 0), dev_collector.H)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+    try:
+        payload = {
+            "source": "hermes",
+            "client": "Hermes",
+            "date": "2026-06-12",
+            "records": [
+                {"email": "fresh@keep.com", "model": "m", "input_tokens": 7, "output_tokens": 8}
+            ],
+        }
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/usage/report" % server.server_address[1],
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": "Bearer devtoken", "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10).read()
+    finally:
+        server.shutdown()
+        thread.join(timeout=3)
+
+    assert observed == [(15,)]
