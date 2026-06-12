@@ -583,3 +583,38 @@ def test_tool_board_lifetime_mode_matches_person_board_proration(dc, monkeypatch
     expected = round(120.0 * (12 / 30), 4)
     assert _row_by_email(person, "lt@keep.com")["cost"] == expected
     assert _row_by_email(board, "lt@keep.com")["cost"] == expected
+
+
+def test_hermes_board_includes_legacy_lowercase_client_rows(dc, monkeypatch, tmp_path):
+    """历史小写 client='hermes' 行须出现在 Hermes 榜并参与推断(大小写不敏感过滤)。"""
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "h-low@keep.com", "HLow", "Keep/平台/基础")
+        _insert_usage_model(dc, conn, "ref@keep.com", "Keep/平台/基础", "2026-06-09",
+                            "litellm", "LiteLLM", "glm-5.1", 1000, 10.0, 1)
+        _insert_usage_model(dc, conn, "h-low@keep.com", "Keep/平台/基础", "2026-06-10",
+                            "subscription", "hermes", "tencent/glm-5.1", 2000, 0.0, 1)
+        conn.commit()
+        rows = _leaderboard(dc, conn, {"client": ["Hermes"], "days": ["30"]})
+    finally:
+        conn.close()
+    low = _row_by_email(rows, "h-low@keep.com")
+    assert low is not None and low["cost"] == 20.0 and low.get("cost_est") is True
+
+
+def test_cursor_client_leaderboard_keeps_cost_unchanged(dc, monkeypatch, tmp_path):
+    """SPEC: Cursor 榜不动 —— client=Cursor 的榜不并入订阅费(真 UI 用 /v1/cursor)。"""
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_people(conn, "cur@keep.com", "Cur", "Keep/平台/基础")
+        _insert_sub(conn, "cur@keep.com", "cursor", "standard", 40.0, "Cur", "Keep/平台/基础")
+        _insert_usage(dc, conn, "cur@keep.com", "Keep/平台/基础", "2026-06-10", "subscription", "Cursor", 100, 0.0, 1)
+        conn.commit()
+        rows = _leaderboard(dc, conn, {"client": ["Cursor"], "days": ["30"]})
+    finally:
+        conn.close()
+    assert _row_by_email(rows, "cur@keep.com")["cost"] == 0

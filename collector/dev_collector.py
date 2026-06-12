@@ -1378,8 +1378,10 @@ class H(BaseHTTPRequestHandler):
         today = datetime.date.today()
         # 可选 ?client=Claude Code|Codex CLI|... → 只统计该工具(Claude 榜 / Codex 榜复用此端点)
         cli = (qs.get("client") or [None])[0]
-        cli_clause = " AND u.client = ?" if cli else ""
-        params2 = list(params) + ([cli] if cli else [])
+        # client 匹配大小写不敏感:历史上 Hermes 有上报端写过小写 'hermes',
+        # 精确匹配会把这些行漏出榜单与推断;归一(ingest 已做)之前的存量也要能查到。
+        cli_clause = " AND lower(u.client) = ?" if cli else ""
+        params2 = list(params) + ([cli.lower()] if cli else [])
         # agent key 用量(source=litellm_agent)不进个人榜 —— 单独走 /v1/agent_leaderboard
         rows = conn.execute("""
             SELECT u.email, MAX(u.dept),
@@ -1441,7 +1443,7 @@ class H(BaseHTTPRequestHandler):
                     FROM usage u
                     WHERE u.period_type='day' AND u.source != 'litellm_agent'%s
                     GROUP BY u.email
-                """ % cli_clause, ([cli] if cli else [])).fetchall():
+                """ % cli_clause, ([cli.lower()] if cli else [])).fetchall():
                     if mr[0] and mr[1]:
                         cli_window_start[mr[0]] = mr[1]
             for row in result:
@@ -1452,7 +1454,7 @@ class H(BaseHTTPRequestHandler):
                 row["subs"] = _single_tool_subs(subs_by_email, row["email"], sub_tool, win_s, win_e)
                 # 工具榜价格:该工具订阅费按席位区间摊销并入本榜 cost(订阅 token 无网关
                 # 实销,此前恒为 $0 —— sunke 2026-06-13"codex/claude 榜没有价格")。
-                if sub_tool:
+                if sub_tool in ("claude", "codex"):   # SPEC: Cursor 榜(/v1/cursor)不动
                     fee_total = 0.0
                     for seat in subs_by_email.get(row["email"], []):
                         if (seat.get("tool") or "").lower() != sub_tool:
@@ -1546,7 +1548,7 @@ class H(BaseHTTPRequestHandler):
                     FROM usage u
                     WHERE u.period_type='day' AND u.source != 'litellm_agent'%s
                     GROUP BY u.email
-                """ % cli_clause, ([cli] if cli else [])).fetchall():
+                """ % cli_clause, ([cli.lower()] if cli else [])).fetchall():
                     if mr[0] and mr[1]:
                         usage_window_start[mr[0]] = mr[1]
 
