@@ -1837,6 +1837,16 @@ class H(BaseHTTPRequestHandler):
             idle_params,
         ).fetchall()
         usage_emails = {r[0] for r in idle_usage_rows if r and r[0]}
+        # 飞书 AI 权益点数也算「用量」：纯飞书用户已进个人榜(计订阅费),不能同时再算闲置。
+        try:
+            frng, fparams = _feishu_range(qs)
+            for fr in conn.execute(
+                    "SELECT DISTINCT email FROM feishu_member WHERE credits>0%s" % frng,
+                    fparams).fetchall():
+                if fr and fr[0]:
+                    usage_emails.add(fr[0])
+        except Exception:
+            pass  # feishu_member 表不存在(未启用飞书采集)时跳过
         today_d = datetime.date.today()
         idle_win_s, idle_win_e = _window_dates(qs) or (today_d, today_d)
         idle_fee_by = {}

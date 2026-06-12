@@ -198,8 +198,9 @@ LITELLM_BASE_URL=... LITELLM_MASTER_KEY=... python3 collector/litellm_collector.
   （reason=`no_match`|`ambiguous`），看板治理区显示「订阅名单未归位 N 人」待人工补映射。
 
 **归属与个人榜「公司实付」**：个人榜成本列改为公司实付 = 网关实销
-（`usage_daily.source in ('api','litellm')`）+ 该人当前订阅月费之和 × 区间覆盖的自然月数
-（整月口径，不按天折算）。订阅制工具 token 量照常展示，但不再按 API 牌价折算成成本。
+（`usage_daily.source in ('api','litellm')`）+ Σ每席位 月费 ×（查询窗口∩席位 [开通,删除] 区间
+的按天摊销系数：逐自然月「重叠天数/该月总天数」累加）。日均模式下成本折算仅个人榜。
+订阅制工具 token 量照常展示，但不再按 API 牌价折算成成本。
 
 **运行方式**：`subscriptions-sync.timer` 每天 03:30 触发 `subscriptions_sync.py`（oneshot），
 与 collector 同宿主、纯标准库（py3.6.8）、直接写 `tok.db`，免 HTTP 自上报、不依赖孙可 Mac。
