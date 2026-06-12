@@ -224,17 +224,18 @@ def test_feishu_email_fallback_resolves_dept():
     rec = {"email": "luorui@keep.com", "name": "罗锐",
            "dept": "Keep/运动消费事业部/智能装备交付部/品控部/品质组", "avatar": "av"}
     fmap = {"luorui@keep.com": rec}   # 只有 email 索引(模拟 user_id 不匹配)
-    captured = {"single": {}, "detail": [{"items": [{
+    captured = {"single": {}, "detail_by_day": {"2026-06-01": [{"items": [{
         "entityInfo": {"externalID": "luorui", "entityName": "罗锐",
                        "entityExtraInfo": {"department": {"entityName": "品质组"}}},
         "featureUsageMap": {"aily_credits": 300},
-    }]}]}
+    }]}]}}
     F.EMAIL_DOMAIN = "keep.com"
-    out = F.normalize(captured, "2026-06-01", fmap)
+    out = F.normalize(captured, ("2026-06-01", "2026-06-01"), fmap)
     m = out["members"][0]
     assert m["email"] == "luorui@keep.com"
     assert m["dept"] == "Keep/运动消费事业部/智能装备交付部/品控部/品质组"  # 不再是裸「品质组」
     assert m["name"] == "罗锐"
+    assert m["usage_date"] == "2026-06-01"   # 按天:每行带 usage_date
 
 
 def test_feishu_load_map_survives_pagination_failure(monkeypatch):
@@ -269,13 +270,13 @@ def test_feishu_no_match_keeps_bare_fallback():
     import feishu_collector as F
     F = importlib.reload(F)
     fmap = {}   # 飞连完全查不到
-    captured = {"single": {}, "detail": [{"items": [{
+    captured = {"single": {}, "detail_by_day": {"2026-06-01": [{"items": [{
         "entityInfo": {"externalID": "ghost", "entityName": "幽灵",
                        "entityExtraInfo": {"department": {"entityName": "某外部组"}}},
         "featureUsageMap": {"aily_credits": 5},
-    }]}]}
+    }]}]}}
     F.EMAIL_DOMAIN = "keep.com"
-    out = F.normalize(captured, "2026-06-01", fmap)
+    out = F.normalize(captured, ("2026-06-01", "2026-06-01"), fmap)
     m = out["members"][0]
     assert m["dept"] == "某外部组"   # 查不到时退回飞书裸名(不崩)
 

@@ -306,7 +306,7 @@ async function load(){
     j('/v1/leaderboard?client='+encodeURIComponent('Codex CLI')+qa),
     j('/v1/leaderboard?client='+encodeURIComponent('LiteLLM')+qa),   // LiteLLM 榜=网关用量(已自动排除 agent)
     j('/v1/leaderboard?client='+encodeURIComponent('Hermes')+qa),
-    j('/v1/feishu'+(SHOW_DEPARTED?'?show_departed=1':''))   // 飞书 AI 权益(独立周期快照,不受 token 时间范围影响)
+    j('/v1/feishu'+q)   // 飞书 AI 权益(按天聚合,随所选区间走;无区间默认近 30 天)
   ]);
   CACHE.person=lb.leaderboard||[]; CACHE.team=tm.teams||[];
   CACHE.tool=tool.breakdown||[]; CACHE.model=model.breakdown||[]; CACHE.cursor=cur.cursor||[];
@@ -367,7 +367,7 @@ function renderFeishu(){
   }).join('');
   $('list').innerHTML='<div class="fs-unit">单位：点（飞书 AI 权益消耗，与上方 token 为不同口径，不加总）</div>'+
     '<div class="fs-quota">'+quotaHTML+'</div>'+
-    '<div class="fs-sec-t">个人消耗榜<span class="fs-per">当前周期起 '+(d.period_start||'—')+'</span></div>'+body;
+    '<div class="fs-sec-t">个人消耗榜<span class="fs-per">'+(d.period_start||'—')+' ~ '+(d.period_end||'—')+'</span></div>'+body;
 }
 // 部门榜:把扁平的 dept/depth 节点(后端已 roll-up)建成可折叠下钻树。
 // 名称只显示路径最后一段,层级靠缩进;主指标=人均(tokens/people,叠加日均口径);

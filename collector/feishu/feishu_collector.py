@@ -27,7 +27,7 @@ import json
 import os
 import sys
 import urllib.request
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 
 from playwright.sync_api import sync_playwright
 
@@ -51,10 +51,27 @@ DRY = os.environ.get("FEISHU_DRY_RUN") == "1"
 FEISHU_HOST = os.environ.get("FEISHU_HOST", "your-tenant.feishu.cn")  # 你的飞书企业域名
 BASE = f"https://{FEISHU_HOST}/admin/aibilling"
 PAGE_LIMIT = int(os.environ.get("FEISHU_PAGE_LIMIT", "100"))
+# 逐日采集:每跑一次回采「最近 N 天」(含昨天),按天幂等覆盖 → 自动补前几天失败的缺口。
+# 首次回填历史传大值(如 30);日常 launchd 跑默认小值即可。
+BACKFILL_DAYS = int(os.environ.get("FEISHU_BACKFILL_DAYS", "7"))
+CST = timezone(timedelta(hours=8))  # 飞书租户时区(Asia/Shanghai),单日窗口按它切
 
 
 def log(*a):
     print(*a, flush=True)
+
+
+def target_days():
+    """要采的日期列表:昨天往前 BACKFILL_DAYS 天(升序)。不采今天(当天数据未结算完)。"""
+    today = datetime.now(CST).date()
+    return [today - timedelta(days=k) for k in range(BACKFILL_DAYS, 0, -1)]
+
+
+def day_window(d):
+    """某天 → (startTime, endTime) unix 秒,覆盖 00:00:00~23:59:59 (CST)。"""
+    s = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=CST)
+    e = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=CST)
+    return int(s.timestamp()), int(e.timestamp())
 
 
 # ---------------- 飞连身份(可选) ----------------
@@ -167,37 +184,47 @@ def collect():
         page.get_by_role("button", name="查询").first.click(timeout=2000)
         page.wait_for_timeout(4500)
 
-        # 3) 全员翻页:用抓到的头 ctx.request.post 直翻(稳、快,6 次拿全)。
+        # 3) 全员逐人 —— 按天采:对每个目标日改写 startTime/endTime 单日窗口,offset 翻页拿全。
+        #    单日窗口已实测可行(接口认窗口,返回当天增量,非累计)。按天落库 → 部门/个人榜可按
+        #    区间聚合,不再是「一坨月累计」死快照;按天幂等覆盖自动补前几天失败的缺口。
         if login_broken["v"]:
             raise SystemExit("LOGIN_EXPIRED")
-        total = max([int(d.get("total") or 0) for d in captured["detail"]] or [0])
+        captured["detail"] = []        # UI 暖会话那次(10/页,混窗口)丢掉,统一用 API 按天全量翻
+        captured["detail_by_day"] = {}
         if not req_tpl["headers"] or not req_tpl["body"]:
-            log("⚠️ 没抓到明细请求模板,退回仅首页");
+            log("⚠️ 没抓到明细请求模板,无法按天采集")
         else:
             base = json.loads(req_tpl["body"])
             h = {k: v for k, v in req_tpl["headers"].items()
                  if k.lower() not in ("content-length", "host", ":authority", "accept-encoding", "connection")}
             base["limit"] = PAGE_LIMIT
-            captured["detail"] = []  # 丢掉 UI 的 10/页,统一用 API 全量翻
-            off = 0
-            while off < (total or 1):
-                base["offset"] = off
-                r = ctx.request.post(f"https://{FEISHU_HOST}/suite/admin/ai_center/usage_detail/entity",
-                                     data=json.dumps(base), headers=h)
-                if r.status != 200:
-                    log(f"翻页 offset={off} HTTP {r.status},停止"); break
-                jd = r.json()
-                if jd.get("code") not in (0, None):
-                    log(f"翻页 offset={off} code={jd.get('code')},停止"); break
-                d = jd.get("data") or {}
-                captured["detail"].append(d)
-                total = total or int(d.get("total") or 0)
-                got = len(d.get("items", []))
-                off += PAGE_LIMIT
-                if got < PAGE_LIMIT:
-                    break
-            n = sum(len(d.get("items", [])) for d in captured["detail"])
-            log(f"全员翻页:total={total},取得 {n} 行")
+            days = target_days()
+            log(f"按天采集 {len(days)} 天:{days[0]} ~ {days[-1]}")
+            for d in days:
+                iso = d.isoformat()
+                s, e = day_window(d)
+                base["startTime"], base["endTime"] = s, e
+                pages, off, total = [], 0, None
+                while off < (total or 1):
+                    base["offset"] = off
+                    r = ctx.request.post(
+                        f"https://{FEISHU_HOST}/suite/admin/ai_center/usage_detail/entity",
+                        data=json.dumps(base), headers=h)
+                    if r.status != 200:
+                        log(f"  {iso} offset={off} HTTP {r.status},停止该天"); break
+                    jd = r.json()
+                    if jd.get("code") not in (0, None):
+                        log(f"  {iso} offset={off} code={jd.get('code')},停止该天"); break
+                    dd = jd.get("data") or {}
+                    pages.append(dd)
+                    total = int(dd.get("total") or 0) if total is None else total
+                    got = len(dd.get("items", []))
+                    off += PAGE_LIMIT
+                    if got < PAGE_LIMIT:
+                        break
+                captured["detail_by_day"][iso] = pages
+                n = sum(len(x.get("items", [])) for x in pages)
+                log(f"  {iso}: {n} 人 (total={total})")
 
         # 4) 补抓每个功能的额度明细:overview/feature 在总览页只对默认功能(AI_credits)发了一次,
         #    aily 的 used/remain 缺 → 用 header-replay 按 featureKey 各拉一次(同会话 x-csrf-token 复用)。
@@ -278,32 +305,36 @@ def normalize(captured, period, fmap):
                                              "credits": pt.get("amount") or 0,
                                              "user_count": int(ucount.get(str(bt)) or 0)})
 
-    # 全员逐人
-    seen = set()
-    for d in captured["detail"]:
-        for it in d.get("items", []):
-            ei = it.get("entityInfo") or {}
-            uid = ei.get("externalID") or ""
-            if not uid or uid in seen:
-                continue
-            seen.add(uid)
-            ident = (fmap or {}).get(uid) or {}
-            email = ident.get("email") or f"{uid}@{EMAIL_DOMAIN}"
-            # user_id 没命中飞连 → 用合成 email 再查飞连(同 dict email 索引)，拿真实部门
-            if not ident and fmap:
-                ident = fmap.get(email.lower()) or {}
-                if ident.get("name"):
-                    email = ident.get("email") or email
-            name = ident.get("name") or ei.get("entityName") or uid
-            dept = ident.get("dept")
-            if not dept or dept == "unknown":
-                dept = ((ei.get("entityExtraInfo") or {}).get("department") or {}).get("entityName") or "unknown"
-            avatar = ident.get("avatar") or ei.get("avatarURL") or ""
-            fm = it.get("featureUsageMap") or {}
-            for fk, credits in fm.items():
-                out["members"].append({"email": email, "name": name, "dept": dept,
-                                       "avatar": avatar, "entity_id": ei.get("entityID") or "",
-                                       "feature_key": fk, "credits": credits or 0})
+    # 全员逐人(按天):detail_by_day = {usage_date: [data, ...]}。每天内按 uid 去重,
+    # 每条 member 行带 usage_date → 看板按天落库、按区间聚合。
+    by_day = captured.get("detail_by_day") or {}
+    for iso, pages in by_day.items():
+        seen = set()
+        for d in pages:
+            for it in d.get("items", []):
+                ei = it.get("entityInfo") or {}
+                uid = ei.get("externalID") or ""
+                if not uid or uid in seen:
+                    continue
+                seen.add(uid)
+                ident = (fmap or {}).get(uid) or {}
+                email = ident.get("email") or f"{uid}@{EMAIL_DOMAIN}"
+                # user_id 没命中飞连 → 用合成 email 再查飞连(同 dict email 索引)，拿真实部门
+                if not ident and fmap:
+                    ident = fmap.get(email.lower()) or {}
+                    if ident.get("name"):
+                        email = ident.get("email") or email
+                name = ident.get("name") or ei.get("entityName") or uid
+                dept = ident.get("dept")
+                if not dept or dept == "unknown":
+                    dept = ((ei.get("entityExtraInfo") or {}).get("department") or {}).get("entityName") or "unknown"
+                avatar = ident.get("avatar") or ei.get("avatarURL") or ""
+                fm = it.get("featureUsageMap") or {}
+                for fk, credits in fm.items():
+                    out["members"].append({"email": email, "name": name, "dept": dept,
+                                           "avatar": avatar, "entity_id": ei.get("entityID") or "",
+                                           "feature_key": fk, "credits": credits or 0,
+                                           "usage_date": iso})
     return out
 
 
@@ -327,7 +358,8 @@ def main():
             return 3
         raise
     payload = normalize(captured, period, fmap)
-    log(f"归一化:周期 {payload['period_start']}~{payload['period_end']} | "
+    days = sorted({m.get("usage_date") for m in payload["members"] if m.get("usage_date")})
+    log(f"归一化:按天 {len(days)} 天 {days[0] if days else '-'}~{days[-1] if days else '-'} | "
         f"全员 {len({m['email'] for m in payload['members']})} 人 / {len(payload['members'])} 行 | "
         f"额度 {len(payload['quota'])} | 趋势 {len(payload['trend'])} 行")
     if DRY:

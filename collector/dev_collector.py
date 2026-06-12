@@ -269,13 +269,20 @@ def db():
     # 1000 人规模:按 period_type 过滤是所有榜单的公共前缀,建索引避免全表扫
     c.execute("CREATE INDEX IF NOT EXISTS idx_usage_period ON usage(period_type, total DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_usage_dept ON usage(period_type, dept)")
-    # 飞书 AI 权益(独立三表,单位=「点」credits,与 token 不加总;一周期一快照,主键覆盖)
+    # 飞书 AI 权益(独立三表,单位=「点」credits,与 token 不加总)。
+    # feishu_member 按天落库(主键含 usage_date),部门/个人榜按区间聚合 —— 不再是月累计死快照。
+    # 迁移:旧表主键含 period_start、无 usage_date(月快照,语义不兼容),检测到就 DROP 重建,
+    # 由采集器回填最近 N 天补回(孙可 2026-06-12)。
+    _cols = [r[1] for r in c.execute("PRAGMA table_info(feishu_member)").fetchall()]
+    if _cols and "usage_date" not in _cols:
+        c.execute("DROP TABLE feishu_member")
     c.execute("""CREATE TABLE IF NOT EXISTS feishu_member(
         email TEXT NOT NULL, name TEXT DEFAULT '', dept TEXT DEFAULT 'unknown',
         feature_key TEXT NOT NULL, credits REAL NOT NULL DEFAULT 0,
-        period_start TEXT NOT NULL, period_end TEXT DEFAULT '',
+        usage_date TEXT NOT NULL,
         avatar TEXT DEFAULT '', entity_id TEXT DEFAULT '',
-        PRIMARY KEY(email, feature_key, period_start))""")
+        PRIMARY KEY(email, feature_key, usage_date))""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_feishu_member_date ON feishu_member(usage_date)")
     c.execute("""CREATE TABLE IF NOT EXISTS feishu_quota(
         feature_key TEXT NOT NULL, quota REAL DEFAULT 0, used REAL DEFAULT 0,
         remain REAL DEFAULT 0, period_start TEXT NOT NULL, period_end TEXT DEFAULT '',
@@ -883,12 +890,15 @@ class H(BaseHTTPRequestHandler):
         conn = db()
         nm = nq = nt = 0
         for m in p.get("members") or []:
+            ud = m.get("usage_date") or ""
+            if not ud:                       # 按天上报必须带 usage_date,缺了跳过不写脏
+                continue
             conn.execute(
                 "INSERT OR REPLACE INTO feishu_member"
-                "(email,name,dept,feature_key,credits,period_start,period_end,avatar,entity_id)"
-                " VALUES(?,?,?,?,?,?,?,?,?)",
+                "(email,name,dept,feature_key,credits,usage_date,avatar,entity_id)"
+                " VALUES(?,?,?,?,?,?,?,?)",
                 (m.get("email") or "", m.get("name") or "", m.get("dept") or "unknown",
-                 m.get("feature_key") or "", float(m.get("credits") or 0), ps, pe,
+                 m.get("feature_key") or "", float(m.get("credits") or 0), ud,
                  m.get("avatar") or "", m.get("entity_id") or "")); nm += 1
         for q in p.get("quota") or []:
             conn.execute(
@@ -1063,14 +1073,35 @@ class H(BaseHTTPRequestHandler):
             conn.close()
 
     def _feishu(self, conn, qs):
-        """飞书 AI 权益(独立板块,单位=点)。返回最新周期快照:额度盘 + 全员逐人榜
-        + 部门榜 + 趋势。?show_departed=1 才纳入离职。"""
-        period = conn.execute("SELECT max(period_start) FROM feishu_member").fetchone()[0]
-        if not period:
-            return self._send(200, {"period_start": None, "quota": [], "members": [],
-                                    "dept": [], "trend": []})
-        pe = (conn.execute("SELECT max(period_end) FROM feishu_member WHERE period_start=?",
-                           (period,)).fetchone() or [""])[0]
+        """飞书 AI 权益(独立板块,单位=点)。按天聚合:额度盘 + 全员逐人榜 + 部门榜 + 趋势。
+        区间同 token 榜:?from=&to= 或 ?days=N(usage_date 上过滤);默认近 30 天(=回填窗口)。
+        ?show_departed=1 才纳入离职。"""
+        # usage_date 区间(默认近 30 天)。复用全局 from/to/days 语义,但落在 usage_date 列上。
+        frm = (qs.get("from") or [None])[0]
+        to = (qs.get("to") or [None])[0]
+        raw = (qs.get("days") or [None])[0]
+        conds, params = [], []
+        if frm or to:
+            if frm:
+                conds.append("usage_date >= ?"); params.append(frm)
+            if to:
+                conds.append("usage_date <= ?"); params.append(to)
+        else:
+            try:
+                days = int(raw) if raw not in (None, "", "all") else 30
+            except (TypeError, ValueError):
+                days = 30
+            if days and days > 0:
+                cutoff = (datetime.date.today() - datetime.timedelta(days=days - 1)).isoformat()
+                conds.append("usage_date >= ?"); params.append(cutoff)
+        rng = (" AND " + " AND ".join(conds)) if conds else ""
+
+        span = conn.execute("SELECT min(usage_date), max(usage_date) FROM feishu_member"
+                            " WHERE 1=1%s" % rng, params).fetchone()
+        if not span or not span[0]:
+            return self._send(200, {"period_start": None, "period_end": None, "quota": [],
+                                    "members": [], "dept": [], "trend": []})
+        ps, pe = span[0], span[1]
         sd = _show_departed(qs)
         dep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
         quota = [{"feature_key": r[0], "quota": r[1] or 0, "used": r[2] or 0, "remain": r[3] or 0}
@@ -1084,19 +1115,19 @@ class H(BaseHTTPRequestHandler):
                        "SELECT email, MAX(name), MAX(dept), MAX(avatar), SUM(credits),"
                        " SUM(CASE WHEN feature_key='AI_credits' THEN credits ELSE 0 END),"
                        " SUM(CASE WHEN feature_key='aily_credits' THEN credits ELSE 0 END)"
-                       " FROM feishu_member WHERE period_start=?%s"
-                       " GROUP BY email HAVING SUM(credits)>0 ORDER BY SUM(credits) DESC" % dep,
-                       (period,)).fetchall()]
+                       " FROM feishu_member WHERE 1=1%s%s"
+                       " GROUP BY email HAVING SUM(credits)>0 ORDER BY SUM(credits) DESC" % (rng, dep),
+                       params).fetchall()]
         dept = [{"dept": r[0] or "unknown", "credits": r[1] or 0, "people": r[2] or 0}
                 for r in conn.execute(
                     "SELECT dept, SUM(credits), COUNT(DISTINCT email) FROM feishu_member"
-                    " WHERE period_start=?%s GROUP BY dept ORDER BY SUM(credits) DESC" % dep,
-                    (period,)).fetchall()]
+                    " WHERE 1=1%s%s GROUP BY dept ORDER BY SUM(credits) DESC" % (rng, dep),
+                    params).fetchall()]
         trend = [{"usage_date": r[0], "biz_type": r[1], "credits": r[2] or 0, "user_count": r[3] or 0}
                  for r in conn.execute(
                      "SELECT usage_date,biz_type,credits,user_count FROM feishu_trend"
                      " ORDER BY usage_date").fetchall()]
-        self._send(200, {"period_start": period, "period_end": pe,
+        self._send(200, {"period_start": ps, "period_end": pe,
                          "quota": quota, "members": members, "dept": dept, "trend": trend})
 
     def _leaderboard(self, conn, qs):
