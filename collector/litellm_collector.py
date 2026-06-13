@@ -75,9 +75,14 @@ for _pair in os.environ.get("LITELLM_KEY_OWNER_MAP", "").split(","):
         if _a.strip() and _e.strip():
             KEY_OWNER_OVERRIDES[_a.strip()] = _e.strip()
 # 探针/测试 key 别名前缀:命中即从所有榜单剔除(无真人 owner 的调试噪音)。逗号分隔。
-PROBE_ALIAS_PREFIXES = tuple(
-    p.strip() for p in os.environ.get("LITELLM_PROBE_ALIAS_PREFIXES", "tmp-").split(",")
-    if p.strip())
+# 内置前缀无论 env 如何配置都生效 —— recon/压测工具批量打的合成 key
+# (litellm-key:recon-benchmark-* / recon-benchmark-probe-*)绝无真人 owner,
+# 只在 /user/daily/activity 留 token 噪音、污染个人榜(2026-06-14 根治)。env 可再追加。
+_BUILTIN_PROBE_PREFIXES = ("tmp-", "recon-benchmark", "recon-")
+PROBE_ALIAS_PREFIXES = tuple(dict.fromkeys(
+    _BUILTIN_PROBE_PREFIXES + tuple(
+        p.strip() for p in os.environ.get("LITELLM_PROBE_ALIAS_PREFIXES", "").split(",")
+        if p.strip())))
 # 精确匹配的探针别名:已删、查不到任何真人 owner 的服务号/短别名垃圾 key(逗号分隔,整名相等才剔除)。
 # 区别于 PROBE_ALIAS_PREFIXES(前缀匹配);精确匹配避免误伤(如 'ss' 不会连累 'ss-platform')。
 PROBE_ALIASES = set(

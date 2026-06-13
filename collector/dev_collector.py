@@ -1394,7 +1394,8 @@ class H(BaseHTTPRequestHandler):
                     ORDER BY rl.reported_at DESC LIMIT 1),
                    MAX(p.dept)
             FROM usage u LEFT JOIN people p ON p.email = u.email
-            WHERE %s AND u.source != 'litellm_agent'%s%s
+            WHERE %s AND u.source != 'litellm_agent'
+              AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s
             GROUP BY u.email
             HAVING SUM(u.total) > 0
             ORDER BY SUM(u.total) DESC
@@ -1404,7 +1405,8 @@ class H(BaseHTTPRequestHandler):
         for cr in conn.execute("""
             SELECT u.email, u.client, SUM(u.total)
             FROM usage u
-            WHERE %s AND u.source != 'litellm_agent'%s%s
+            WHERE %s AND u.source != 'litellm_agent'
+              AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s
             GROUP BY u.email, u.client
         """ % (where, dep_clause, cli_clause), params2).fetchall():
             comp.setdefault(cr[0], []).append({"client": cr[1], "tokens": cr[2] or 0})

@@ -333,6 +333,24 @@ def test_personal_board_prefers_people_dept_over_bare_litellm_alias(dc):
     assert lb["郭东霖"]["dept"] == "Keep/技术平台部/推荐搜索部/算法组"
 
 
+def test_personal_board_excludes_synthetic_litellm_key_identities(dc):
+    """根因(2026-06-14 排障): 无真人 owner 的 LiteLLM key 会被合成成 litellm-key:<alias>
+    /litellm-user:<uid> 假身份(部门 unknown), 污染个人榜。个人榜查询须过滤这两类合成 email。
+    采集端 recon-* 已剔除, 这是 display 层兜底: 既清存量, 也挡任何未来合成身份。
+    修复前会失败(合成行会出现在榜上)。"""
+    conn = _full_conn()
+    _usage_row(conn, "guo@keep.com", "Keep/技术平台部", "litellm", "LiteLLM", 5000)
+    conn.execute("INSERT INTO people VALUES('guo@keep.com','郭东霖','','Keep/技术平台部')")
+    _usage_row(conn, "litellm-key:recon-benchmark-1781357315", "unknown", "litellm", "LiteLLM", 36000)
+    _usage_row(conn, "litellm-key:recon-benchmark-probe-1781355161", "unknown", "litellm", "LiteLLM", 615)
+    _usage_row(conn, "litellm-user:u-ghost", "unknown", "litellm", "LiteLLM", 1400)
+    conn.commit()
+    lb = _leaderboard(dc, conn)
+    assert "郭东霖" in lb, "真人邮箱不得被误伤"
+    synthetic = [n for n in lb if n.startswith("litellm-key:") or n.startswith("litellm-user:")]
+    assert synthetic == [], "合成身份 litellm-key:/litellm-user: 不该出现在个人榜"
+
+
 def test_personal_board_falls_back_to_usage_dept_when_no_people_path(dc):
     """people.dept 空(飞连未解析)→ 退回 usage.dept(裸别名),不崩。"""
     conn = _full_conn()
