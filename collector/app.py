@@ -398,6 +398,7 @@ async def leaderboard(days: int = 30, source: str = "all", limit: int = 100) -> 
                COALESCE(SUM(cost_usd) FILTER (WHERE source IN ('api','litellm')), 0) AS gateway_cost
         FROM usage_daily
         WHERE usage_date >= current_date - ($1::int - 1)
+          AND email NOT LIKE 'litellm-key:%' AND email NOT LIKE 'litellm-user:%'
         {where_source}
         GROUP BY email, dept
         ORDER BY total_tokens DESC, email ASC;

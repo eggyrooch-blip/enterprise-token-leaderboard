@@ -78,7 +78,9 @@ for _pair in os.environ.get("LITELLM_KEY_OWNER_MAP", "").split(","):
 # 内置前缀无论 env 如何配置都生效 —— recon/压测工具批量打的合成 key
 # (litellm-key:recon-benchmark-* / recon-benchmark-probe-*)绝无真人 owner,
 # 只在 /user/daily/activity 留 token 噪音、污染个人榜(2026-06-14 根治)。env 可再追加。
-_BUILTIN_PROBE_PREFIXES = ("tmp-", "recon-benchmark", "recon-")
+# 注意:只钉死 `recon-benchmark`(覆盖 -probe- 变体),不放宽到裸 `recon-` ——
+# 避免误伤未来可能存在的真人/agent key(应 codex review 收窄,守住 SPEC 范围)。
+_BUILTIN_PROBE_PREFIXES = ("tmp-", "recon-benchmark")
 PROBE_ALIAS_PREFIXES = tuple(dict.fromkeys(
     _BUILTIN_PROBE_PREFIXES + tuple(
         p.strip() for p in os.environ.get("LITELLM_PROBE_ALIAS_PREFIXES", "").split(",")

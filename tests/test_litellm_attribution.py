@@ -88,15 +88,15 @@ def test_tmp_prefix_filtered_even_with_real_owner(L):
 
 def test_recon_benchmark_keys_filtered_even_when_env_omits_them(L):
     """根因(2026-06-14 排障): recon/压测工具批量打的 recon-benchmark-* 合成 key
-    无真人 owner, 之前掉成 litellm-key:recon-benchmark-* 污染个人榜。recon-benchmark / recon-
-    现为内置探针前缀, 无论 LITELLM_PROBE_ALIAS_PREFIXES 配的是什么(此 fixture 只配了 'tmp-')
-    都无条件剔除。修复前会失败(这些行会进 lifetime 榜)。"""
+    无真人 owner, 之前掉成 litellm-key:recon-benchmark-* 污染个人榜。recon-benchmark(含 -probe-
+    变体)现为内置探针前缀, 无论 LITELLM_PROBE_ALIAS_PREFIXES 配的是什么(此 fixture 只配了 'tmp-')
+    都无条件剔除。收窄到 recon-benchmark(不放宽到裸 recon-)避免误伤真人/agent key。
+    修复前会失败(这些行会进 lifetime 榜)。"""
     results = [_activity("recon-benchmark-1781357315"),
-               _activity("recon-benchmark-probe-1781355161"),
-               _activity("recon-scan-001")]
+               _activity("recon-benchmark-probe-1781355161")]
     rows, _n, _a, stats = L.build_rows(results, {}, {}, "", {})
-    assert _lifetime_emails(rows) == set(), "recon-benchmark/recon-* 探针 key 不该进任何榜"
-    assert stats["probe_skipped"] == 3
+    assert _lifetime_emails(rows) == set(), "recon-benchmark-* 探针 key 不该进任何榜"
+    assert stats["probe_skipped"] == 2
 
 
 def test_fetch_daily_activity_reads_all_pages(L, monkeypatch):
