@@ -41,3 +41,22 @@ def test_hermes_board_is_standalone_after_litellm():
     assert "CACHE.hermes=hm.leaderboard||[]" in html
     assert "CUR==='hermes'" in html
     assert "'Hermes'" in html[html.index("var TOOL_COLOR="):html.index("function toolColor")]
+
+
+def test_seg_ctl_capsules_render_adjacent_not_split():
+    """根因(2026-06-14): 两个 .seg-ctl 胶囊(总量/日均 与 按Token/按消费)各自带
+    margin-left:auto, flex 把空闲空间平分到两个 auto margin → 胶囊间被撑开一大段空隙。
+    修复: 基础 .seg-ctl 不再带 margin-left:auto; 只有 #metricCtl 吃 auto 把整组推右,
+    两胶囊靠父级 .tabs 的 flex gap 分隔(不另加 margin, 否则和 gap 叠加成 16px)。"""
+    html = DASHBOARD.read_text(encoding="utf-8")
+    seg_rule = re.search(r"\.seg-ctl\{([^}]*)\}", html)
+    assert seg_rule, "应有 .seg-ctl 基础样式"
+    assert "margin-left:auto" not in seg_rule.group(1), (
+        "基础 .seg-ctl 不得带 margin-left:auto, 否则两个胶囊各自 auto 被撑开"
+    )
+    assert re.search(r"#metricCtl\{[^}]*margin-left:auto", html), (
+        "只有 #metricCtl 吃 margin-left:auto 把整组推到最右"
+    )
+    assert not re.search(r"#sortCtl\{[^}]*margin-left", html), (
+        "#sortCtl 不应另加 margin-left(会和父级 .tabs gap 叠加), 靠 flex gap 分隔即可"
+    )

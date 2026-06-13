@@ -97,11 +97,11 @@
   .sub-logo.ended::before,.sub-badge.ended::before{content:'';position:absolute;inset:0;border-radius:999px;border:1px solid rgba(92,99,112,.22);pointer-events:none}
   .sub-logo.ended::after,.sub-badge.ended::after{content:'';position:absolute;left:2px;right:2px;top:50%;height:1.5px;background:rgba(92,99,112,.68);border-radius:999px;transform:rotate(-18deg);pointer-events:none}
   /* metric (总量/日均) + sort (按Token/按消费) segmented controls, sit right of tabs row.
-     只有第一个胶囊吃 margin-left:auto 把整组推到最右;后续胶囊用固定小 gap 紧挨着它,
-     否则两个胶囊各自 margin-left:auto 会被 flex 撑开一段空隙(2026-06-14 修)。 */
+     只有第一个胶囊(#metricCtl)吃 margin-left:auto 把整组推到最右;两胶囊之间靠父级
+     .tabs 的 flex gap(8px)分隔即可 —— 不再各自 margin-left:auto(会被 flex 撑开一大段
+     空隙),也不另加 margin(会和 .tabs gap 叠加成 16px)(2026-06-14 修)。 */
   .seg-ctl{display:inline-flex;background:#fff;border-radius:999px;padding:3px;gap:2px;align-items:center}
   #metricCtl{margin-left:auto}
-  #sortCtl{margin-left:8px}
   .seg-ctl button{height:30px;padding:0 14px;border:0;border-radius:999px;background:transparent;color:var(--t2);font:600 13px var(--font);cursor:pointer}
   .seg-ctl button.on{background:var(--green);color:#fff}
   .track{flex:1;height:8px;border-radius:999px;background:var(--div);overflow:hidden;min-width:60px}
