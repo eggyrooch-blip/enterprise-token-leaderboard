@@ -267,3 +267,44 @@ def test_app_sub_overlap_proration(monkeypatch):
             "subs": [],
         },
     ]
+
+
+class _SyntheticFilteringConn(_FakeConn):
+    """模拟 Postgres 真的执行 email NOT LIKE 'litellm-key:%'/'litellm-user:%':
+    仅当 SQL 带该 guard 时才过滤合成行。guard 被删→合成行漏出→断言失败(回归保护)。"""
+
+    @staticmethod
+    def _is_synth(email):
+        return str(email).startswith("litellm-key:") or str(email).startswith("litellm-user:")
+
+    async def fetch(self, sql, *args):
+        rows = await super().fetch(sql, *args)
+        if "FROM usage_daily" in sql and "GROUP BY email, dept" in sql \
+                and "NOT LIKE 'litellm-key:%'" in sql and "NOT LIKE 'litellm-user:%'" in sql:
+            return [r for r in rows if not self._is_synth(r["email"])]
+        return rows
+
+
+def test_app_leaderboard_and_dashboard_exclude_synthetic_litellm_identities(monkeypatch):
+    """根因(2026-06-14): 无真人 owner 的 litellm-key:/litellm-user: 合成身份污染个人榜。
+    app.py(Postgres 模式)的 /v1/leaderboard 与 /dashboard 个人表都须过滤。
+    guard 缺失会让合成行漏到 web 榜→本测试失败(codex review 抓出的第二条 web 路径)。"""
+    app = _load_app_module(monkeypatch)
+    usage_rows = [
+        {"email": "guo@keep.com", "dept": "Keep/技术平台部", "t": 5000, "c": 1.0, "api": 5000, "sub": 0},
+        {"email": "litellm-key:recon-benchmark-1781357315", "dept": "unknown",
+         "t": 36000, "c": 1.0, "api": 36000, "sub": 0},
+        {"email": "litellm-user:u-ghost", "dept": "unknown", "t": 1400, "c": 0.0, "api": 1400, "sub": 0},
+    ]
+    conn = _SyntheticFilteringConn([], usage_rows, dept_rows=[], tool_rows=[], code_rows=[])
+    monkeypatch.setattr(app, "_pool", _FakePool(conn))
+
+    lb = asyncio.run(app.leaderboard(days=30, source="all", limit=100))
+    emails = [r["email"] for r in lb["ranking"]]
+    assert "guo@keep.com" in emails, "真人不得被误伤"
+    assert not any(_SyntheticFilteringConn._is_synth(e) for e in emails), \
+        "/v1/leaderboard 不该出现 litellm-key:/litellm-user: 合成身份"
+
+    html = asyncio.run(app.dashboard(days=30))
+    assert "litellm-key:recon-benchmark-1781357315" not in html, "/dashboard 个人表不该渲染合成身份"
+    assert "litellm-user:u-ghost" not in html

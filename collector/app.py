@@ -454,6 +454,7 @@ async def dashboard(days: int = 30) -> str:
                    COALESCE(SUM(total_tokens) FILTER (WHERE source='api'), 0) api,
                    COALESCE(SUM(total_tokens) FILTER (WHERE source='subscription'), 0) sub
             FROM usage_daily WHERE usage_date >= {window}
+              AND email NOT LIKE 'litellm-key:%' AND email NOT LIKE 'litellm-user:%'
             GROUP BY email, dept""", days)
         depts = await conn.fetch(f"""
             SELECT dept, SUM(total_tokens) t, ROUND(SUM(cost_usd),2) c
