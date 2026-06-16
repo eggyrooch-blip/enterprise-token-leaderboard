@@ -58,6 +58,11 @@ for _ENV in (os.path.join(_d, "..", "pipeline", ".env"), os.path.join(_d, ".env"
                 _k, _v = _l.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
 
+# AI 用接口 /v1/ai/usage 的身份归一: 传登录名(无 @)时补的公司域名。
+# 与 subscriptions_sync 的 user_id@keep.com 约定一致; 可用 env(或 .env)覆盖。
+# 必须在上面的 .env 载入之后求值, 否则 .env 里的 AI_EMAIL_DOMAIN 被忽略。
+AI_EMAIL_DOMAIN = os.environ.get("AI_EMAIL_DOMAIN", "keep.com").strip().lstrip("@").lower()
+
 # 飞书 AI 权益计费常量 —— 必须在 .env 加载之后取值,否则 .env 里的覆盖不生效。
 PACKAGE_CNY = _env_float("FEISHU_PACKAGE_CNY", 99000)
 PACKAGE_POINTS = _env_float("FEISHU_PACKAGE_POINTS", 2000000)
@@ -1295,6 +1300,8 @@ class H(BaseHTTPRequestHandler):
                 return self._breakdown(conn, qs)
             if path == "/v1/trend":
                 return self._trend(conn, qs)
+            if path == "/v1/ai/usage":
+                return self._ai_usage(conn, qs)
             if path == "/v1/meta":
                 return self._meta(conn)
             if path == "/v1/governance_metrics":
@@ -1312,6 +1319,7 @@ class H(BaseHTTPRequestHandler):
                     "GET  /v1/teams                  (部门/team 榜)",
                     "GET  /v1/breakdown?by=client|client_model|client_provider_model|model  (工具/模型榜)",
                     "GET  /v1/trend?email=...        (月度趋势)",
+                    "GET  /v1/ai/usage?user=&days=N  (AI 用: 单人汇总+每日明细; 不传 user 出整榜)",
                     "GET  /v1/governance_metrics     (大厂治理指标可计算项)",
                     "GET  /v1/raw",
                 ],
@@ -1849,6 +1857,119 @@ class H(BaseHTTPRequestHandler):
                 "cost": round(r[7] or 0, 4), "messages": r[8] or 0,
             })
         self._send(200, {"email": email_filter, "trend": result})
+
+    def _ai_usage(self, conn, qs):
+        """AI 用的无鉴权用量接口(喂 Hermes skill)。
+
+        - ?user=<邮箱或登录名>&days=N → 该人窗口内 token 汇总 + 每日明细。
+          登录名(无 @)自动补公司域名 AI_EMAIL_DOMAIN; 邮箱大小写不敏感。
+          查不到人不报 404, 返回 total_tokens=0/daily=[]。
+        - 不传 user → 窗口内按人 SUM 的 top-N 个人榜(默认排除离职; ?show_departed=1 纳入)。
+        窗口语义同其它榜: ?from=&to= 优先, 否则 ?days=N, 默认近 30 天(只看 day 桶)。
+        每条响应都带数据时间戳: latest_usage_date(数据覆盖到哪天) + generated_at。
+        """
+        frm = (qs.get("from") or [None])[0]
+        to = (qs.get("to") or [None])[0]
+        days = None
+        if not (frm or to):
+            raw = (qs.get("days") or [None])[0]
+            try:
+                days = int(raw) if raw not in (None, "", "all") else 30
+            except (TypeError, ValueError):
+                days = 30
+            if days <= 0:
+                days = 30
+            to = datetime.date.today().isoformat()
+            frm = (datetime.date.today() - datetime.timedelta(days=days - 1)).isoformat()
+
+        def clause(pfx=""):
+            cs = ["%speriod_type='day'" % pfx]
+            if frm:
+                cs.append("%speriod >= ?" % pfx)
+            if to:
+                cs.append("%speriod <= ?" % pfx)
+            return " AND ".join(cs)
+
+        params = []
+        if frm:
+            params.append(frm)
+        if to:
+            params.append(to)
+
+        latest = conn.execute(
+            "SELECT max(period) FROM usage WHERE period_type='day'").fetchone()[0]
+        now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+        window = {"days": days, "from": frm, "to": to}
+
+        sd = _show_departed(qs)
+        departed_lower = {(e or "").lower() for e in _departed_set(conn)}
+        # 个人榜口径(同 _leaderboard): agent key 用量与合成身份(litellm-key/-user)不进个人统计。
+        PERSON_FILTER = (" AND source != 'litellm_agent'"
+                         " AND email NOT LIKE 'litellm-key:%%'"
+                         " AND email NOT LIKE 'litellm-user:%%'")
+
+        user = (qs.get("user") or [None])[0]
+        if user and user.strip():
+            email = user.strip().lower()
+            if "@" not in email:
+                email = "%s@%s" % (email, AI_EMAIL_DOMAIN)
+            is_departed = email in departed_lower
+            if is_departed and not sd:
+                # 默认排除离职: 显式查到离职者返回 0, 带 departed 标记(非静默 0); ?show_departed=1 才出数。
+                daily, total_tokens, cost_usd = [], 0, 0
+            else:
+                rows = conn.execute(
+                    "SELECT period, SUM(total), SUM(cost) FROM usage "
+                    "WHERE %s%s AND lower(email)=? GROUP BY period ORDER BY period"
+                    % (clause(), PERSON_FILTER),
+                    params + [email]).fetchall()
+                daily = [{"date": r[0], "total_tokens": r[1] or 0,
+                          "cost_usd": round(r[2] or 0, 4)} for r in rows]
+                total_tokens = sum(d["total_tokens"] for d in daily)
+                cost_usd = round(sum((r[2] or 0) for r in rows), 4)
+            prof = conn.execute(
+                "SELECT MAX(name), MAX(dept) FROM people WHERE lower(email)=?",
+                (email,)).fetchone()
+            name = (prof[0] if prof else None) or None
+            dept = (prof[1] if prof else None) or None
+            if not dept:
+                d2 = conn.execute(
+                    "SELECT MAX(dept) FROM usage WHERE lower(email)=?",
+                    (email,)).fetchone()
+                dept = (d2[0] if d2 and d2[0] else None) or None
+            return self._send(200, {
+                "user": email, "name": name, "dept": dept,
+                "departed": is_departed,
+                "window": window,
+                "total_tokens": total_tokens, "cost_usd": cost_usd,
+                "daily": daily,
+                "latest_usage_date": latest, "generated_at": now_iso,
+            })
+
+        # 不传 user → 整张个人榜(窗口内按人 SUM), 默认排除离职 + agent/合成身份。
+        dep = _departed_filter(sd, "u.")
+        try:
+            limit = int((qs.get("limit") or ["50"])[0])
+        except (TypeError, ValueError):
+            limit = 50
+        if limit <= 0:
+            limit = 50
+        rows = conn.execute(
+            "SELECT u.email, MAX(p.name), COALESCE(MAX(p.dept), MAX(u.dept)), "
+            "SUM(u.total), SUM(u.cost) "
+            "FROM usage u LEFT JOIN people p ON p.email = u.email "
+            "WHERE %s AND u.source != 'litellm_agent' "
+            "AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s "
+            "GROUP BY u.email HAVING SUM(u.total) > 0 "
+            "ORDER BY SUM(u.total) DESC LIMIT ?" % (clause("u."), dep),
+            params + [limit]).fetchall()
+        ranking = [{"user": r[0], "name": r[1] or None, "dept": r[2] or None,
+                    "total_tokens": r[3] or 0, "cost_usd": round(r[4] or 0, 4)}
+                   for r in rows]
+        self._send(200, {
+            "window": window, "count": len(ranking), "ranking": ranking,
+            "latest_usage_date": latest, "generated_at": now_iso,
+        })
 
     def _governance_metrics(self, conn, qs=None):
         """当前 SQLite 能直接计算的治理指标。
