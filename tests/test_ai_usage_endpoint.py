@@ -160,6 +160,60 @@ def test_board_excludes_departed_synthetic_agent_and_cost_not_inflated(tmp_path,
     assert any(r["user"] == "bob@keep.com" for r in with_dep["ranking"])
 
 
+def test_days_window_matches_leaderboard_with_future_row(tmp_path, monkeypatch):
+    """评审 #4: ?days=N 在两接口须是同一窗口(无人为 to 上界)。
+
+    种一条 future-dated(明天) day 行: leaderboard?days=7 无上界会纳入它,
+    ai/usage?days=7 也必须纳入(否则窗口漂)。断言两接口对 alice 的 total 相等。
+    """
+    def seed_future(conn):
+        _seed(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO usage(email,dept,period_type,period,source,client,provider,model,"
+            "input,output,cache_read,cache_write,reasoning,total,cost,messages) "
+            "VALUES('alice@keep.com','Keep/IT','day',?,'litellm','LiteLLM','','m',0,0,0,0,0,7,0.1,0)",
+            (D(-1),))  # 明天
+        conn.commit()
+    monkeypatch.setattr(dev_collector, "DB", str(tmp_path / "tok.db"))
+    monkeypatch.setattr(dev_collector, "AI_EMAIL_DOMAIN", "keep.com")
+    conn = dev_collector.db(); seed_future(conn); conn.close()
+    server = dev_collector.ThreadingHTTPServer(("127.0.0.1", 0), dev_collector.H)
+    thread = threading.Thread(target=server.serve_forever); thread.daemon = True; thread.start()
+    try:
+        ai = _get(server, "/v1/ai/usage?user=alice&days=7")
+        lb = _get(server, "/v1/leaderboard?days=7")
+    finally:
+        server.shutdown(); thread.join(timeout=3)
+    alice = next(r for r in lb["leaderboard"] if r["email"] == "alice@keep.com")
+    assert ai["total_tokens"] == alice["tokens"]            # 同一窗口 → 相等
+    assert ai["total_tokens"] == sum(d["total_tokens"] for d in ai["daily"])
+
+
+def test_case_duplicate_email_total_equals_daily(tmp_path, monkeypatch):
+    """评审 #4: DB 里同一人有大小写不同的 email 行时, total 与 daily 不能分裂。"""
+    def seed_dup(conn):
+        conn.execute("CREATE TABLE IF NOT EXISTS people(email TEXT PRIMARY KEY, name TEXT, avatar TEXT, dept TEXT)")
+        for em, tot in [("Alice@keep.com", 100), ("alice@keep.com", 50)]:
+            conn.execute(
+                "INSERT OR REPLACE INTO usage(email,dept,period_type,period,source,client,provider,model,"
+                "input,output,cache_read,cache_write,reasoning,total,cost,messages) "
+                "VALUES(?,?,'day',?,'litellm','LiteLLM','','m',0,0,0,0,0,?,0.1,0)",
+                (em, "Keep/IT", D(0), tot))
+        conn.commit()
+    monkeypatch.setattr(dev_collector, "DB", str(tmp_path / "tok.db"))
+    monkeypatch.setattr(dev_collector, "AI_EMAIL_DOMAIN", "keep.com")
+    conn = dev_collector.db(); seed_dup(conn); conn.close()
+    server = dev_collector.ThreadingHTTPServer(("127.0.0.1", 0), dev_collector.H)
+    thread = threading.Thread(target=server.serve_forever); thread.daemon = True; thread.start()
+    try:
+        ai = _get(server, "/v1/ai/usage?user=alice&days=7")
+    finally:
+        server.shutdown(); thread.join(timeout=3)
+    # 两条大小写不同的行都归到同一人: total=150, 且 == daily 之和(不分裂)。
+    assert ai["total_tokens"] == 150
+    assert sum(d["total_tokens"] for d in ai["daily"]) == ai["total_tokens"]
+
+
 def test_single_user_departed_default_zero_with_flag(tmp_path, monkeypatch):
     server, thread = _serve(tmp_path, monkeypatch)
     try:

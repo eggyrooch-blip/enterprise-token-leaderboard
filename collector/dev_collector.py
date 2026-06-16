@@ -1943,56 +1943,39 @@ class H(BaseHTTPRequestHandler):
         窗口语义同其它榜: ?from=&to= 优先, 否则 ?days=N, 默认近 30 天(只看 day 桶)。
         每条响应都带数据时间戳: latest_usage_date(数据覆盖到哪天) + generated_at。
         """
-        frm = (qs.get("from") or [None])[0]
-        to = (qs.get("to") or [None])[0]
-        days = None
-        if not (frm or to):
-            raw = (qs.get("days") or [None])[0]
-            try:
-                days = int(raw) if raw not in (None, "", "all") else 30
-            except (TypeError, ValueError):
-                days = 30
-            if days <= 0:
-                days = 30
-            to = datetime.date.today().isoformat()
-            frm = (datetime.date.today() - datetime.timedelta(days=days - 1)).isoformat()
-
-        def clause(pfx=""):
-            cs = ["%speriod_type='day'" % pfx]
-            if frm:
-                cs.append("%speriod >= ?" % pfx)
-            if to:
-                cs.append("%speriod <= ?" % pfx)
-            return " AND ".join(cs)
-
-        params = []
-        if frm:
-            params.append(frm)
-        if to:
-            params.append(to)
-
         latest = conn.execute(
             "SELECT max(period) FROM usage WHERE period_type='day'").fetchone()[0]
         now_iso = datetime.datetime.now().isoformat(timespec="seconds")
-        window = {"days": days, "from": frm, "to": to}
 
-        sd = _show_departed(qs)
         departed_lower = {(e or "").lower() for e in _departed_set(conn)}
         PERSON_FILTER = (" AND source != 'litellm_agent'"
                          " AND email NOT LIKE 'litellm-key:%%'"
                          " AND email NOT LIKE 'litellm-user:%%'")
 
-        # 唯一口径: 直接复用 /v1/leaderboard 的个人榜计算(网关实销 + 飞书点 + 订阅费窗口摊销),
-        # 不再自写一套(2026-06-16 评审教训: 自写漏了订阅摊销, 与前端漂)。
-        # 用显式 from/to 把窗口钉死, 避免无参时 _range_clause 退化成 lifetime 而与本接口 days=30 不一致。
+        # 唯一口径: 直接复用 /v1/leaderboard 的个人榜计算(网关实销 + 飞书点 + 订阅费窗口摊销)。
+        # 窗口用与 leaderboard 完全相同的 _range_clause 语义 —— 不自加 to 上界, 否则 days=N 两接口
+        # 会因 future-dated 行而漂(评审 #4)。无任何窗口参数时默认近 30 天(leaderboard 默认 lifetime)。
         eqs = dict(qs)
-        if frm:
-            eqs["from"] = [frm]
-        if to:
-            eqs["to"] = [to]
+        if not (qs.get("from") or qs.get("to") or qs.get("days")):
+            eqs["days"] = ["30"]
         board = _personal_board_rows(conn, eqs)
-        by_email = {(r["email"] or "").lower(): r for r in board}
+        dwhere, dparams = _range_clause(eqs, "")     # 个人榜同一窗口子句(每日明细复用)
         frng, fparams = _feishu_range(eqs)
+
+        # 展示用窗口(days=N 无上界 → from=cutoff, to=null, 与 leaderboard 一致)。
+        frm_q = (qs.get("from") or [None])[0]
+        to_q = (qs.get("to") or [None])[0]
+        days_disp = None
+        if not (frm_q or to_q):
+            raw = (qs.get("days") or [None])[0]
+            try:
+                days_disp = int(raw) if raw not in (None, "", "all") else 30
+            except (TypeError, ValueError):
+                days_disp = 30
+            if days_disp <= 0:
+                days_disp = 30
+            frm_q = (datetime.date.today() - datetime.timedelta(days=days_disp - 1)).isoformat()
+        window = {"days": days_disp, "from": frm_q, "to": to_q}
 
         user = (qs.get("user") or [None])[0]
         if user and user.strip():
@@ -2000,8 +1983,9 @@ class H(BaseHTTPRequestHandler):
             if "@" not in email:
                 email = "%s@%s" % (email, AI_EMAIL_DOMAIN)
             is_departed = email in departed_lower
-            row = by_email.get(email)
-            if row is None:
+            # 大小写不敏感聚合: 防 DB 里同一人有大小写不同的 email 行 → total 与 daily 分裂(评审 #4)。
+            matches = [r for r in board if (r["email"] or "").lower() == email]
+            if not matches:
                 # 不在榜(窗口内无用量, 或默认被排除的离职者) → 0/空; departed 标记仍给。
                 prof = conn.execute(
                     "SELECT MAX(name), MAX(dept) FROM people WHERE lower(email)=?",
@@ -2010,17 +1994,17 @@ class H(BaseHTTPRequestHandler):
                 dept = (prof[1] if prof else None) or None
                 total_tokens, cost_usd, daily = 0, 0, []
             else:
-                total_tokens = row["tokens"]
-                cost_usd = row["cost"]
-                name = row.get("name") or None
-                dept = row.get("dept") or None
-                # 每日明细(token 维度: 当天 SUM(total) + 飞书点, 和 == total_tokens 自洽)。
+                total_tokens = sum(r["tokens"] or 0 for r in matches)
+                cost_usd = round(sum(float(r["cost"] or 0) for r in matches), 4)
+                name = matches[0].get("name") or None
+                dept = matches[0].get("dept") or None
+                # 每日明细(token 维度: 当天 SUM(total) + 飞书点, 和 == total_tokens 自洽; 同窗口子句)。
                 # cost 含订阅月费摊销, 不可按天拆, 故 daily 只给 token。
                 day_map = {}
                 for p, tot in conn.execute(
                         "SELECT period, SUM(total) FROM usage WHERE %s%s AND lower(email)=? "
-                        "GROUP BY period" % (clause(), PERSON_FILTER),
-                        params + [email]).fetchall():
+                        "GROUP BY period" % (dwhere, PERSON_FILTER),
+                        dparams + [email]).fetchall():
                     day_map[p] = day_map.get(p, 0) + (tot or 0)
                 for ud, cr in conn.execute(
                         "SELECT usage_date, SUM(credits) FROM feishu_member "
