@@ -207,11 +207,16 @@ def test_case_duplicate_email_total_equals_daily(tmp_path, monkeypatch):
     thread = threading.Thread(target=server.serve_forever); thread.daemon = True; thread.start()
     try:
         ai = _get(server, "/v1/ai/usage?user=alice&days=7")
+        lb = _get(server, "/v1/leaderboard?days=7")
     finally:
         server.shutdown(); thread.join(timeout=3)
     # 两条大小写不同的行都归到同一人: total=150, 且 == daily 之和(不分裂)。
     assert ai["total_tokens"] == 150
     assert sum(d["total_tokens"] for d in ai["daily"]) == ai["total_tokens"]
+    # 评审 #5: 个人榜也合并大小写变体 → 只有一行 150, 与 ai/usage 分毫一致(不是 100/50 两行)。
+    alice_rows = [r for r in lb["leaderboard"] if (r["email"] or "").lower() == "alice@keep.com"]
+    assert len(alice_rows) == 1
+    assert alice_rows[0]["tokens"] == ai["total_tokens"] == 150
 
 
 def test_single_user_departed_default_zero_with_flag(tmp_path, monkeypatch):

@@ -1107,6 +1107,24 @@ def _personal_board_rows(conn, qs):
             continue
         row["cost"] = round(float(row["cost"] or 0) + fee_total, 4)
 
+    # email 本应大小写不敏感: 把同一人(lower(email) 相同)的大小写变体行合并成一行,
+    # 否则同一人会被拆成多行(token/cost 分裂)。生产 0 例(防御性; 也让 /v1/ai/usage 单人聚合
+    # 与本榜分毫一致, 2026-06-16 评审)。
+    merged = {}
+    for row in result:
+        k = (row["email"] or "").lower()
+        m = merged.get(k)
+        if m is None:
+            merged[k] = row
+            continue
+        m["tokens"] = (m["tokens"] or 0) + (row["tokens"] or 0)
+        m["cost"] = round(float(m["cost"] or 0) + float(row["cost"] or 0), 4)
+        m["messages"] = (m.get("messages") or 0) + (row.get("messages") or 0)
+        m["composition"].extend(row["composition"])
+        if row.get("feishu_credits"):
+            m["feishu_credits"] = (m.get("feishu_credits") or 0) + row["feishu_credits"]
+    result = list(merged.values())
+
     for row in result:
         tot = row["tokens"] or 0
         for x in row["composition"]:
