@@ -53,6 +53,14 @@ def _seed(conn):
     conn.execute(
         "INSERT OR REPLACE INTO feishu_member(email,name,dept,feature_key,credits,usage_date,avatar,entity_id) "
         "VALUES('alice@keep.com','爱丽丝','Keep/IT/规范部门','AI_credits',12.0,?,'','')", (D(0),))
+    # 订阅: alice codex $25/月(无界席位), 个人榜 cost 按窗口摊销叠加 —— 评审发现的关键路径。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS subscriptions(email TEXT, tool TEXT, seat INTEGER DEFAULT 1, "
+        "tier TEXT DEFAULT 'standard', monthly_fee_usd REAL DEFAULT 0, display_name TEXT DEFAULT '', "
+        "dept TEXT DEFAULT '', start_date TEXT, end_date TEXT, synced_at TEXT, PRIMARY KEY(email,tool,seat))")
+    conn.execute(
+        "INSERT OR REPLACE INTO subscriptions(email,tool,seat,tier,monthly_fee_usd,synced_at) "
+        "VALUES('alice@keep.com','codex',1,'standard',25.0,?)", (D(0),))
     conn.execute("CREATE TABLE IF NOT EXISTS departed(email TEXT PRIMARY KEY, reason TEXT, marked_at TEXT)")
     conn.execute("INSERT OR REPLACE INTO departed(email,reason,marked_at) VALUES('bob@keep.com','left',?)", (D(30),))
     conn.commit()
@@ -87,29 +95,30 @@ def test_parity_single_user_matches_leaderboard_row(tmp_path, monkeypatch):
     alice = next(r for r in lb["leaderboard"] if r["email"] == "alice@keep.com")
     # token 含飞书点: 300+100+50 + 12 = 462
     assert ai["total_tokens"] == alice["tokens"] == 462
-    # cost = 网关实销(2.5+1.0=3.5) + 飞书点成本(12×USD_PER_POINT), 订阅牌价 999 不计入
-    assert abs(ai["cost_usd"] - alice["cost"]) < 0.01
-    assert ai["cost_usd"] < 5.0   # 远小于订阅牌价 999, 证明牌价没被算进去
+    # cost = 网关实销(3.5) + 飞书点成本 + 订阅费窗口摊销 —— 必须与前端那一行分毫一致
+    assert abs(ai["cost_usd"] - alice["cost"]) < 0.001
+    assert ai["cost_usd"] < 100   # 含 $25 订阅摊销但远小于订阅牌价 999, 证明牌价没被算进去
 
 
-def test_cost_excludes_subscription_notional(tmp_path, monkeypatch):
+def test_cost_excludes_subscription_per_token_notional(tmp_path, monkeypatch):
     server, thread = _serve(tmp_path, monkeypatch)
     try:
         ai = _get(server, "/v1/ai/usage?user=alice&days=30")
     finally:
         server.shutdown(); thread.join(timeout=3)
-    # 网关 3.5 + 飞书 12×0.006923≈0.083 ≈ 3.58, 绝不是 999+ 量级
-    assert 3.4 < ai["cost_usd"] < 4.0
+    # 含网关 3.5 + 飞书点 + 订阅 $25 摊销(~25), 但绝不含订阅制按 token 的牌价 999。
+    assert 3.5 <= ai["cost_usd"] < 100
 
 
-def test_daily_sums_to_total(tmp_path, monkeypatch):
+def test_daily_tokens_sum_to_total(tmp_path, monkeypatch):
     server, thread = _serve(tmp_path, monkeypatch)
     try:
         ai = _get(server, "/v1/ai/usage?user=alice&days=30")
     finally:
         server.shutdown(); thread.join(timeout=3)
+    # daily 只给 token(cost 含订阅月费不可按天拆); token 各天之和 == total。
     assert sum(d["total_tokens"] for d in ai["daily"]) == ai["total_tokens"]
-    assert abs(sum(d["cost_usd"] for d in ai["daily"]) - ai["cost_usd"]) < 0.01
+    assert all("cost_usd" not in d for d in ai["daily"])
 
 
 def test_email_and_loginname_are_equivalent(tmp_path, monkeypatch):
@@ -147,7 +156,7 @@ def test_board_excludes_departed_synthetic_agent_and_cost_not_inflated(tmp_path,
     assert not any(e.startswith("litellm-key:") or e.startswith("litellm-user:") for e in emails)
     alice = next(r for r in board["ranking"] if r["user"] == "alice@keep.com")
     assert alice["total_tokens"] == 462
-    assert alice["cost_usd"] < 5.0       # 牌价没被算进 board
+    assert alice["cost_usd"] < 100       # 含订阅摊销但牌价 999 没被算进 board
     assert any(r["user"] == "bob@keep.com" for r in with_dep["ranking"])
 
 

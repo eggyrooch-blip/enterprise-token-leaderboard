@@ -976,6 +976,146 @@ def _dept_headcount_map():
 # ---------------------------------------------------------------------------
 # HTTP 处理
 # ---------------------------------------------------------------------------
+def _personal_board_rows(conn, qs):
+    """个人榜「按人」计算 —— 唯一口径, /v1/leaderboard 与 /v1/ai/usage 共用(2026-06-16)。
+
+    token = SUM(total) + 飞书权益点(1点=1token);
+    cost  = 公司实付 = 网关实销 SUM(CASE source IN('litellm','api') THEN cost)
+                      + 飞书点成本(credits×USD_PER_POINT)
+                      + 订阅费按「窗口∩席位区间」摊销(_interval_fraction)。
+    过滤 litellm_agent + 合成身份 + 离职(默认)。已并入飞书(含纯飞书行)并按 tokens 降序。
+    不接受 ?client(那是工具榜, 仍在 _leaderboard 内)。
+    """
+    where, params = _range_clause(qs, "u.")
+    sd = _show_departed(qs)
+    dep_clause = _departed_filter(sd, "u.")
+    departed = _departed_set(conn)
+    cost_start, cost_end = _cost_window(qs)
+    today = datetime.date.today()
+    rows = conn.execute("""
+        SELECT u.email, MAX(u.dept),
+               SUM(u.input), SUM(u.output), SUM(u.cache_read), SUM(u.cache_write),
+               SUM(u.reasoning), SUM(u.total),
+               SUM(CASE WHEN u.source IN ('litellm','api') THEN u.cost ELSE 0 END),
+               SUM(u.messages),
+               MAX(p.name), MAX(p.avatar),
+               (SELECT rl.via FROM report_log rl WHERE rl.email = u.email
+                ORDER BY rl.reported_at DESC LIMIT 1),
+               MAX(p.dept)
+        FROM usage u LEFT JOIN people p ON p.email = u.email
+        WHERE %s AND u.source != 'litellm_agent'
+          AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s
+        GROUP BY u.email
+        HAVING SUM(u.total) > 0
+        ORDER BY SUM(u.total) DESC
+    """ % (where, dep_clause), params).fetchall()
+    comp = {}
+    for cr in conn.execute("""
+        SELECT u.email, u.client, SUM(u.total)
+        FROM usage u
+        WHERE %s AND u.source != 'litellm_agent'
+          AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s
+        GROUP BY u.email, u.client
+    """ % (where, dep_clause), params).fetchall():
+        comp.setdefault(cr[0], []).append({"client": cr[1], "tokens": cr[2] or 0})
+    result = []
+    by_email = {}
+    for r in rows:
+        row = {
+            "email": r[0], "dept": _to_keep(r[13]) or _normalize_dept_path(r[1]),
+            "input": r[2] or 0, "output": r[3] or 0,
+            "cache_read": r[4] or 0, "cache_write": r[5] or 0,
+            "reasoning": r[6] or 0, "tokens": r[7] or 0,
+            "cost": round(r[8] or 0, 4), "messages": r[9] or 0,
+            "name": r[10] or (r[0] or "").split("@")[0],
+            "avatar": r[11] or "",
+            "via": r[12] or "",
+            "departed": r[0] in departed,
+            "composition": list(comp.get(r[0], [])),
+            "subs": [],
+        }
+        result.append(row)
+        by_email[r[0]] = row
+
+    subs_by_email = load_subscriptions(conn)
+
+    # 飞书 AI 权益并入(1 点 = 1 token; 纯飞书用户也建行)。
+    frng, fparams = _feishu_range(qs)
+    fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
+    for fr in conn.execute(
+            "SELECT email, MAX(name), MAX(dept), MAX(avatar), SUM(credits)"
+            " FROM feishu_member WHERE 1=1%s%s"
+            " GROUP BY email HAVING SUM(credits)>0" % (frng, fdep), fparams).fetchall():
+        fem, fname, fdept, favatar, credits = fr[0], fr[1], fr[2], fr[3], fr[4] or 0
+        if credits <= 0:
+            continue
+        row = by_email.get(fem)
+        if row is None:
+            pr = conn.execute("SELECT dept,name,avatar FROM people WHERE email=?",
+                              (fem,)).fetchone()
+            dept = (_to_keep(pr[0]) if pr and pr[0] else None) \
+                or _to_keep(fdept) or _normalize_dept_path(fdept) or "unknown"
+            row = {"email": fem, "dept": dept,
+                   "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+                   "reasoning": 0, "tokens": 0, "cost": 0, "messages": 0,
+                   "name": (pr[1] if pr and pr[1] else None) or fname or fem.split("@")[0],
+                   "avatar": (pr[2] if pr and pr[2] else None) or favatar or "",
+                   "via": "", "departed": fem in departed, "composition": [],
+                   "subs": []}
+            result.append(row)
+            by_email[fem] = row
+        row["tokens"] = (row["tokens"] or 0) + credits
+        row["feishu_credits"] = credits
+        fc = round(credits * FEISHU_USD_PER_POINT, 4)
+        row["feishu_cost"] = fc
+        row["cost"] = round(float(row["cost"] or 0) + credits * FEISHU_USD_PER_POINT, 4)
+        row["composition"].append({"client": "飞书AI权益", "tokens": credits})
+
+    # 订阅费按窗口摊销并入个人榜 cost。
+    usage_window_start = {}
+    if cost_start is None:
+        for mr in conn.execute("""
+            SELECT u.email, MIN(u.period)
+            FROM usage u
+            WHERE u.period_type='day' AND u.source != 'litellm_agent'
+            GROUP BY u.email
+        """).fetchall():
+            if mr[0] and mr[1]:
+                usage_window_start[mr[0]] = mr[1]
+
+    def _fee_window(email):
+        if cost_start is not None and cost_end is not None:
+            return cost_start, cost_end
+        return usage_window_start.get(email) or today, today
+
+    for row in result:
+        win_s, win_e = _fee_window(row["email"])
+        kept = []
+        fee_total = 0.0
+        for sub in subs_by_email.get(row["email"], []):
+            if cost_start is None and usage_window_start.get(row["email"]) is None and \
+                    not sub.get("start") and not sub.get("end"):
+                frac = 1.0
+            else:
+                frac = _interval_fraction(win_s, win_e, sub.get("start"), sub.get("end"))
+            if frac <= 0:
+                continue
+            kept.append(sub)
+            fee_total += float(sub.get("fee") or 0) * frac
+        row["subs"] = _group_subs(kept)
+        if not kept:
+            continue
+        row["cost"] = round(float(row["cost"] or 0) + fee_total, 4)
+
+    for row in result:
+        tot = row["tokens"] or 0
+        for x in row["composition"]:
+            x["pct"] = round(x["tokens"] / tot * 100, 1) if tot else 0
+        row["composition"].sort(key=lambda x: x["tokens"], reverse=True)
+    result.sort(key=lambda x: x["tokens"] or 0, reverse=True)
+    return result
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -1375,9 +1515,14 @@ class H(BaseHTTPRequestHandler):
         payload.update(billing)
         self._send(200, payload)
 
+
     def _leaderboard(self, conn, qs):
         """按人聚合(区间 ?days=N 或全部),join people 取中文姓名+头像+完整部门路径。
-        同一人当天 Cursor+Claude+Codex 的 token 自动求和(GROUP BY email)。"""
+        同一人当天 Cursor+Claude+Codex 的 token 自动求和(GROUP BY email)。
+        无 ?client → 个人榜走共用 _personal_board_rows(与 /v1/ai/usage 同口径)。"""
+        cli = (qs.get("client") or [None])[0]
+        if not cli:
+            return self._send(200, {"leaderboard": _personal_board_rows(conn, qs)})
         where, params = _range_clause(qs, "u.")
         sd = _show_departed(qs)
         dep_clause = _departed_filter(sd, "u.")
@@ -1516,77 +1661,7 @@ class H(BaseHTTPRequestHandler):
                 if est:
                     row["cost_est"] = True
 
-        # 飞书 AI 权益并入个人榜:1 点 = 1 token,计入总量参与排序(孙可 2026-06-12)。
-        # 只在主个人榜并入;带 ?client 的工具榜(Claude/Codex/Cursor/LiteLLM/Hermes)不并。
-        # 纯飞书用户(无 token 用量)也建行进榜,排序靠后无妨(孙可:不用显出来)。
-        if not cli:
-            frng, fparams = _feishu_range(qs)
-            fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
-            for fr in conn.execute(
-                "SELECT email, MAX(name), MAX(dept), MAX(avatar), SUM(credits)"
-                " FROM feishu_member WHERE 1=1%s%s"
-                " GROUP BY email HAVING SUM(credits)>0" % (frng, fdep), fparams).fetchall():
-                fem, fname, fdept, favatar, credits = fr[0], fr[1], fr[2], fr[3], fr[4] or 0
-                if credits <= 0:
-                    continue
-                row = by_email.get(fem)
-                if row is None:
-                    pr = conn.execute("SELECT dept,name,avatar FROM people WHERE email=?",
-                                      (fem,)).fetchone()
-                    dept = (_to_keep(pr[0]) if pr and pr[0] else None) \
-                        or _to_keep(fdept) or _normalize_dept_path(fdept) or "unknown"
-                    row = {"email": fem, "dept": dept,
-                           "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
-                           "reasoning": 0, "tokens": 0, "cost": 0, "messages": 0,
-                           "name": (pr[1] if pr and pr[1] else None) or fname or fem.split("@")[0],
-                           "avatar": (pr[2] if pr and pr[2] else None) or favatar or "",
-                           "via": "", "departed": fem in departed, "composition": [],
-                           "subs": []}
-                    result.append(row)
-                    by_email[fem] = row
-                row["tokens"] = (row["tokens"] or 0) + credits
-                row["feishu_credits"] = credits   # 单列飞书点数,前端可标注「含飞书 X 点」
-                fc = round(credits * FEISHU_USD_PER_POINT, 4)
-                row["feishu_cost"] = fc
-                row["cost"] = round(float(row["cost"] or 0) + credits * FEISHU_USD_PER_POINT, 4)
-                row["composition"].append({"client": "飞书AI权益", "tokens": credits})
-
-            usage_window_start = {}
-            if cost_start is None:
-                for mr in conn.execute("""
-                    SELECT u.email, MIN(u.period)
-                    FROM usage u
-                    WHERE u.period_type='day' AND u.source != 'litellm_agent'%s
-                    GROUP BY u.email
-                """ % cli_clause, ([cli.lower()] if cli else [])).fetchall():
-                    if mr[0] and mr[1]:
-                        usage_window_start[mr[0]] = mr[1]
-
-            def _fee_window(email):
-                if cost_start is not None and cost_end is not None:
-                    return cost_start, cost_end
-                return usage_window_start.get(email) or today, today
-
-            for row in result:
-                win_s, win_e = _fee_window(row["email"])
-                kept = []
-                fee_total = 0.0
-                for sub in subs_by_email.get(row["email"], []):
-                    if cost_start is None and usage_window_start.get(row["email"]) is None and \
-                            not sub.get("start") and not sub.get("end"):
-                        # lifetime/all 且此人无 usage 明细时，保留原「整月订阅=1.0」语义。
-                        frac = 1.0
-                    else:
-                        frac = _interval_fraction(win_s, win_e, sub.get("start"), sub.get("end"))
-                    if frac <= 0:
-                        continue
-                    kept.append(sub)
-                    fee_total += float(sub.get("fee") or 0) * frac
-                row["subs"] = _group_subs(kept)
-                if not kept:
-                    continue
-                row["cost"] = round(float(row["cost"] or 0) + fee_total, 4)
-
+        # (个人榜的飞书并入 + 订阅摊销已移到 _personal_board_rows; 此处只剩工具榜 cli 路径)
         # 飞书并入后总量可能变 → 统一算 composition 占比 + 重排
         for row in result:
             tot = row["tokens"] or 0
@@ -1903,21 +1978,21 @@ class H(BaseHTTPRequestHandler):
 
         sd = _show_departed(qs)
         departed_lower = {(e or "").lower() for e in _departed_set(conn)}
-        # 口径完全对齐前端个人榜 /v1/leaderboard(sunke 2026-06-16):
-        #  - token = SUM(total) + 飞书权益点(1点=1token)
-        #  - cost  = 公司实付 = 网关实销 SUM(CASE source IN('litellm','api') THEN cost) + 飞书点成本
-        #    订阅制客户端(Claude Code/Codex)按 token 的牌价 cost 绝不计入(否则千倍虚高)。
-        # agent key 用量(litellm_agent)与合成身份(litellm-key/-user)不进个人统计。
         PERSON_FILTER = (" AND source != 'litellm_agent'"
                          " AND email NOT LIKE 'litellm-key:%%'"
                          " AND email NOT LIKE 'litellm-user:%%'")
 
-        def cost_case(pfx=""):
-            return ("SUM(CASE WHEN %ssource IN ('litellm','api') THEN %scost ELSE 0 END)"
-                    % (pfx, pfx))
-
-        # 飞书权益点窗口(usage_date,语义同 ?days/from/to)。
-        frng, fparams = _feishu_range(qs)
+        # 唯一口径: 直接复用 /v1/leaderboard 的个人榜计算(网关实销 + 飞书点 + 订阅费窗口摊销),
+        # 不再自写一套(2026-06-16 评审教训: 自写漏了订阅摊销, 与前端漂)。
+        # 用显式 from/to 把窗口钉死, 避免无参时 _range_clause 退化成 lifetime 而与本接口 days=30 不一致。
+        eqs = dict(qs)
+        if frm:
+            eqs["from"] = [frm]
+        if to:
+            eqs["to"] = [to]
+        board = _personal_board_rows(conn, eqs)
+        by_email = {(r["email"] or "").lower(): r for r in board}
+        frng, fparams = _feishu_range(eqs)
 
         user = (qs.get("user") or [None])[0]
         if user and user.strip():
@@ -1925,44 +2000,35 @@ class H(BaseHTTPRequestHandler):
             if "@" not in email:
                 email = "%s@%s" % (email, AI_EMAIL_DOMAIN)
             is_departed = email in departed_lower
-            if is_departed and not sd:
-                # 默认排除离职: 显式查到离职者返回 0, 带 departed 标记(非静默 0); ?show_departed=1 才出数。
-                daily, total_tokens, cost_usd = [], 0, 0
+            row = by_email.get(email)
+            if row is None:
+                # 不在榜(窗口内无用量, 或默认被排除的离职者) → 0/空; departed 标记仍给。
+                prof = conn.execute(
+                    "SELECT MAX(name), MAX(dept) FROM people WHERE lower(email)=?",
+                    (email,)).fetchone()
+                name = (prof[0] if prof else None) or None
+                dept = (prof[1] if prof else None) or None
+                total_tokens, cost_usd, daily = 0, 0, []
             else:
-                rows = conn.execute(
-                    "SELECT period, SUM(total), %s FROM usage "
-                    "WHERE %s%s AND lower(email)=? GROUP BY period"
-                    % (cost_case(), clause(), PERSON_FILTER),
-                    params + [email]).fetchall()
-                day_map = {r[0]: {"date": r[0], "total_tokens": r[1] or 0,
-                                  "cost_usd": float(r[2] or 0)} for r in rows}
-                # 飞书点按天并入(1点=1token; 点成本 credits×USD_PER_POINT 并入 cost),
-                # 折到对应天使 sum(daily)==total。
+                total_tokens = row["tokens"]
+                cost_usd = row["cost"]
+                name = row.get("name") or None
+                dept = row.get("dept") or None
+                # 每日明细(token 维度: 当天 SUM(total) + 飞书点, 和 == total_tokens 自洽)。
+                # cost 含订阅月费摊销, 不可按天拆, 故 daily 只给 token。
+                day_map = {}
+                for p, tot in conn.execute(
+                        "SELECT period, SUM(total) FROM usage WHERE %s%s AND lower(email)=? "
+                        "GROUP BY period" % (clause(), PERSON_FILTER),
+                        params + [email]).fetchall():
+                    day_map[p] = day_map.get(p, 0) + (tot or 0)
                 for ud, cr in conn.execute(
                         "SELECT usage_date, SUM(credits) FROM feishu_member "
                         "WHERE 1=1%s AND lower(email)=? GROUP BY usage_date" % frng,
                         fparams + [email]).fetchall():
-                    cr = cr or 0
-                    if not cr:
-                        continue
-                    d = day_map.setdefault(ud, {"date": ud, "total_tokens": 0, "cost_usd": 0.0})
-                    d["total_tokens"] += cr
-                    d["cost_usd"] += cr * FEISHU_USD_PER_POINT
-                daily = [{"date": d["date"], "total_tokens": d["total_tokens"],
-                          "cost_usd": round(d["cost_usd"], 4)}
-                         for d in sorted(day_map.values(), key=lambda x: x["date"])]
-                total_tokens = sum(d["total_tokens"] for d in daily)
-                cost_usd = round(sum(d["cost_usd"] for d in daily), 4)
-            prof = conn.execute(
-                "SELECT MAX(name), MAX(dept) FROM people WHERE lower(email)=?",
-                (email,)).fetchone()
-            name = (prof[0] if prof else None) or None
-            dept = (prof[1] if prof else None) or None
-            if not dept:
-                d2 = conn.execute(
-                    "SELECT MAX(dept) FROM usage WHERE lower(email)=?",
-                    (email,)).fetchone()
-                dept = (d2[0] if d2 and d2[0] else None) or None
+                    if cr:
+                        day_map[ud] = day_map.get(ud, 0) + cr
+                daily = [{"date": d, "total_tokens": day_map[d]} for d in sorted(day_map)]
             return self._send(200, {
                 "user": email, "name": name, "dept": dept,
                 "departed": is_departed,
@@ -1972,39 +2038,17 @@ class H(BaseHTTPRequestHandler):
                 "latest_usage_date": latest, "generated_at": now_iso,
             })
 
-        # 不传 user → 整张个人榜(窗口内按人聚合), 默认排除离职 + agent/合成身份。
-        dep = _departed_filter(sd, "u.")
-        fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
+        # 不传 user → 整张个人榜 top-N(已含飞书/订阅, 已按 tokens 降序)。
         try:
             limit = int((qs.get("limit") or ["50"])[0])
         except (TypeError, ValueError):
             limit = 50
         if limit <= 0:
             limit = 50
-        rows = conn.execute(
-            "SELECT u.email, MAX(p.name), COALESCE(MAX(p.dept), MAX(u.dept)), "
-            "SUM(u.total), %s "
-            "FROM usage u LEFT JOIN people p ON p.email = u.email "
-            "WHERE %s AND u.source != 'litellm_agent' "
-            "AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s "
-            "GROUP BY u.email HAVING SUM(u.total) > 0 "
-            "ORDER BY SUM(u.total) DESC LIMIT ?" % (cost_case("u."), clause("u."), dep),
-            params + [limit]).fetchall()
-        # 飞书点并入已在榜的人(1点=1token + 点成本); 纯飞书用户(无 agent token)不在 top-N,
-        # 单人查询能查到其飞书点, 此处不另建行(与单人路径口径一致, 量级可忽略)。
-        fcred = {}
-        for fe, cr in conn.execute(
-                "SELECT lower(email), SUM(credits) FROM feishu_member "
-                "WHERE 1=1%s%s GROUP BY lower(email)" % (frng, fdep), fparams).fetchall():
-            if cr:
-                fcred[fe] = cr
-        ranking = []
-        for r in rows:
-            cr = fcred.get((r[0] or "").lower(), 0)
-            ranking.append({
-                "user": r[0], "name": r[1] or None, "dept": r[2] or None,
-                "total_tokens": (r[3] or 0) + cr,
-                "cost_usd": round(float(r[4] or 0) + cr * FEISHU_USD_PER_POINT, 4)})
+        ranking = [{"user": r["email"], "name": r.get("name") or None,
+                    "dept": r.get("dept") or None,
+                    "total_tokens": r["tokens"], "cost_usd": r["cost"]}
+                   for r in board[:limit]]
         self._send(200, {
             "window": window, "count": len(ranking), "ranking": ranking,
             "latest_usage_date": latest, "generated_at": now_iso,
