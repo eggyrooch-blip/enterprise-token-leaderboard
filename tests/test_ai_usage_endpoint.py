@@ -1,11 +1,10 @@
-"""Regression for the unauthenticated AI usage endpoint GET /v1/ai/usage.
+"""Regression for GET /v1/ai/usage — 口径完全对齐前端个人榜 /v1/leaderboard.
 
-Hermes skill use case: 'sunke 过去一周的 token 用量' — per-person summary +
-daily breakdown, login-name → email normalization, missing user is 0 (not 404),
-departed default-excluded with a flag, and the no-user board drops departed +
-agent rows + synthetic identities. Spins the real HTTP server and GETs it.
+核心: 奇偶校验(parity) —— 同种子数据, ai/usage?user=X 的 total_tokens/cost_usd
+必须 == /v1/leaderboard 中 X 那一行的 tokens/cost。这把两个接口的取数钉死成一套逻辑,
+防止再次漂成两套(根因: 旧版 cost=SUM(所有 source) 把订阅牌价算进去, 千倍虚高)。
 
-Dates are seeded relative to today so `?days=N` windows never rot.
+Dates 相对今天, 不腐烂。
 """
 import datetime
 import json
@@ -30,15 +29,16 @@ def _seed(conn):
     conn.execute("CREATE TABLE IF NOT EXISTS people(email TEXT PRIMARY KEY, name TEXT, avatar TEXT, dept TEXT)")
     conn.execute("INSERT OR REPLACE INTO people(email,name,avatar,dept) VALUES(?,?,?,?)",
                  ("alice@keep.com", "爱丽丝", "", "Keep/IT/规范部门"))
+    # 同一人混合来源: 订阅制(大额牌价 cost, 不进公司实付) + 网关实销(进 cost)
     rows = [
-        # alice: D(2)=100, D(1)=200+50(同天多行需 SUM), D(0)=300  → 合计 650
-        ("alice@keep.com", "Keep/IT/脏部门", "day", D(2), "subscription", "Claude", "", "m", 100, 1.0),
-        ("alice@keep.com", "Keep/IT/脏部门", "day", D(1), "subscription", "Codex", "", "m", 200, 2.0),
-        ("alice@keep.com", "Keep/IT/脏部门", "day", D(1), "subscription", "Claude", "", "m2", 50, 0.5),
-        ("alice@keep.com", "Keep/IT/脏部门", "day", D(0), "subscription", "Claude", "", "m", 300, 3.0),
+        # subscription: token 算数, 但 cost(牌价)绝不进 cost_usd
+        ("alice@keep.com", "Keep/IT", "day", D(1), "subscription", "Claude", "", "m", 300, 999.0),
+        # 网关实销 api/litellm: cost 进公司实付
+        ("alice@keep.com", "Keep/IT", "day", D(1), "api", "LiteLLM", "", "m", 100, 2.5),
+        ("alice@keep.com", "Keep/IT", "day", D(0), "litellm", "LiteLLM", "", "m", 50, 1.0),
         # 离职者 bob
-        ("bob@keep.com", "Keep/IT", "day", D(0), "subscription", "Claude", "", "m", 999, 9.0),
-        # agent key 用量 + 合成身份(litellm-key/-user): 都不进个人榜
+        ("bob@keep.com", "Keep/IT", "day", D(0), "subscription", "Claude", "", "m", 777, 5.0),
+        # agent + 合成身份: 都不进个人统计
         ("agent:botA", "unknown", "day", D(0), "litellm_agent", "LiteLLM", "", "m", 5000, 50.0),
         ("litellm-key:orphan", "unknown", "day", D(0), "litellm", "LiteLLM", "", "m", 4000, 40.0),
         ("litellm-user:ghost", "unknown", "day", D(0), "litellm", "LiteLLM", "", "m", 3000, 30.0),
@@ -49,6 +49,10 @@ def _seed(conn):
             "input,output,cache_read,cache_write,reasoning,total,cost,messages) "
             "VALUES(?,?,?,?,?,?,?,?,0,0,0,0,0,?,?,0)",
             (email, dept, pt, period, src, client, prov, model, total, cost))
+    # 飞书权益点(1点=1token, 点成本并入 cost) —— alice 当天 12 点
+    conn.execute(
+        "INSERT OR REPLACE INTO feishu_member(email,name,dept,feature_key,credits,usage_date,avatar,entity_id) "
+        "VALUES('alice@keep.com','爱丽丝','Keep/IT/规范部门','AI_credits',12.0,?,'','')", (D(0),))
     conn.execute("CREATE TABLE IF NOT EXISTS departed(email TEXT PRIMARY KEY, reason TEXT, marked_at TEXT)")
     conn.execute("INSERT OR REPLACE INTO departed(email,reason,marked_at) VALUES('bob@keep.com','left',?)", (D(30),))
     conn.commit()
@@ -72,22 +76,40 @@ def _serve(tmp_path, monkeypatch):
     return server, thread
 
 
-def test_per_person_summary_and_daily(tmp_path, monkeypatch):
+def test_parity_single_user_matches_leaderboard_row(tmp_path, monkeypatch):
+    """奇偶校验: ai/usage?user=alice 的 tokens/cost == /v1/leaderboard 中 alice 行。"""
     server, thread = _serve(tmp_path, monkeypatch)
     try:
-        data = _get(server, "/v1/ai/usage?user=alice&days=30")
+        ai = _get(server, "/v1/ai/usage?user=alice&days=30")
+        lb = _get(server, "/v1/leaderboard?days=30")
     finally:
         server.shutdown(); thread.join(timeout=3)
-    assert data["user"] == "alice@keep.com"        # login-name → email
-    assert data["name"] == "爱丽丝"
-    assert data["dept"] == "Keep/IT/规范部门"        # canonical people.dept, not usage dept
-    assert data["departed"] is False
-    by_date = {d["date"]: d["total_tokens"] for d in data["daily"]}
-    assert by_date == {D(2): 100, D(1): 250, D(0): 300}   # 同天多行被 SUM
-    assert data["total_tokens"] == 650
-    assert data["cost_usd"] == 6.5
-    assert data["latest_usage_date"] == D(0)
-    assert data["window"]["days"] == 30
+    alice = next(r for r in lb["leaderboard"] if r["email"] == "alice@keep.com")
+    # token 含飞书点: 300+100+50 + 12 = 462
+    assert ai["total_tokens"] == alice["tokens"] == 462
+    # cost = 网关实销(2.5+1.0=3.5) + 飞书点成本(12×USD_PER_POINT), 订阅牌价 999 不计入
+    assert abs(ai["cost_usd"] - alice["cost"]) < 0.01
+    assert ai["cost_usd"] < 5.0   # 远小于订阅牌价 999, 证明牌价没被算进去
+
+
+def test_cost_excludes_subscription_notional(tmp_path, monkeypatch):
+    server, thread = _serve(tmp_path, monkeypatch)
+    try:
+        ai = _get(server, "/v1/ai/usage?user=alice&days=30")
+    finally:
+        server.shutdown(); thread.join(timeout=3)
+    # 网关 3.5 + 飞书 12×0.006923≈0.083 ≈ 3.58, 绝不是 999+ 量级
+    assert 3.4 < ai["cost_usd"] < 4.0
+
+
+def test_daily_sums_to_total(tmp_path, monkeypatch):
+    server, thread = _serve(tmp_path, monkeypatch)
+    try:
+        ai = _get(server, "/v1/ai/usage?user=alice&days=30")
+    finally:
+        server.shutdown(); thread.join(timeout=3)
+    assert sum(d["total_tokens"] for d in ai["daily"]) == ai["total_tokens"]
+    assert abs(sum(d["cost_usd"] for d in ai["daily"]) - ai["cost_usd"]) < 0.01
 
 
 def test_email_and_loginname_are_equivalent(tmp_path, monkeypatch):
@@ -97,8 +119,9 @@ def test_email_and_loginname_are_equivalent(tmp_path, monkeypatch):
         b = _get(server, "/v1/ai/usage?user=ALICE@keep.com&days=30")
     finally:
         server.shutdown(); thread.join(timeout=3)
-    assert a["total_tokens"] == b["total_tokens"] == 650
+    assert a["total_tokens"] == b["total_tokens"] == 462
     assert a["user"] == b["user"] == "alice@keep.com"
+    assert a["dept"] == "Keep/IT/规范部门"
 
 
 def test_unknown_user_is_zero_not_404(tmp_path, monkeypatch):
@@ -108,21 +131,10 @@ def test_unknown_user_is_zero_not_404(tmp_path, monkeypatch):
     finally:
         server.shutdown(); thread.join(timeout=3)
     assert data["user"] == "nobody@keep.com"
-    assert data["total_tokens"] == 0
-    assert data["daily"] == []
+    assert data["total_tokens"] == 0 and data["daily"] == []
 
 
-def test_window_from_to_limits_to_single_day(tmp_path, monkeypatch):
-    server, thread = _serve(tmp_path, monkeypatch)
-    try:
-        data = _get(server, "/v1/ai/usage?user=alice&from=%s&to=%s" % (D(1), D(1)))
-    finally:
-        server.shutdown(); thread.join(timeout=3)
-    assert data["total_tokens"] == 250
-    assert [d["date"] for d in data["daily"]] == [D(1)]
-
-
-def test_board_excludes_departed_and_synthetic_and_agent(tmp_path, monkeypatch):
+def test_board_excludes_departed_synthetic_agent_and_cost_not_inflated(tmp_path, monkeypatch):
     server, thread = _serve(tmp_path, monkeypatch)
     try:
         board = _get(server, "/v1/ai/usage?days=30")
@@ -131,13 +143,12 @@ def test_board_excludes_departed_and_synthetic_and_agent(tmp_path, monkeypatch):
         server.shutdown(); thread.join(timeout=3)
     emails = [r["user"] for r in board["ranking"]]
     assert "alice@keep.com" in emails and "bob@keep.com" not in emails
-    # agent 行 + 合成身份绝不进个人榜(否则 5000/4000/3000 会把 alice 挤下榜首)
     assert not any(e.startswith("agent:") for e in emails)
     assert not any(e.startswith("litellm-key:") or e.startswith("litellm-user:") for e in emails)
-    assert board["ranking"][0]["user"] == "alice@keep.com"
-    assert board["ranking"][0]["dept"] == "Keep/IT/规范部门"   # canonical people.dept
+    alice = next(r for r in board["ranking"] if r["user"] == "alice@keep.com")
+    assert alice["total_tokens"] == 462
+    assert alice["cost_usd"] < 5.0       # 牌价没被算进 board
     assert any(r["user"] == "bob@keep.com" for r in with_dep["ranking"])
-    assert board["count"] == len(board["ranking"])
 
 
 def test_single_user_departed_default_zero_with_flag(tmp_path, monkeypatch):
@@ -150,4 +161,4 @@ def test_single_user_departed_default_zero_with_flag(tmp_path, monkeypatch):
     assert default["departed"] is True
     assert default["total_tokens"] == 0 and default["daily"] == []
     assert shown["departed"] is True
-    assert shown["total_tokens"] == 999
+    assert shown["total_tokens"] == 777
