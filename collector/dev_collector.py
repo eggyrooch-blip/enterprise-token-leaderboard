@@ -529,6 +529,28 @@ def _unwrap(v):
     return v
 
 
+def _clean_serial(raw):
+    """从可能畸形的 serial 字段里取出真正的序列号。
+
+    实测 Windows PowerShell 客户端有 bug:Log 函数用 Write-Output,泄漏进
+    Get-DeviceSerial 的返回值,使 serial 变成一个 list —— 日志行 + 真 SN 混在一起,例如
+      ['[tokreport-windows] ... BIOS is <SN>', '... baseboard is <BB>',
+       '... The meaningful SN should be <SN> ...', '<SN>']
+    旧代码 `serial in _serial_cache` 直接拿 list 当 key → unhashable → 整份上报 500
+    (这才是 Windows 机器一直进不了榜的真根因)。这里把 list 里日志行(都含空白)滤掉,
+    取最后一个无空白的候选作真 SN;客户端侧另有修复让 serial 不再被污染。
+    """
+    if isinstance(raw, (list, tuple)):
+        cands = [str(x).strip() for x in raw if str(x).strip()]
+        nospace = [c for c in cands if len(c.split()) == 1]   # 真 SN 无空白;日志行有空格
+        raw = nospace[-1] if nospace else (cands[-1] if cands else "")
+    elif isinstance(raw, dict):
+        raw = str(raw.get("id") or raw.get("value") or "")
+    elif not isinstance(raw, str):
+        raw = "" if raw is None else str(raw)
+    return raw.strip()
+
+
 def _sstr(v, default=""):
     """归一为可安全写库的字符串(防 list/dict 直接 bind SQLite 抛 InterfaceError)。"""
     v = _unwrap(v)
@@ -1435,7 +1457,7 @@ class H(BaseHTTPRequestHandler):
             return self._send(403, {"error": "invalid token"})
 
         p = self._read_body()
-        serial = p.get("serial", "")
+        serial = _clean_serial(p.get("serial", ""))
         lifetime_entries = (p.get("models") or {}).get("entries") or []
         monthly_entries = (p.get("monthly") or {}).get("entries") or []
 

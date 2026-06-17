@@ -21,7 +21,11 @@ $LogPath = Join-Path $LogDir "tokreport.log"
 function Log {
     param([string]$Message)
     $line = "[tokreport-windows] $((Get-Date).ToString('s')) $Message"
-    Write-Output $line
+    # 必须用 Write-Host,绝不能 Write-Output:Write-Output 会把日志行注入调用它的
+    # 函数返回值(success 流)。Get-DeviceSerial 内部调用 Log,曾导致 $serial 变成
+    # [日志行..., 真SN] 这样的数组,上报到服务端 serial 成 list → 500,Windows 机器
+    # 全部进不了榜。Write-Host 走 host/information 流,不污染任何函数返回值。
+    Write-Host $line
     try {
         New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
         Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value $line
