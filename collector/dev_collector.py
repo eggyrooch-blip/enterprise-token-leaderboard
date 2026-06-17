@@ -322,11 +322,12 @@ def num(r, *keys):
     """从 dict r 中按 keys 顺序取第一个非 None 整数，失败返回 0。"""
     for k in keys:
         if k in r and r[k] is not None:
+            v = _unwrap(r[k])          # list/dict 形状先剥成标量,保住数值不被零掉
             try:
-                return int(r[k])
+                return int(v)
             except (TypeError, ValueError, OverflowError):
                 try:
-                    f = float(r[k])
+                    f = float(v)
                     if f != f or f in (float("inf"), float("-inf")):  # NaN / ±inf → 0
                         return 0
                     return int(f)
@@ -509,18 +510,48 @@ _CLIENT_TO_SUB_TOOL = {
 }
 
 
-def _client_label(raw):
-    """把上报里的 client 字段归一为展示标签。
+def _unwrap(v):
+    """把畸形上报字段拆成单个标量。
 
-    某些 tokscale 版本(实测 Windows 客户端)把 client 发成 list,例如 ['claude'];
-    直接 `_CLIENT_LABELS.get(list)` 会抛 `TypeError: unhashable type: 'list'`,
-    把整份上报打成 500 —— 这是 Windows MDM 数据进不了榜的根因。这里做总体强转,
-    保证任何形状的 client 都先归一成可哈希的字符串再查表。
+    实测某 tokscale 客户端(Windows)把本该是标量的字段发成单元素 list,例如
+    client=['claude'] / provider=['anthropic'] / model=['x'] / cost=[1.2] /
+    month=['2026-06'] / date=['2026-06-17']。这些值若直接进 dict.get(→unhashable)、
+    直接 bind 进 SQLite(→InterfaceError)或喂给 float()(→TypeError),都会把整份
+    上报打成 500。这里在每个标量字段入库前先剥成标量(list→首个非空元素,dict→
+    常见键),从源头消灭"任意字段是 list"这一类 500。
     """
-    if isinstance(raw, (list, tuple)):
-        raw = next((x for x in raw if x), "") if raw else ""
-    if isinstance(raw, dict):
-        raw = raw.get("id") or raw.get("name") or raw.get("client") or ""
+    seen = 0
+    while isinstance(v, (list, tuple)) and seen < 5:
+        v = next((x for x in v if x not in (None, "")), None)
+        seen += 1
+    if isinstance(v, dict):
+        v = v.get("id") or v.get("name") or v.get("value") or ""
+    return v
+
+
+def _sstr(v, default=""):
+    """归一为可安全写库的字符串(防 list/dict 直接 bind SQLite 抛 InterfaceError)。"""
+    v = _unwrap(v)
+    if v is None:
+        return default
+    return v if isinstance(v, str) else str(v)
+
+
+def _sfloat(v):
+    """归一为 float;任何畸形(list/dict/None/非数字/NaN/inf)→ 0.0。"""
+    v = _unwrap(v)
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if f != f or f in (float("inf"), float("-inf")):
+        return 0.0
+    return f
+
+
+def _client_label(raw):
+    """把 client 字段归一为展示标签(先剥标量再查表,防 unhashable)。"""
+    raw = _unwrap(raw)
     if not isinstance(raw, str):
         raw = "" if raw is None else str(raw)
     raw = raw.strip() or "unknown"
@@ -557,15 +588,15 @@ def _upsert_lifetime(conn, email, dept, entries):
     up = 0
     for e in entries:
         client = _client_label(e.get("client", "unknown"))
-        provider = e.get("provider") or ""
-        model = e.get("model") or "unknown"
+        provider = _sstr(e.get("provider"))
+        model = _sstr(e.get("model")) or "unknown"
         inp = num(e, "input")
         out = num(e, "output")
         cr = num(e, "cacheRead")
         cw = num(e, "cacheWrite")
         reasoning = num(e, "reasoning")
         total = inp + out + cr + cw + reasoning
-        cost = float(e.get("cost") or 0)
+        cost = _sfloat(e.get("cost"))
         messages = num(e, "messageCount")
         conn.execute(_UPSERT_SQL, (
             email, dept, "lifetime", "all", "subscription",
@@ -585,7 +616,7 @@ def _upsert_monthly(conn, email, dept, entries):
     """
     up = 0
     for e in entries:
-        month = e.get("month") or ""
+        month = _sstr(e.get("month"))
         if not month:
             continue
         inp = num(e, "input")
@@ -594,7 +625,7 @@ def _upsert_monthly(conn, email, dept, entries):
         cw = num(e, "cacheWrite")
         reasoning = num(e, "reasoning")          # monthly 通常无此字段 → 0
         total = inp + out + cr + cw + reasoning
-        cost = float(e.get("cost") or 0)
+        cost = _sfloat(e.get("cost"))
         messages = num(e, "messageCount")
         # provider 必须用稳定常量：之前塞乱序模型列表 → 每次跑主键都不同 → 月度翻倍。
         # 月度只做时间桶,模型维度从 lifetime 行取,这里 provider 固定为空。
@@ -613,7 +644,7 @@ def _upsert_daily(conn, email, dept, graph):
             tokens:{input,output,cacheRead,cacheWrite,reasoning}, cost, messages}]}]}"""
     up = 0
     for d in (graph or {}).get("contributions") or []:
-        day = d.get("date")
+        day = _sstr(d.get("date"))
         if not day:
             continue
         for c in d.get("clients") or []:
@@ -624,8 +655,8 @@ def _upsert_daily(conn, email, dept, graph):
             total = inp + out + cr + cw + rs
             conn.execute(_UPSERT_SQL, (
                 email, dept, "day", day, "subscription",
-                client, c.get("providerId") or "", c.get("modelId") or "unknown",
-                inp, out, cr, cw, rs, total, float(c.get("cost") or 0), num(c, "messages"),
+                client, _sstr(c.get("providerId")), _sstr(c.get("modelId")) or "unknown",
+                inp, out, cr, cw, rs, total, _sfloat(c.get("cost")), num(c, "messages"),
             ))
             up += 1
     return up
