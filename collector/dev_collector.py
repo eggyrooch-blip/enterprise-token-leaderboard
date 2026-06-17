@@ -509,6 +509,24 @@ _CLIENT_TO_SUB_TOOL = {
 }
 
 
+def _client_label(raw):
+    """把上报里的 client 字段归一为展示标签。
+
+    某些 tokscale 版本(实测 Windows 客户端)把 client 发成 list,例如 ['claude'];
+    直接 `_CLIENT_LABELS.get(list)` 会抛 `TypeError: unhashable type: 'list'`,
+    把整份上报打成 500 —— 这是 Windows MDM 数据进不了榜的根因。这里做总体强转,
+    保证任何形状的 client 都先归一成可哈希的字符串再查表。
+    """
+    if isinstance(raw, (list, tuple)):
+        raw = next((x for x in raw if x), "") if raw else ""
+    if isinstance(raw, dict):
+        raw = raw.get("id") or raw.get("name") or raw.get("client") or ""
+    if not isinstance(raw, str):
+        raw = "" if raw is None else str(raw)
+    raw = raw.strip() or "unknown"
+    return _CLIENT_LABELS.get(raw, raw)
+
+
 def _single_tool_subs(subs_by_email, email, tool, win_start=None, win_end=None):
     # 工具榜只挂同工具的订阅徽标(多席位聚合成一个),复用个人榜 subs 结构避免前端分叉。
     if not tool:
@@ -538,8 +556,7 @@ def _upsert_lifetime(conn, email, dept, entries):
     """将 tokscale models --json entries UPSERT 为 period_type=lifetime。"""
     up = 0
     for e in entries:
-        client_raw = e.get("client", "unknown")
-        client = _CLIENT_LABELS.get(client_raw, client_raw)
+        client = _client_label(e.get("client", "unknown"))
         provider = e.get("provider") or ""
         model = e.get("model") or "unknown"
         inp = num(e, "input")
@@ -601,8 +618,7 @@ def _upsert_daily(conn, email, dept, graph):
             continue
         for c in d.get("clients") or []:
             tk = c.get("tokens") or {}
-            client_raw = c.get("client", "unknown")
-            client = _CLIENT_LABELS.get(client_raw, client_raw)
+            client = _client_label(c.get("client", "unknown"))
             inp = num(tk, "input"); out = num(tk, "output")
             cr = num(tk, "cacheRead"); cw = num(tk, "cacheWrite"); rs = num(tk, "reasoning")
             total = inp + out + cr + cw + rs
