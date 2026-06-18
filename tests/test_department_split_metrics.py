@@ -184,3 +184,37 @@ def test_aily_credits_follow_people_spend_bucket_when_available(monkeypatch):
     assert team["employee_staff_outsourcing"]["credits"] == 0
     assert team["business_outsourcing"]["credits"] == 300
     assert team["department_full"]["credits"] == 300
+
+
+def test_aily_credits_follow_people_effective_dept_for_supplier_raw_dept(monkeypatch):
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    conn.execute("ALTER TABLE people ADD COLUMN effective_dept TEXT DEFAULT ''")
+    conn.execute("ALTER TABLE people ADD COLUMN spend_bucket TEXT DEFAULT ''")
+    today = datetime.date.today().isoformat()
+    raw = "Keep/合作商/W/中软国际科技服务有限公司(SP004867)"
+    conn.execute(
+        "INSERT INTO feishu_member VALUES(?,?,?,?,?,?,?,?)",
+        ("supplier@keep.com", "supplier", raw, "aily_credits", 300, today, "", ""),
+    )
+    conn.execute(
+        "INSERT INTO people(email,name,avatar,dept,effective_dept,spend_bucket)"
+        " VALUES(?,?,?,?,?,?)",
+        (
+            "supplier@keep.com",
+            "supplier",
+            "",
+            raw,
+            "Keep/技术平台部/固件组",
+            "business_outsourcing",
+        ),
+    )
+    conn.commit()
+
+    teams = _teams(dc, conn, monkeypatch)
+    team = teams["Keep/技术平台部/固件组"]
+
+    assert team["business_outsourcing"]["credits"] == 300
+    assert team["department_full"]["credits"] == 300
+    assert "Keep/外部合作商/中软国际科技服务有限公司(SP004867)" not in teams

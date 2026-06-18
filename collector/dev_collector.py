@@ -2938,15 +2938,21 @@ class H(BaseHTTPRequestHandler):
                 """ % (where, dep_clause, ex_clause), params + ex_params).fetchall()
             ]
 
-        # 用 people.dept(飞连规范全路径)把每个人归一到唯一的真实组织部门，
+        # 用 people.effective_dept(飞书归因后的真实部门)把每个人归一到唯一的真实组织部门，
+        # 老库没有 effective_dept 时回退到 people.dept。
         # 再把此人所有来源的用量收进该部门 → 单一 Keep 树，杜绝裸别名裂树。
-        pdept = dict(conn.execute("SELECT email, dept FROM people").fetchall())
+        people_cols = _table_columns(conn, "people")
+        if "effective_dept" in people_cols:
+            pdept = dict(conn.execute(
+                "SELECT email, COALESCE(NULLIF(effective_dept,''), dept) FROM people"
+            ).fetchall())
+        else:
+            pdept = dict(conn.execute("SELECT email, dept FROM people").fetchall())
         if scope_user and not scope_user.get("is_admin"):
             rows = [
                 r for r in rows
                 if email_in_scope(scope_user, r[0], _scope_dept(r[0], r[2] or r[1], pdept, r[1]))
             ]
-        people_cols = _table_columns(conn, "people")
         if "spend_bucket" in people_cols:
             pbucket = dict(conn.execute(
                 "SELECT email, COALESCE(NULLIF(spend_bucket,''), ?) FROM people",
