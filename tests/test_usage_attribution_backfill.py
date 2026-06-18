@@ -105,6 +105,46 @@ def test_backfill_usage_attribution_preserves_raw_and_sets_effective_bucket():
     )
 
 
+def test_backfill_surfaces_inactive_chat_owner_candidate_as_pending():
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    raw = "Keep/合作商/W/北京再作品牌管理有限公司(SP000083)"
+    _usage(conn, "candidate@keep.com", raw, 30)
+    conn.execute(
+        "INSERT INTO department_attributions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "dept-chat-candidate",
+            dc._canonical_dept_key(raw),
+            "合作商/W/北京再作品牌管理有限公司(SP000083)",
+            "dept-target",
+            "Keep/运动消费事业部/市场营销部",
+            "pending_business_outsourcing",
+            "chat_owner_department",
+            "medium",
+            0,
+            "",
+            "2026-06-18",
+        ),
+    )
+    conn.commit()
+
+    written = dc._backfill_usage_attribution(conn, dry_run=False)
+    row = conn.execute(
+        "SELECT raw_dept, effective_dept, dept, spend_bucket, attribution_source"
+        " FROM usage WHERE email='candidate@keep.com'"
+    ).fetchone()
+
+    assert written["pending_business_outsourcing"] == 1
+    assert row == (
+        raw,
+        "Keep/运动消费事业部/市场营销部",
+        "Keep/运动消费事业部/市场营销部",
+        "pending_business_outsourcing",
+        "chat_owner_department",
+    )
+
+
 def test_db_startup_backfills_existing_legacy_usage_rows(monkeypatch, tmp_path):
     dc = importlib.reload(dev_collector)
     db_path = tmp_path / "tok.db"

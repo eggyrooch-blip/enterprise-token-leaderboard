@@ -156,6 +156,15 @@ def test_emailless_supplier_rolls_up_via_canonical_key():
     assert src == fds.RULE_LEADER
 
 
+def test_chat_owner_candidate_rolls_up_as_pending_bucket():
+    attrs = _attributions(chat_owner=True)
+    feilian_raw = "Keep/合作商/W/北京再作品牌管理有限公司(SP000083)"
+    eff, bucket, src = fds.effective_dept_for_person(feilian_raw, attrs)
+    assert eff == "运动消费事业部/市场营销部"
+    assert bucket == fds.BUCKET_PENDING_BUSINESS
+    assert src == fds.RULE_CHAT_OWNER
+
+
 def test_resolved_rate_excludes_inactive_chat_owner():
     # only leader-owned supplier is active among 3 suppliers -> 1/3
     attrs = _attributions(chat_owner=True)

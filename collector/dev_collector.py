@@ -1477,14 +1477,15 @@ def _active_attribution_map(conn):
     out = {}
     try:
         rows = conn.execute(
-            "SELECT source_dept_key, target_dept_path, spend_bucket, rule"
+            "SELECT source_dept_key, target_dept_path, spend_bucket, rule, active"
             " FROM department_attributions"
-            " WHERE active=1 AND COALESCE(target_dept_path,'')<>''"
+            " WHERE COALESCE(target_dept_path,'')<>''"
+            " AND (active=1 OR (active=0 AND rule='chat_owner_department'))"
         ).fetchall()
     except Exception:
         return out
-    for key, target, bucket, rule in rows:
-        out.setdefault(key or "", []).append((target, bucket, rule))
+    for key, target, bucket, rule, active in rows:
+        out.setdefault(key or "", []).append((target, bucket, rule, active))
     return out
 
 
@@ -1538,8 +1539,9 @@ def _attribution_for_raw_dept(conn, raw_dept, active_map=None):
     if active_map is None:
         try:
             rows = conn.execute(
-                "SELECT target_dept_path, spend_bucket, rule FROM department_attributions"
-                " WHERE source_dept_key=? AND active=1 AND COALESCE(target_dept_path,'')<>''",
+                "SELECT target_dept_path, spend_bucket, rule, active FROM department_attributions"
+                " WHERE source_dept_key=? AND COALESCE(target_dept_path,'')<>''"
+                " AND (active=1 OR (active=0 AND rule='chat_owner_department'))",
                 (key,),
             ).fetchall()
         except Exception:
@@ -1548,7 +1550,10 @@ def _attribution_for_raw_dept(conn, raw_dept, active_map=None):
         rows = active_map.get(key, [])
     if len(rows) != 1:
         return default
-    target, bucket, rule = rows[0]
+    target, bucket, rule = rows[0][:3]
+    active = rows[0][3] if len(rows[0]) > 3 else 1
+    if not active and rule == "chat_owner_department":
+        bucket = BUCKET_PENDING_BUSINESS
     bucket = bucket or default_bucket
     if bucket not in (BUCKET_EMPLOYEE, BUCKET_BUSINESS, BUCKET_PENDING_BUSINESS, BUCKET_UNRESOLVED):
         bucket = default_bucket

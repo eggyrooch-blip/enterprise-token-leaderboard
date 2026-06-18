@@ -42,6 +42,7 @@ USER_PAGE_SIZE = int(os.environ.get("FEISHU_USER_PAGE_SIZE", "50"))
 # Spend buckets — preserve metric separation after roll-up.
 BUCKET_EMPLOYEE = "employee_staff_outsourcing"   # 员工 + 人员外包
 BUCKET_BUSINESS = "business_outsourcing"         # 业务外包 (supplier) attributed back
+BUCKET_PENDING_BUSINESS = "pending_business_outsourcing"  # chat-owner suggestion
 BUCKET_UNRESOLVED = "unresolved"
 
 # Attribution rules / confidence vocab (must match the DB CHECK-free contract).
@@ -384,6 +385,7 @@ def derive_department_attributions(
             continue
 
         tdid, tpath, rule, conf, active = resolved
+        bucket = BUCKET_PENDING_BUSINESS if rule == RULE_CHAT_OWNER and not active else BUCKET_BUSINESS
         # 6. No supplier-to-supplier cycles.
         if is_outsourcing_department(tpath):
             rows.append(dict(base, spend_bucket=BUCKET_UNRESOLVED,
@@ -393,7 +395,7 @@ def derive_department_attributions(
             continue
 
         rows.append(dict(base, target_dept_id=tdid, target_dept_path=tpath,
-                         spend_bucket=BUCKET_BUSINESS, rule=rule,
+                         spend_bucket=bucket, rule=rule,
                          confidence=conf, active=active, reason=""))
 
     # Key-conflict guard: same canonical key on >1 department -> all inactive.
@@ -425,7 +427,19 @@ def effective_dept_for_person(raw_dept_path, attributions):
         return (a.get("target_dept_path") or raw_dept_path,
                 a.get("spend_bucket") or BUCKET_EMPLOYEE,
                 a.get("rule") or "")
-    # No confident attribution: preserve raw path, signal review if it's a supplier.
+    pending = [
+        a for a in attributions
+        if a.get("source_dept_key") == key
+        and not a.get("active")
+        and a.get("rule") == RULE_CHAT_OWNER
+        and a.get("target_dept_path")
+    ]
+    if len(pending) == 1:
+        a = pending[0]
+        return (a.get("target_dept_path") or raw_dept_path,
+                BUCKET_PENDING_BUSINESS,
+                a.get("rule") or "")
+    # No confident/candidate attribution: preserve raw path, signal review if it's a supplier.
     if is_outsourcing_department(raw_dept_path):
         return raw_dept_path, BUCKET_UNRESOLVED, RULE_UNRESOLVED
     return raw_dept_path, BUCKET_EMPLOYEE, RULE_DIRECT
