@@ -292,14 +292,34 @@ def test_downgrade_protection_keeps_last_known_good():
     assert any(a["kind"] == "downgrade_blocked" for a in result["alerts"])
 
 
-def test_cli_blocks_write_when_supplier_coverage_below_threshold(monkeypatch, tmp_path):
+def test_cli_low_coverage_syncs_directory_but_blocks_business_rollup(monkeypatch, tmp_path):
     monkeypatch.setattr(fds, "FeishuDirectoryClient", lambda: _FakeDirectoryClient())
     db_path = tmp_path / "tok.db"
 
     rc = fds.main(["--db", str(db_path)])
 
-    assert rc == 2
-    assert not db_path.exists()
+    assert rc == 0
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM feishu_users").fetchone()[0] == 5
+        assert conn.execute("SELECT COUNT(*) FROM departments").fetchone()[0] == 9
+        assert conn.execute(
+            "SELECT COUNT(*) FROM roles WHERE role='department_owner'"
+        ).fetchone()[0] == 3
+        row = conn.execute(
+            "SELECT target_dept_path, spend_bucket, rule, active, reason"
+            " FROM department_attributions WHERE source_dept_id='d_sp_leader'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row == (
+        "技术平台部/固件组",
+        fds.BUCKET_PENDING_BUSINESS,
+        fds.RULE_LEADER,
+        0,
+        "production_enablement_blocked_low_coverage",
+    )
 
 
 def test_cli_allows_low_coverage_only_with_explicit_override(monkeypatch, tmp_path):
@@ -312,6 +332,10 @@ def test_cli_allows_low_coverage_only_with_explicit_override(monkeypatch, tmp_pa
     conn = sqlite3.connect(str(db_path))
     try:
         assert conn.execute("SELECT COUNT(*) FROM department_attributions").fetchone()[0] > 0
+        assert conn.execute(
+            "SELECT spend_bucket, rule, active FROM department_attributions"
+            " WHERE source_dept_id='d_sp_leader'"
+        ).fetchone() == (fds.BUCKET_BUSINESS, fds.RULE_LEADER, 1)
     finally:
         conn.close()
 

@@ -432,7 +432,10 @@ def effective_dept_for_person(raw_dept_path, attributions):
         a for a in attributions
         if a.get("source_dept_key") == key
         and not a.get("active")
-        and a.get("rule") == RULE_CHAT_OWNER
+        and (
+            a.get("rule") == RULE_CHAT_OWNER
+            or a.get("spend_bucket") == BUCKET_PENDING_BUSINESS
+        )
         and a.get("target_dept_path")
     ]
     if len(pending) == 1:
@@ -444,6 +447,24 @@ def effective_dept_for_person(raw_dept_path, attributions):
     if is_outsourcing_department(raw_dept_path):
         return raw_dept_path, BUCKET_UNRESOLVED, RULE_UNRESOLVED
     return raw_dept_path, BUCKET_EMPLOYEE, RULE_DIRECT
+
+
+def disable_unapproved_business_rollup(attributions):
+    """Keep supplier candidates visible without enabling production roll-up."""
+    rows = []
+    for attr in attributions:
+        row = dict(attr)
+        if (
+            is_outsourcing_department(row.get("source_dept_path", ""))
+            and row.get("active")
+            and row.get("spend_bucket") == BUCKET_BUSINESS
+            and row.get("rule") != RULE_MANUAL
+        ):
+            row["active"] = 0
+            row["spend_bucket"] = BUCKET_PENDING_BUSINESS
+            row["reason"] = "production_enablement_blocked_low_coverage"
+        rows.append(row)
+    return rows
 
 
 def resolved_business_outsourcing_rate(attributions, spend_by_key=None):
@@ -482,6 +503,7 @@ def write_directory_snapshot(
     chat_owner_lookup=None,
     manual_overrides=None,
     allow_partial=False,
+    business_rollup_enabled=True,
 ):
     """Persist a full directory snapshot. Idempotent. Returns a summary dict.
 
@@ -553,6 +575,8 @@ def write_directory_snapshot(
     # --- department_attributions (with downgrade protection) ---
     new_rows = derive_department_attributions(
         departments, users, chat_owner_lookup, manual_overrides)
+    if not business_rollup_enabled:
+        new_rows = disable_unapproved_business_rollup(new_rows)
     for r in new_rows:
         sid = r["source_dept_id"]
         prev = conn.execute(
@@ -565,7 +589,8 @@ def write_directory_snapshot(
         target_id = r["target_dept_id"]
         reason = r["reason"]
         if (prev and int(prev[0]) == 1 and active == 0
-                and rule != RULE_MANUAL):
+                and rule != RULE_MANUAL
+                and "production_enablement_blocked_low_coverage" not in reason):
             # Refuse to auto-downgrade a previously-active attribution.
             alerts.append({
                 "source_dept_id": sid, "kind": "downgrade_blocked",
@@ -688,6 +713,7 @@ def write_directory_snapshot(
         "unresolved": sum(1 for r in new_rows if r["rule"] == RULE_UNRESOLVED),
         "roles_written": written_roles,
         "resolved_business_outsourcing_rate": resolved_business_outsourcing_rate(new_rows),
+        "business_rollup_enabled": bool(business_rollup_enabled),
         "alerts": alerts,
         "synced_at": stamp,
     }
@@ -927,18 +953,24 @@ def main(argv=None):
     if args.dry_run:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
-    if summary["production_enablement_blocked"] and not args.allow_low_coverage:
-        summary["write_blocked"] = True
-        summary["override"] = "--allow-low-coverage"
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
-        return 2
-
+    business_rollup_enabled = (
+        not summary["production_enablement_blocked"] or args.allow_low_coverage
+    )
     conn = sqlite3.connect(args.db)
     try:
         result = write_directory_snapshot(
-            conn, users, departments, admin_emails=admin_emails)
+            conn, users, departments, admin_emails=admin_emails,
+            business_rollup_enabled=business_rollup_enabled)
     finally:
         conn.close()
+    result.update({
+        "visibility_warnings": warnings,
+        "min_required_rate": MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE,
+        "production_enablement_blocked": summary["production_enablement_blocked"],
+        "business_rollup_enabled": business_rollup_enabled,
+    })
+    if summary["production_enablement_blocked"] and not args.allow_low_coverage:
+        result["override"] = "--allow-low-coverage"
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

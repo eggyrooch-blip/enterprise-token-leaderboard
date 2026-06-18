@@ -145,6 +145,46 @@ def test_backfill_surfaces_inactive_chat_owner_candidate_as_pending():
     )
 
 
+def test_backfill_surfaces_inactive_pending_business_candidate():
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    raw = "Keep/合作商/W/中软国际科技服务有限公司(SP004867)"
+    _usage(conn, "candidate@keep.com", raw, 30)
+    conn.execute(
+        "INSERT INTO department_attributions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "dept-low-coverage-candidate",
+            dc._canonical_dept_key(raw),
+            "合作商/W/中软国际科技服务有限公司(SP004867)",
+            "dept-target",
+            "Keep/技术平台部/固件组",
+            "pending_business_outsourcing",
+            "leader_department",
+            "high",
+            0,
+            "production_enablement_blocked_low_coverage",
+            "2026-06-18",
+        ),
+    )
+    conn.commit()
+
+    written = dc._backfill_usage_attribution(conn, dry_run=False)
+    row = conn.execute(
+        "SELECT raw_dept, effective_dept, dept, spend_bucket, attribution_source"
+        " FROM usage WHERE email='candidate@keep.com'"
+    ).fetchone()
+
+    assert written["pending_business_outsourcing"] == 1
+    assert row == (
+        raw,
+        "Keep/技术平台部/固件组",
+        "Keep/技术平台部/固件组",
+        "pending_business_outsourcing",
+        "leader_department",
+    )
+
+
 def test_db_startup_backfills_existing_legacy_usage_rows(monkeypatch, tmp_path):
     dc = importlib.reload(dev_collector)
     db_path = tmp_path / "tok.db"

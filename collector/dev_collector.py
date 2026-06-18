@@ -1505,7 +1505,8 @@ def _active_attribution_map(conn):
             "SELECT source_dept_key, target_dept_path, spend_bucket, rule, active"
             " FROM department_attributions"
             " WHERE COALESCE(target_dept_path,'')<>''"
-            " AND (active=1 OR (active=0 AND rule='chat_owner_department'))"
+            " AND (active=1 OR (active=0 AND (rule='chat_owner_department'"
+            " OR spend_bucket='pending_business_outsourcing')))"
         ).fetchall()
     except Exception:
         return out
@@ -1566,7 +1567,8 @@ def _attribution_for_raw_dept(conn, raw_dept, active_map=None):
             rows = conn.execute(
                 "SELECT target_dept_path, spend_bucket, rule, active FROM department_attributions"
                 " WHERE source_dept_key=? AND COALESCE(target_dept_path,'')<>''"
-                " AND (active=1 OR (active=0 AND rule='chat_owner_department'))",
+                " AND (active=1 OR (active=0 AND (rule='chat_owner_department'"
+                " OR spend_bucket='pending_business_outsourcing')))",
                 (key,),
             ).fetchall()
         except Exception:
@@ -1577,7 +1579,7 @@ def _attribution_for_raw_dept(conn, raw_dept, active_map=None):
         return default
     target, bucket, rule = rows[0][:3]
     active = rows[0][3] if len(rows[0]) > 3 else 1
-    if not active and rule == "chat_owner_department":
+    if not active and (rule == "chat_owner_department" or bucket == BUCKET_PENDING_BUSINESS):
         bucket = BUCKET_PENDING_BUSINESS
     bucket = bucket or default_bucket
     if bucket not in (BUCKET_EMPLOYEE, BUCKET_BUSINESS, BUCKET_PENDING_BUSINESS, BUCKET_UNRESOLVED):
