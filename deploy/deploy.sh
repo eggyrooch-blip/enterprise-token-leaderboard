@@ -39,6 +39,7 @@ cd "$REPO_ROOT"
 [[ -f "collector/dev_collector.py" ]] || die "collector/dev_collector.py 不存在，请确认 repo 结构。"
 [[ -f "collector/feilian_client.py" ]] || die "collector/feilian_client.py 不存在。"
 [[ -f "collector/subscriptions_sync.py" ]] || die "collector/subscriptions_sync.py 不存在。"
+[[ -f "collector/feishu_directory_sync.py" ]] || die "collector/feishu_directory_sync.py 不存在。"
 [[ -f "agent/remote_tokscale_report.sh" ]] || die "agent/remote_tokscale_report.sh 不存在。"
 [[ -f "agent/tokreport_windows.ps1" ]] || die "agent/tokreport_windows.ps1 不存在。"
 command -v rsync >/dev/null 2>&1 || die "本机未安装 rsync。"
@@ -58,6 +59,7 @@ rsync -az \
     collector/feilian_client.py \
     collector/litellm_collector.py \
     collector/subscriptions_sync.py \
+    collector/feishu_directory_sync.py \
     collector/dashboard.html \
     collector/help.html \
     "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/"
@@ -132,6 +134,22 @@ ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
 info "subscriptions-sync.timer 已 enable --now（每天 03:30 触发，oneshot）"
 warn "立即手动跑一次（主控执行）: ssh it@${REMOTE_HOST} 'sudo systemctl start subscriptions-sync.service'"
 
+# ── 4d. 飞书通讯录同步 timer（每天 02:10 同步 people/departments/roles） ──
+# 前提：.env 里需含 FEISHU_APP_ID + FEISHU_APP_SECRET，且 bot 有 contact-read 权限。
+info "[4d/6] 安装 feishu-directory-sync service + timer（daily 02:10）"
+for _unit in feishu-directory-sync.service feishu-directory-sync.timer; do
+    sed \
+        -e "s|__REMOTE_DIR__|${REMOTE_DIR}|g" \
+        -e "s|__PYTHON__|${PYTHON}|g" \
+        "$SCRIPT_DIR/${_unit}" \
+    | ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+        "sudo tee /etc/systemd/system/${_unit} > /dev/null"
+done
+ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+    "sudo systemctl daemon-reload && sudo systemctl enable --now feishu-directory-sync.timer"
+info "feishu-directory-sync.timer 已 enable --now（每天 02:10 触发，oneshot）"
+warn "立即手动跑一次（主控执行）: ssh it@${REMOTE_HOST} 'sudo systemctl start feishu-directory-sync.service'"
+
 # ── 5. 幂等验证：检查 unit 是否被 systemd 识别 ──────────────────────
 info "[5/6] 验证 collector unit 注册"
 ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
@@ -141,8 +159,13 @@ info "[6/6] 验证 litellm-sync.timer"
 ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
     "sudo systemctl list-timers litellm-sync.timer --no-pager 2>&1 | head -5 || true"
 
+info "[6b/6] 验证 feishu-directory-sync.timer"
+ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+    "sudo systemctl list-timers feishu-directory-sync.timer --no-pager 2>&1 | head -5 || true"
+
 echo ""
 info "部署 kit 传输完成。collector 待主控 start；litellm-sync.timer 已自动计时。"
 info "主控启动 collector: ssh it@${REMOTE_HOST} 'sudo systemctl start ${SERVICE_NAME}'"
 info "litellm 立即首跑:    ssh it@${REMOTE_HOST} 'sudo systemctl start litellm-sync.service'"
+info "飞书通讯录首跑:      ssh it@${REMOTE_HOST} 'sudo systemctl start feishu-directory-sync.service'"
 info "冒烟测试: bash deploy/smoke.sh"

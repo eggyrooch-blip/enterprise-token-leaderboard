@@ -1,0 +1,18 @@
+[Unit]
+Description=飞书通讯录同步 → tokreport SQLite (people/departments/roles 组织架构真源)
+After=network-online.target tokreport-collector.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=it
+WorkingDirectory=__REMOTE_DIR__
+EnvironmentFile=__REMOTE_DIR__/.env
+# 与 collector 写同一个库; FEISHU_APP_ID/FEISHU_APP_SECRET/AUTH_ADMIN_EMAILS 从 .env 读
+Environment=DEV_DB=__REMOTE_DIR__/tok.db
+ExecStart=__PYTHON__ __REMOTE_DIR__/feishu_directory_sync.py --db __REMOTE_DIR__/tok.db
+# 拉通讯录树 + 用户 + 归因写库一次, 失败由 timer 次日重试
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=feishu-directory-sync

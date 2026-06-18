@@ -228,3 +228,27 @@ FEISHU_APP_ID=... FEISHU_APP_SECRET=... python3 collector/subscriptions_sync.py 
 （按席位区间摊销/徽章聚合/闲置治理,由 tests/ 断言两端一致）,但其 `subscriptions`
 表需要使用方自行灌数——Postgres 写入器是后续工作,当前未实现。生产事实来源以
 SQLite 部署为准。
+
+## 飞书通讯录同步（组织架构真源）
+
+**运行方式**：`feishu-directory-sync.timer` 每天 02:10 触发
+`feishu_directory_sync.py`（oneshot），与 collector 同宿主、纯标准库、直接写
+`tok.db`。它写入/更新 `feishu_users`、`departments`、`department_attributions`、
+`people`、`roles`，使看板权限、部门归属、负责人范围以飞书通讯录为准。
+
+**前置**：`pipeline/.env` 里需含 `FEISHU_APP_ID` + `FEISHU_APP_SECRET`，同一 bot
+必须开启 contact-read 通讯录读取权限，并对所有需要统计/授权的部门有可见范围。
+`FEISHU_ROOT_DEPT` 默认 `0`；`AUTH_ADMIN_EMAILS` 用于补充管理员 allowlist，
+`sunke@keep.com` 仍由代码固定为超管兜底。
+
+**手动运维**：
+```bash
+ssh it@collector.example.com 'sudo systemctl start feishu-directory-sync.service'   # 立即跑一次
+ssh it@collector.example.com 'sudo journalctl -u feishu-directory-sync -n 80 --no-pager'  # 看日志
+ssh it@collector.example.com 'sudo systemctl list-timers feishu-directory-sync.timer'     # 看下次触发
+# 只读演练（本机，不写库，打印部门/用户/外包归因/可见性告警）：
+FEISHU_APP_ID=... FEISHU_APP_SECRET=... python3 collector/feishu_directory_sync.py --dry-run --db /tmp/tok.db
+```
+
+**上线门槛**：dry-run 的 `production_enablement_blocked` 必须为 `false`，或孙可明确接受
+低于阈值的业务外包归因覆盖率；否则只允许同步通讯录/角色，不应把未解析供应商静默并入部门榜。

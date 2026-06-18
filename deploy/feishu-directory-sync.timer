@@ -1,0 +1,12 @@
+[Unit]
+Description=每日触发 feishu-directory-sync.service (飞书通讯录/部门/角色同步)
+
+[Timer]
+# 启动后 7 分钟先跑一次, 之后每天 02:10 跑, 早于 subscriptions-sync 的 03:30.
+OnBootSec=7min
+OnCalendar=*-*-* 02:10:00
+Persistent=true
+Unit=feishu-directory-sync.service
+
+[Install]
+WantedBy=timers.target
