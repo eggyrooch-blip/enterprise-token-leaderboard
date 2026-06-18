@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task.
 
-**Goal:** Make Feishu the source of truth for people, departments, outsourcing attribution, and dashboard authorization: supplier/outsourcing spend is attributed to the real business department, employees see only themselves, department owners see their department subtree, and admins see everything.
+**Goal:** Make Feishu the source of truth for people, departments, outsourcing attribution, department leaderboard split metrics, and dashboard authorization: supplier/outsourcing spend is attributed to the real business department while remaining separately measurable, employees see only themselves, department owners see their department subtree, and admins see everything.
 
-**Architecture:** Keep the current production shape: `dev_collector.py` + SQLite + systemd on `tokscale.gotokeep.com`. Add a pure-stdlib Feishu directory sync that writes raw directory data (`feishu_users`, `departments`), derived business attribution (`department_attributions`), dashboard-compatible people data (`people`), roles, and auth sessions. Add OAuth web login endpoints and a single authorization/scope layer used by every dashboard API. Feilian remains only a device-serial attribution fallback; once an email is known, Feishu directory data wins for name, department, status, role, and effective department attribution.
+**Architecture:** Keep the current production shape: `dev_collector.py` + SQLite + systemd on `tokscale.gotokeep.com`. Add a pure-stdlib Feishu directory sync that writes raw directory data (`feishu_users`, `departments`), derived business attribution (`department_attributions`), spend buckets, dashboard-compatible people data (`people`), roles, and auth sessions. Add OAuth web login endpoints and a single authorization/scope layer used by every dashboard API. Feilian remains only a device-serial attribution fallback; once an email is known, Feishu directory data wins for name, department, status, role, effective department attribution, and spend bucket.
 
 **Tech Stack:** Python 3.6-compatible standard library, SQLite, existing `BaseHTTPRequestHandler` collector, Feishu Open Platform OAuth + contact APIs, systemd timer. No new runtime dependency.
 
@@ -65,7 +65,14 @@ Extend/create:
   - `raw_dept TEXT DEFAULT ''`
   - `effective_dept TEXT DEFAULT ''`
   - `attribution_source TEXT DEFAULT ''`
+  - `spend_bucket TEXT DEFAULT 'employee_staff_outsourcing'`
   - `updated_at TEXT`
+- `usage` add nullable/backfilled columns if missing:
+  - `raw_dept TEXT DEFAULT ''`
+  - `effective_dept TEXT DEFAULT ''`
+  - `spend_bucket TEXT DEFAULT 'employee_staff_outsourcing'`
+  - `attribution_source TEXT DEFAULT ''`
+  - Keep existing `usage.dept` as the compatibility grouping field; after the migration it stores the effective department used by existing dashboard queries.
 - `feishu_users`
   - `open_id TEXT PRIMARY KEY`
   - `user_id TEXT DEFAULT ''`
@@ -94,6 +101,7 @@ Extend/create:
   - `source_dept_path TEXT NOT NULL`
   - `target_dept_id TEXT DEFAULT ''`
   - `target_dept_path TEXT DEFAULT ''`
+  - `spend_bucket TEXT NOT NULL` where bucket is `employee_staff_outsourcing`, `business_outsourcing`, or `unresolved`
   - `rule TEXT NOT NULL` where rule is `direct_feishu_dept`, `leader_department`, `chat_owner_department`, `manual_override`, or `unresolved`
   - `confidence TEXT NOT NULL` where confidence is `high`, `medium`, or `needs_review`
   - `active INTEGER NOT NULL DEFAULT 0`
@@ -122,6 +130,10 @@ Extend/create:
 Raw department and effective department are deliberately separate:
 - `departments.path` and `people.raw_dept` preserve Feishu's source-of-truth org path.
 - `department_attributions.source_dept_key`, `target_dept_path`, and `people.effective_dept` are used for dashboard spend roll-up.
+- `spend_bucket` preserves metric separation after roll-up:
+  - `employee_staff_outsourcing`: regular employees plus personnel outsourcing; this is the "员工+人员外包" view.
+  - `business_outsourcing`: business outsourcing / supplier spend attributed back to the real business department; this is the "业务外包" view.
+  - `department_full`: not stored as a bucket; it is computed as `employee_staff_outsourcing + business_outsourcing` for the same effective department.
 - Only active, high-confidence attributions feed non-admin dashboard roll-ups by default: `direct_feishu_dept`, `leader_department`, and `manual_override`. `chat_owner_department` starts as a review suggestion unless explicitly promoted.
 - When no confident attribution exists, keep the raw supplier path and mark the attribution `unresolved`; do not silently guess.
 
@@ -151,6 +163,12 @@ Department roll-up policy:
 - Team/global spend roll-ups use `effective_dept`.
 - User profile/detail can show both `raw_dept` and `effective_dept` to admins, so attribution can be audited.
 - Non-admin users never see unresolved/global outsourcing buckets outside their scope.
+- Department leaderboard must expose three metric views for every visible department:
+  - `department_full`: all visible spend attributed to that effective department.
+  - `employee_staff_outsourcing`: regular employee spend plus personnel outsourcing spend.
+  - `business_outsourcing`: business outsourcing / supplier spend attributed to that effective department.
+- `department_full` must equal `employee_staff_outsourcing + business_outsourcing` for comparable numeric metrics such as tokens, cost, messages, and active users after dedupe rules are applied.
+- The UI may show these as three columns or a segmented mode switch (`部门全集`, `员工+人员外包`, `业务外包`), but the API must return all three so data can be checked independently.
 
 ## Implementation Tasks
 
@@ -283,7 +301,10 @@ Assert:
 - leader-owned supplier maps to leader's real department with rule `leader_department`, confidence `high`, `active=1`.
 - readable department chat owner maps to owner department with rule `chat_owner_department`, confidence `medium`, `active=0` until manually promoted.
 - unreadable/missing owner maps to `unresolved`, confidence `needs_review`, and does not rewrite people rows to a guessed department.
-- non-outsourcing departments default to rule `direct_feishu_dept`.
+- non-outsourcing departments default to rule `direct_feishu_dept`, `spend_bucket=employee_staff_outsourcing`.
+- personnel outsourcing departments that already encode or resolve to a real business department use `spend_bucket=employee_staff_outsourcing`.
+- business outsourcing supplier departments that are attributed back to a real business department use `spend_bucket=business_outsourcing`.
+- ambiguous supplier/personnel classification uses `spend_bucket=unresolved` and is visible only to admin review until a manual override sets the bucket.
 - if a leader or chat owner resolves to another outsourcing department, the source stays `unresolved` to avoid cycles and recursive supplier-to-supplier attribution.
 - an emailless supplier usage event whose raw Feilian department is `Keep / 合作商 / W / <supplier>` can still roll up through `department_attributions` when the Feishu path is `合作商/W/<supplier>` and the attribution is active.
 - raw Feilian department strings that normalize to no synced Feishu attribution key are counted as `unmatched_feilian_dept_keys` and do not silently fall back to a guessed target.
@@ -299,17 +320,19 @@ Expected before implementation: attribution functions missing or failing.
 
 Add pure functions:
 - `is_outsourcing_department(path)`: true for paths under `合作商/` and future-configured prefixes.
+- `classify_spend_bucket(path, department, manual_overrides=None)`.
 - `canonical_dept_key(raw_path)`.
 - `derive_department_attributions(departments, users, chat_owner_lookup=None, manual_overrides=None)`.
 - `effective_dept_for_person(raw_dept_path, attributions)`.
 
 Rules in order:
 1. Manual override wins if configured.
-2. Non-outsourcing path maps to itself (`direct_feishu_dept`).
-3. Outsourcing supplier department with `leader_user_id`: resolve leader's primary real department.
-4. Outsourcing supplier department with readable `chat_id` owner: resolve owner's primary real department, but write it inactive until admin/manual promotion.
-5. If the resolved target is still under any outsourcing prefix, mark unresolved.
-6. Else unresolved; preserve source path.
+2. Non-outsourcing path maps to itself (`direct_feishu_dept`) and bucket `employee_staff_outsourcing`.
+3. Personnel outsourcing path maps to its effective real department and bucket `employee_staff_outsourcing`.
+4. Business outsourcing supplier department with `leader_user_id`: resolve leader's primary real department and bucket `business_outsourcing`.
+5. Business outsourcing supplier department with readable `chat_id` owner: resolve owner's primary real department, bucket `business_outsourcing`, but write it inactive until admin/manual promotion.
+6. If the resolved target is still under any outsourcing prefix, mark unresolved.
+7. Else unresolved; preserve source path.
 
 Do not call real IM chat APIs in unit tests. Inject `chat_owner_lookup`.
 
@@ -547,6 +570,9 @@ For each role, call handler methods or HTTP harness:
 - owner subtree includes resolved supplier spend only when `department_attributions.active=1` and `effective_dept` maps a supplier raw department into the owned business department
 - owner subtree does not include inactive `chat_owner_department` suggestions until an admin/manual override promotes them
 - owner subtree does not include unresolved supplier spend from outside their owned department
+- `/v1/teams` returns split metrics for each department: `department_full`, `employee_staff_outsourcing`, and `business_outsourcing`.
+- For test fixture rows, `department_full.total = employee_staff_outsourcing.total + business_outsourcing.total`, and same for cost/messages where applicable.
+- Sorting/filtering can use `department_full` by default, but bucket metrics stay available in the response.
 - `/v1/feishu` member/owner responses recompute summary/total/quota fields after auth filtering; no pre-filter company-wide totals remain beside filtered rows
 - owner cannot use `include_excluded=1`
 - admin can use full existing behavior
@@ -574,7 +600,13 @@ Apply visible filters to:
 - `_governance_metrics` admin-only
 - `_raw` admin-only
 
-Any team grouping SQL should group by `COALESCE(NULLIF(people.effective_dept, ''), people.dept)`, not raw `people.dept` alone. For `sn:<serial>` or other non-email identities, `_tokscale_report` must compute `effective_dept` from the raw Feilian department through active `department_attributions` before writing lifetime/monthly/daily rows and `people`.
+Any team grouping SQL should group by `COALESCE(NULLIF(usage.effective_dept, ''), usage.dept)`, not raw `people.dept` alone. For `sn:<serial>` or other non-email identities, `_tokscale_report` must compute `effective_dept` and `spend_bucket` from the raw Feilian department through active `department_attributions` before writing lifetime/monthly/daily rows and `people`.
+
+Department split aggregation:
+- `employee_staff_outsourcing`: `SUM(...) WHERE spend_bucket='employee_staff_outsourcing'`.
+- `business_outsourcing`: `SUM(...) WHERE spend_bucket='business_outsourcing'`.
+- `department_full`: sum of the two visible buckets for the same effective department.
+- Admin-only review surfaces may show `unresolved` separately; owner/member views do not include unresolved in department_full.
 
 **Step 4: Verify targeted suite**
 
@@ -605,19 +637,22 @@ Cases:
 - if Feishu raw department is a resolved supplier/outsourcing department, usage rolls up to attribution target while preserving raw department for admin audit.
 - if Feilian returns no email and the identity becomes `sn:<serial>`, but returns raw department `Keep/合作商/W/<supplier>` or another normalizable supplier path, the usage still rolls up through active `department_attributions`.
 - if the supplier attribution is inactive or unresolved, the usage keeps raw department and is visible only to admin review surfaces.
+- usage upserts populate `raw_dept`, `effective_dept`, and `spend_bucket`; existing `dept` remains the effective department for backward-compatible queries.
+- personnel outsourcing and regular employees count into `employee_staff_outsourcing`; business outsourcing suppliers count into `business_outsourcing` after active attribution.
 
 **Step 2: Implement lookup precedence**
 
 Add helper:
 - `_directory_identity_for_email(conn, email)`
 - `_effective_dept_for_raw_dept(conn, raw_dept)`
+- `_spend_bucket_for_raw_dept(conn, raw_dept)`
 - `_canonical_dept_key(raw_dept)`
 - `_merge_identity(serial_identity, reported_email, directory_identity)`
 
 Precedence:
 1. Email from Feilian or payload
-2. If email exists in Feishu-synced `people`, use Feishu name/avatar/raw_dept/effective_dept/status
-3. Else use Feilian result and compute `effective_dept` from raw Feilian department through active `department_attributions.source_dept_key`
+2. If email exists in Feishu-synced `people`, use Feishu name/avatar/raw_dept/effective_dept/status/spend_bucket
+3. Else use Feilian result and compute `effective_dept` and `spend_bucket` from raw Feilian department through active `department_attributions.source_dept_key`
 4. Else `sn:<serial>`
 
 **Step 3: Verify**
@@ -645,6 +680,7 @@ Assert dashboard contains:
 - `/v1/me` bootstrap call
 - login button or redirect path `/auth/login`
 - role/scope label text
+- department leaderboard controls or columns for `部门全集`, `员工+人员外包`, and `业务外包`
 - no visible global data loading before auth passes
 
 **Step 2: Implement minimal UI**
@@ -655,6 +691,11 @@ On load:
 - if authenticated, show user name/dept/role and then load dashboard data
 
 Do not build a full role management UI.
+
+For department leaderboard:
+- Default view uses `部门全集`.
+- Expose `员工+人员外包` and `业务外包` as visible comparable metrics, either as columns or a segmented control.
+- Do not hide the split behind an admin-only debug panel; department owners need to see the split for their own scope.
 
 **Step 3: Browser SIM**
 
@@ -710,6 +751,8 @@ Start local collector using ftask env. Verify:
 - member session cannot see others
 - owner session subtree is enforced
 - active supplier spend mapped into an owned department is visible to that owner in team roll-up
+- department leaderboard shows three metrics for the owned department: `部门全集`, `员工+人员外包`, and `业务外包`
+- `部门全集` equals `员工+人员外包 + 业务外包` for the same scoped data
 - inactive chat-owner suggestions are visible only to admins
 - unresolved supplier spend is visible only to admin review surfaces
 
@@ -739,6 +782,7 @@ Ask Claude/reviewer to specifically challenge:
 - Whether emailless supplier usage now has a real path from `_tokscale_report` raw Feilian department through `canonical_dept_key` to active `department_attributions` to dashboard roll-up.
 - Whether canonical department key normalization is strict enough to match Feilian/Feishu without creating false positives.
 - Whether pinning Feishu joins on `open_id` covers leader/owner/OAuth mapping without mis-joining `user_id`.
+- Whether the three department leaderboard metrics (`部门全集`, `员工+人员外包`, `业务外包`) are defined clearly enough and cannot double-count after attribution.
 - Whether the `合作商/` prefix is a safe first-version detector for outsourcing departments, or needs an explicit allowlist.
 - Whether `chat_owner_department` being inactive by default is the right safety tradeoff, or whether sunke wants automatic medium-confidence roll-up.
 - Whether unresolved supplier departments should remain visible to admins only, or need a public "unattributed" bucket.
