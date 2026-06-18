@@ -72,7 +72,8 @@ Extend/create:
   - `effective_dept TEXT DEFAULT ''`
   - `spend_bucket TEXT DEFAULT 'employee_staff_outsourcing'`
   - `attribution_source TEXT DEFAULT ''`
-  - Keep existing `usage.dept` as the compatibility grouping field; after the migration it stores the effective department used by existing dashboard queries.
+  - Keep existing `usage.dept` as the compatibility grouping field; after the migration/backfill it stores the effective department used by existing dashboard queries.
+  - Default values are only migration placeholders. Production enablement requires a one-time backfill that re-derives `raw_dept`, `effective_dept`, and `spend_bucket` for existing rows from the current `usage.dept` plus `department_attributions`.
 - `feishu_users`
   - `open_id TEXT PRIMARY KEY`
   - `user_id TEXT DEFAULT ''`
@@ -167,7 +168,8 @@ Department roll-up policy:
   - `department_full`: all visible spend attributed to that effective department.
   - `employee_staff_outsourcing`: regular employee spend plus personnel outsourcing spend.
   - `business_outsourcing`: business outsourcing / supplier spend attributed to that effective department.
-- `department_full` must equal `employee_staff_outsourcing + business_outsourcing` for comparable numeric metrics such as tokens, cost, messages, and active users after dedupe rules are applied.
+- `department_full` must equal `employee_staff_outsourcing + business_outsourcing` only for additive numeric metrics such as tokens, cost, and messages.
+- Active-user counts are not additive by default because the same person can appear under email and `sn:<serial>` or move buckets after attribution. Compute active users per view with the same canonical identity logic, but do not assert `full_active_users = employee_active_users + business_active_users`.
 - The UI may show these as three columns or a segmented mode switch (`部门全集`, `员工+人员外包`, `业务外包`), but the API must return all three so data can be checked independently.
 
 ## Implementation Tasks
@@ -605,8 +607,9 @@ Any team grouping SQL should group by `COALESCE(NULLIF(usage.effective_dept, '')
 Department split aggregation:
 - `employee_staff_outsourcing`: `SUM(...) WHERE spend_bucket='employee_staff_outsourcing'`.
 - `business_outsourcing`: `SUM(...) WHERE spend_bucket='business_outsourcing'`.
-- `department_full`: sum of the two visible buckets for the same effective department.
+- `department_full`: arithmetic sum of the two visible buckets for the same effective department. Do not compute it as an independent `GROUP BY effective_dept` over all rows.
 - Admin-only review surfaces may show `unresolved` separately; owner/member views do not include unresolved in department_full.
+- Rows with `spend_bucket IS NULL`, stale values, or `unresolved` are excluded from non-admin `department_full` and surfaced in admin review counts.
 
 **Step 4: Verify targeted suite**
 
@@ -668,7 +671,60 @@ git add collector/dev_collector.py tests/test_feishu_identity_source.py
 git commit -m "feat: prefer feishu directory over feilian org data"
 ```
 
-### Task 10: Dashboard Login UX
+### Task 10: Usage Attribution Backfill
+
+**Files:**
+- Modify: `collector/dev_collector.py`
+- Create or modify: `tests/test_usage_attribution_backfill.py`
+- Modify: `deploy/RUNBOOK.md`
+
+**Step 1: Write failing backfill tests**
+
+Seed existing `usage` rows created before the migration:
+- row A: `dept='技术平台部/固件组'`, no `raw_dept`, no `effective_dept`, no `spend_bucket`.
+- row B: `dept='Keep/合作商/W/中软国际科技服务有限公司(SP004867)'`, no split columns; `department_attributions` maps its canonical key to `技术平台部/固件组`, `spend_bucket='business_outsourcing'`, `active=1`.
+- row C: `dept='Keep/合作商/W/未解析供应商'`, no active attribution.
+
+Assert after backfill:
+- row A keeps raw/effective department as `技术平台部/固件组`, bucket `employee_staff_outsourcing`.
+- row B has `raw_dept` preserved as supplier path, `effective_dept='技术平台部/固件组'`, `dept='技术平台部/固件组'`, bucket `business_outsourcing`.
+- row C keeps raw department and bucket `unresolved` or review-only; it does not enter non-admin `department_full`.
+- dry-run prints counts by bucket and unresolved/stale rows before writing.
+
+Run:
+```bash
+pytest tests/test_usage_attribution_backfill.py -q
+```
+Expected before implementation: helper missing or columns not backfilled.
+
+**Step 2: Implement backfill helper**
+
+Add:
+- `_ensure_usage_attribution_columns(conn)`.
+- `_backfill_usage_attribution(conn, dry_run=True)`.
+
+Rules:
+- For rows where `raw_dept` is empty, treat existing `usage.dept` as the raw legacy department.
+- Use `_canonical_dept_key(raw_dept)` and active `department_attributions` to set `effective_dept`, `spend_bucket`, and `attribution_source`.
+- Write `usage.dept=effective_dept` only when the row has a resolved active attribution or direct department mapping.
+- Do not rewrite unresolved rows to guessed departments.
+- Bucket reclassification for historical windows only happens through this explicit backfill; future rule changes require rerunning the backfill intentionally.
+
+**Step 3: Verify split math**
+
+Extend API tests:
+- additive metrics: `department_full.tokens/cost/messages = employee_staff_outsourcing + business_outsourcing`.
+- active users: compute per view, but do not assert additivity.
+- unresolved row with populated `effective_dept` is excluded from non-admin `department_full`.
+
+**Step 4: Commit**
+
+```bash
+git add collector/dev_collector.py tests/test_usage_attribution_backfill.py deploy/RUNBOOK.md
+git commit -m "feat: backfill usage attribution buckets"
+```
+
+### Task 11: Dashboard Login UX
 
 **Files:**
 - Modify: `collector/dashboard.html`
@@ -712,7 +768,7 @@ git add collector/dashboard.html tests/test_dashboard_auth.py
 git commit -m "feat: add feishu login dashboard shell"
 ```
 
-### Task 11: End-to-End Tests And Deployment Plan
+### Task 12: End-to-End Tests And Deployment Plan
 
 **Files:**
 - Modify: `deploy/RUNBOOK.md`
