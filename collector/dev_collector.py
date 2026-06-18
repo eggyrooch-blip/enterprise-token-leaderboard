@@ -580,7 +580,7 @@ def feishu_authorize_url(state):
         "redirect_uri": FEISHU_OAUTH_REDIRECT_URI,
         "state": state,
     })
-    return FEISHU_HOST + "/open-apis/authen/v1/authorize?" + q
+    return FEISHU_HOST + "/open-apis/authen/v1/index?" + q
 
 
 def _safe_next_path(raw):

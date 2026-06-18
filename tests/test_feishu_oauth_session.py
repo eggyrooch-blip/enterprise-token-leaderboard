@@ -88,6 +88,18 @@ def test_login_next_keeps_local_path_and_query(conn, monkeypatch):
     assert dc.consume_oauth_state(conn, state) == "/dashboard?tab=team"
 
 
+def test_authorize_url_uses_current_feishu_code_endpoint(monkeypatch):
+    monkeypatch.setattr(dc, "FEISHU_HOST", "https://open.feishu.cn")
+    monkeypatch.setattr(dc, "FEISHU_APP_ID", "cli_test")
+    monkeypatch.setattr(dc, "FEISHU_OAUTH_REDIRECT_URI", "https://example.com/v1/auth/callback")
+
+    url = dc.feishu_authorize_url("state-1")
+
+    assert url.startswith("https://open.feishu.cn/open-apis/authen/v1/index?")
+    assert "app_id=cli_test" in url
+    assert "state=state-1" in url
+
+
 # --------------------------------------------------------------------------- #
 # session lifecycle + expiry
 # --------------------------------------------------------------------------- #
