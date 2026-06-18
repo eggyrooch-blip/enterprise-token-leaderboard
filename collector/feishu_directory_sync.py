@@ -896,6 +896,12 @@ def main(argv=None):
     parser.add_argument("--root", default=os.environ.get("FEISHU_ROOT_DEPT", "0"))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--admin-emails", default=os.environ.get("AUTH_ADMIN_EMAILS", ""))
+    parser.add_argument(
+        "--allow-low-coverage",
+        action="store_true",
+        default=os.environ.get("ALLOW_LOW_FEISHU_ATTRIBUTION_COVERAGE", "").strip() == "1",
+        help="write even when resolved business-outsourcing coverage is below threshold",
+    )
     args = parser.parse_args(argv)
 
     client = FeishuDirectoryClient()
@@ -920,6 +926,11 @@ def main(argv=None):
     if args.dry_run:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
+    if summary["production_enablement_blocked"] and not args.allow_low_coverage:
+        summary["write_blocked"] = True
+        summary["override"] = "--allow-low-coverage"
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 2
 
     conn = sqlite3.connect(args.db)
     try:

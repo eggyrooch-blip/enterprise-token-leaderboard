@@ -251,4 +251,6 @@ FEISHU_APP_ID=... FEISHU_APP_SECRET=... python3 collector/feishu_directory_sync.
 ```
 
 **上线门槛**：dry-run 的 `production_enablement_blocked` 必须为 `false`，或孙可明确接受
-低于阈值的业务外包归因覆盖率；否则只允许同步通讯录/角色，不应把未解析供应商静默并入部门榜。
+低于阈值的业务外包归因覆盖率；否则 CLI 会返回 2 且不写 `tok.db`，避免把未解析供应商静默
+并入部门榜。明确接受时才设置 `ALLOW_LOW_FEISHU_ATTRIBUTION_COVERAGE=1`，或手工运行时加
+`--allow-low-coverage`。

@@ -71,6 +71,18 @@ def _attributions(chat_owner=None):
     return fds.derive_department_attributions(deps, users, chat_owner_lookup=lookup)
 
 
+class _FakeDirectoryClient:
+    def fetch_snapshot(self, root="0"):
+        deps, pbi = _paths()
+        users = _users()
+        for u in users:
+            u["dept_path"] = pbi.get(u["dept_id"], "")
+        return deps, users
+
+    def validate_visibility_coverage(self, departments, users):
+        return []
+
+
 # --------------------------------------------------------------------------- #
 # canonical_dept_key
 # --------------------------------------------------------------------------- #
@@ -260,6 +272,30 @@ def test_downgrade_protection_keeps_last_known_good():
     assert row[0] == 1  # still active (last-known-good preserved)
     assert "downgrade_blocked" in row[1]
     assert any(a["kind"] == "downgrade_blocked" for a in result["alerts"])
+
+
+def test_cli_blocks_write_when_supplier_coverage_below_threshold(monkeypatch, tmp_path):
+    monkeypatch.setattr(fds, "FeishuDirectoryClient", lambda: _FakeDirectoryClient())
+    db_path = tmp_path / "tok.db"
+
+    rc = fds.main(["--db", str(db_path)])
+
+    assert rc == 2
+    assert not db_path.exists()
+
+
+def test_cli_allows_low_coverage_only_with_explicit_override(monkeypatch, tmp_path):
+    monkeypatch.setattr(fds, "FeishuDirectoryClient", lambda: _FakeDirectoryClient())
+    db_path = tmp_path / "tok.db"
+
+    rc = fds.main(["--db", str(db_path), "--allow-low-coverage"])
+
+    assert rc == 0
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM department_attributions").fetchone()[0] > 0
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #
