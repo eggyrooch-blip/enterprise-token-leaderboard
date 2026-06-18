@@ -243,7 +243,7 @@
     </div>
     <div class="card" id="list"><div class="empty">加载中…</div></div>
 
-    <div class="foot" id="foot">数据来源：本地 agent 汇总 + AI 网关同步 + 代码采纳指标。公开默认只使用聚合计数，不采集 prompt 或代码内容。</div>
+    <div class="foot" id="foot">个人榜公司实付 = 网关实销 + 订阅席位摊销 + 飞书点数折算；部门榜金额标为估算，仅作参考。个人榜默认不含归属 Agent 消耗，Agent 榜与 /v1/agent_owner_summary 单独统计。公开默认只使用聚合计数，不采集 prompt 或代码内容。</div>
   </div>
 
 <script>
@@ -305,6 +305,7 @@ async function fillMeta(){
     if(m && m.min_date){ META_MIN=m.min_date; META_MAX=m.max_date; }   // 存全局供算天数
     if(m && m.min_date && !$('from').value && !$('to').value){
       $('from').value=m.min_date; $('to').value=m.max_date;
+      RANGE_FROM=m.min_date; RANGE_TO=m.max_date;
     }
     var sub=$('sub');
     if(sub && m && m.min_date){
@@ -503,7 +504,7 @@ function renderTeamTree(){
       var big=compact(mv(x))+'/人';
       // 人均点数(飞书 aily,单位「点」)与 token 分列,不加总;只在该部门有 aily 用量时显示
       var creditTag=(x.per_capita_credits>0)?(' · 人均 '+compact(x.per_capita_credits)+' 点'):'';
-      var small='总 '+compact(metricTok(x.tokens||0))+' · $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%'+creditTag;
+      var small='总 '+compact(metricTok(x.tokens||0))+' · 估算 $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%'+creditTag;
       var pad=depth*18;                                 // 每级缩进 18px,层级靠缩进体现
       // 有子节点的行:整行可点(data-path + 手型光标),点哪都展开/收起,不必精准点三角
       var rowAttr=hasKids?(' data-path="'+encodeURIComponent(x.dept)+'" style="cursor:pointer"'):'';
@@ -609,7 +610,7 @@ function render(){
       // 部门榜:主指标=人均(已含日均口径);副标题给总量做参考
       fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
       big=compact(mv(x))+'/人';
-      small='总 '+compact(metricTok(x.tokens||0))+' · $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%';
+      small='总 '+compact(metricTok(x.tokens||0))+' · 估算 $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%';
     } else if(isPersonCost){
       fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
       big='$'+grp(Math.round(mv(x)));

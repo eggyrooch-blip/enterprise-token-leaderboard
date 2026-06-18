@@ -62,6 +62,11 @@ for _ENV in (os.path.join(_d, "..", "pipeline", ".env"), os.path.join(_d, ".env"
 # 与 subscriptions_sync 的 user_id@keep.com 约定一致; 可用 env(或 .env)覆盖。
 # 必须在上面的 .env 载入之后求值, 否则 .env 里的 AI_EMAIL_DOMAIN 被忽略。
 AI_EMAIL_DOMAIN = os.environ.get("AI_EMAIL_DOMAIN", "keep.com").strip().lstrip("@").lower()
+LEADERBOARD_EXCLUDE_EMAILS = {
+    e.strip().lower()
+    for e in os.environ.get("LEADERBOARD_EXCLUDE_EMAILS", "sunke@keep.com").split(",")
+    if e.strip()
+}
 
 # 飞书 AI 权益计费常量 —— 必须在 .env 加载之后取值,否则 .env 里的覆盖不生效。
 PACKAGE_CNY = _env_float("FEISHU_PACKAGE_CNY", 99000)
@@ -858,6 +863,23 @@ def _show_departed(qs):
     return str(raw).strip().lower() in ("1", "true", "yes")
 
 
+def _include_excluded(qs):
+    """解析 ?include_excluded=1 → bool。只影响 LEADERBOARD_EXCLUDE_EMAILS。"""
+    raw = (qs.get("include_excluded") or [None])[0]
+    return str(raw).strip().lower() in ("1", "true", "yes")
+
+
+def _excluded_filter(qs, prefix=""):
+    """配置化极值/内部账号过滤。默认生效;?include_excluded=1 时关闭。
+
+    返回 (sql_fragment, params)，统一用 lower(email) 做大小写无关匹配。
+    """
+    if _include_excluded(qs) or not LEADERBOARD_EXCLUDE_EMAILS:
+        return "", []
+    placeholders = ",".join("?" for _ in LEADERBOARD_EXCLUDE_EMAILS)
+    return " AND lower(%semail) NOT IN (%s)" % (prefix, placeholders), sorted(LEADERBOARD_EXCLUDE_EMAILS)
+
+
 def _feishu_range(qs):
     """飞书 feishu_member.usage_date 区间 → (sql_fragment, params)。语义同 _range_clause:
     ?from=&to= 优先,否则 ?days=N,默认近 30 天。fragment 形如 ' AND usage_date >= ?',
@@ -1058,6 +1080,7 @@ def _personal_board_rows(conn, qs):
     where, params = _range_clause(qs, "u.")
     sd = _show_departed(qs)
     dep_clause = _departed_filter(sd, "u.")
+    ex_clause, ex_params = _excluded_filter(qs, "u.")
     departed = _departed_set(conn)
     cost_start, cost_end = _cost_window(qs)
     today = datetime.date.today()
@@ -1073,19 +1096,19 @@ def _personal_board_rows(conn, qs):
                MAX(p.dept)
         FROM usage u LEFT JOIN people p ON p.email = u.email
         WHERE %s AND u.source != 'litellm_agent'
-          AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s
+          AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s
         GROUP BY u.email
         HAVING SUM(u.total) > 0
         ORDER BY SUM(u.total) DESC
-    """ % (where, dep_clause), params).fetchall()
+    """ % (where, dep_clause, ex_clause), params + ex_params).fetchall()
     comp = {}
     for cr in conn.execute("""
         SELECT u.email, u.client, SUM(u.total)
         FROM usage u
         WHERE %s AND u.source != 'litellm_agent'
-          AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s
+          AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s
         GROUP BY u.email, u.client
-    """ % (where, dep_clause), params).fetchall():
+    """ % (where, dep_clause, ex_clause), params + ex_params).fetchall():
         comp.setdefault(cr[0], []).append({"client": cr[1], "tokens": cr[2] or 0})
     result = []
     by_email = {}
@@ -1111,10 +1134,12 @@ def _personal_board_rows(conn, qs):
     # 飞书 AI 权益并入(1 点 = 1 token; 纯飞书用户也建行)。
     frng, fparams = _feishu_range(qs)
     fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
+    fex, fex_params = _excluded_filter(qs, "")
     for fr in conn.execute(
             "SELECT email, MAX(name), MAX(dept), MAX(avatar), SUM(credits)"
-            " FROM feishu_member WHERE 1=1%s%s"
-            " GROUP BY email HAVING SUM(credits)>0" % (frng, fdep), fparams).fetchall():
+            " FROM feishu_member WHERE 1=1%s%s%s"
+            " GROUP BY email HAVING SUM(credits)>0" % (frng, fdep, fex),
+            fparams + fex_params).fetchall():
         fem, fname, fdept, favatar, credits = fr[0], fr[1], fr[2], fr[3], fr[4] or 0
         if credits <= 0:
             continue
@@ -1519,6 +1544,8 @@ class H(BaseHTTPRequestHandler):
                 return self._leaderboard(conn, qs)
             if path == "/v1/agent_leaderboard":
                 return self._agent_leaderboard(conn, qs)
+            if path == "/v1/agent_owner_summary":
+                return self._agent_owner_summary(conn, qs)
             if path == "/v1/teams":
                 return self._teams(conn, qs)
             if path == "/v1/cursor":
@@ -1574,6 +1601,7 @@ class H(BaseHTTPRequestHandler):
         ps, pe = span[0], span[1]
         sd = _show_departed(qs)
         dep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
+        ex, ex_params = _excluded_filter(qs, "")
         quota = [{"feature_key": r[0], "quota": r[1] or 0, "used": r[2] or 0, "remain": r[3] or 0}
                  for r in conn.execute(
                      "SELECT feature_key,quota,used,remain FROM feishu_quota WHERE period_start="
@@ -1585,14 +1613,14 @@ class H(BaseHTTPRequestHandler):
                        "SELECT email, MAX(name), MAX(dept), MAX(avatar), SUM(credits),"
                        " SUM(CASE WHEN feature_key='AI_credits' THEN credits ELSE 0 END),"
                        " SUM(CASE WHEN feature_key='aily_credits' THEN credits ELSE 0 END)"
-                       " FROM feishu_member WHERE 1=1%s%s"
-                       " GROUP BY email HAVING SUM(credits)>0 ORDER BY SUM(credits) DESC" % (rng, dep),
-                       params).fetchall()]
+                       " FROM feishu_member WHERE 1=1%s%s%s"
+                       " GROUP BY email HAVING SUM(credits)>0 ORDER BY SUM(credits) DESC" % (rng, dep, ex),
+                       params + ex_params).fetchall()]
         dept = [{"dept": r[0] or "unknown", "credits": r[1] or 0, "people": r[2] or 0}
                 for r in conn.execute(
                     "SELECT dept, SUM(credits), COUNT(DISTINCT email) FROM feishu_member"
-                    " WHERE 1=1%s%s GROUP BY dept ORDER BY SUM(credits) DESC" % (rng, dep),
-                    params).fetchall()]
+                    " WHERE 1=1%s%s%s GROUP BY dept ORDER BY SUM(credits) DESC" % (rng, dep, ex),
+                    params + ex_params).fetchall()]
         trend = [{"usage_date": r[0], "biz_type": r[1], "credits": r[2] or 0, "user_count": r[3] or 0}
                  for r in conn.execute(
                      "SELECT usage_date,biz_type,credits,user_count FROM feishu_trend"
@@ -1613,6 +1641,7 @@ class H(BaseHTTPRequestHandler):
         where, params = _range_clause(qs, "u.")
         sd = _show_departed(qs)
         dep_clause = _departed_filter(sd, "u.")
+        ex_clause, ex_params = _excluded_filter(qs, "u.")
         departed = _departed_set(conn)
         cost_start, cost_end = _cost_window(qs)
         today = datetime.date.today()
@@ -1621,7 +1650,7 @@ class H(BaseHTTPRequestHandler):
         # client 匹配大小写不敏感:历史上 Hermes 有上报端写过小写 'hermes',
         # 精确匹配会把这些行漏出榜单与推断;归一(ingest 已做)之前的存量也要能查到。
         cli_clause = " AND lower(u.client) = ?" if cli else ""
-        params2 = list(params) + ([cli.lower()] if cli else [])
+        params2 = list(params) + ex_params + ([cli.lower()] if cli else [])
         # agent key 用量(source=litellm_agent)不进个人榜 —— 单独走 /v1/agent_leaderboard
         rows = conn.execute("""
             SELECT u.email, MAX(u.dept),
@@ -1635,20 +1664,20 @@ class H(BaseHTTPRequestHandler):
                    MAX(p.dept)
             FROM usage u LEFT JOIN people p ON p.email = u.email
             WHERE %s AND u.source != 'litellm_agent'
-              AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s
+              AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s%s
             GROUP BY u.email
             HAVING SUM(u.total) > 0
             ORDER BY SUM(u.total) DESC
-        """ % (where, dep_clause, cli_clause), params2).fetchall()
+        """ % (where, dep_clause, ex_clause, cli_clause), params2).fetchall()
         # 每人按工具(client)的构成:Claude/Codex/Cursor/Gemini/... 占比
         comp = {}
         for cr in conn.execute("""
             SELECT u.email, u.client, SUM(u.total)
             FROM usage u
             WHERE %s AND u.source != 'litellm_agent'
-              AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s
+              AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s%s
             GROUP BY u.email, u.client
-        """ % (where, dep_clause, cli_clause), params2).fetchall():
+        """ % (where, dep_clause, ex_clause, cli_clause), params2).fetchall():
             comp.setdefault(cr[0], []).append({"client": cr[1], "tokens": cr[2] or 0})
         result = []
         by_email = {}
@@ -1732,9 +1761,9 @@ class H(BaseHTTPRequestHandler):
                                 THEN u.cost ELSE 0 END),
                        SUM(CASE WHEN u.cost <= 0 THEN u.total ELSE 0 END)
                 FROM usage u
-                WHERE %s AND u.source != 'litellm_agent'%s%s
+                WHERE %s AND u.source != 'litellm_agent'%s%s%s
                 GROUP BY u.email, u.model
-            """ % (where, dep_clause, cli_clause), params2).fetchall():
+            """ % (where, dep_clause, ex_clause, cli_clause), params2).fetchall():
                 if rep_cost and rep_cost > 0:
                     rep_by_email[em] = rep_by_email.get(em, 0.0) + rep_cost
                 r = rate_exact.get(m or "") or rate_stripped.get((m or "").split("/")[-1].lower())
@@ -1788,6 +1817,36 @@ class H(BaseHTTPRequestHandler):
             })
         self._send(200, {"agent_leaderboard": result})
 
+    def _agent_owner_summary(self, conn, qs):
+        """按归属人聚合 Agent 消耗,用于解释“个人榜不含 Agent,但可看归属 Agent 合计”。
+
+        people 行中 agent:<alias> 的 dept 字段存 owner 中文名,沿用 Agent 榜现有归属模型。
+        可选 ?owner=<中文名> 过滤单个 owner。
+        """
+        where, params = _range_clause(qs, "u.")
+        owner = (qs.get("owner") or [None])[0]
+        owner_clause = " AND COALESCE(p.dept, '') = ?" if owner else ""
+        if owner:
+            params = list(params) + [owner]
+        rows = conn.execute("""
+            SELECT COALESCE(p.dept, '') AS owner,
+                   COUNT(DISTINCT u.email),
+                   SUM(u.total), SUM(u.cost), SUM(u.messages)
+            FROM usage u LEFT JOIN people p ON p.email = u.email
+            WHERE %s AND u.source = 'litellm_agent'%s
+            GROUP BY COALESCE(p.dept, '')
+            HAVING SUM(u.total) > 0
+            ORDER BY SUM(u.total) DESC
+        """ % (where, owner_clause), params).fetchall()
+        result = [{
+            "owner": r[0] or "",
+            "agents": r[1] or 0,
+            "tokens": r[2] or 0,
+            "cost": round(r[3] or 0, 4),
+            "messages": r[4] or 0,
+        } for r in rows]
+        self._send(200, {"agent_owner_summary": result})
+
     def _cursor(self, conn, qs):
         """Cursor 维度榜:按 token 排(与个人/工具/模型榜口径统一),带 token 明细 +
         花费($)/请求数 + 中文姓名/头像/部门。token 来自 Cursor Admin API 的
@@ -1795,6 +1854,7 @@ class H(BaseHTTPRequestHandler):
         where, params = _range_clause(qs, "u.")
         sd = _show_departed(qs)
         dep_clause = _departed_filter(sd, "u.")
+        ex_clause, ex_params = _excluded_filter(qs, "u.")
         departed = _departed_set(conn)
         rows = conn.execute("""
             SELECT u.email, MAX(u.dept),
@@ -1802,10 +1862,10 @@ class H(BaseHTTPRequestHandler):
                    SUM(u.reasoning), SUM(u.total), SUM(u.cost), SUM(u.messages),
                    MAX(p.name), MAX(p.avatar), MAX(p.dept)
             FROM usage u LEFT JOIN people p ON p.email = u.email
-            WHERE %s AND u.source='cursor'%s
+            WHERE %s AND u.source='cursor'%s%s
             GROUP BY u.email
             ORDER BY SUM(u.total) DESC
-        """ % (where, dep_clause), params).fetchall()
+        """ % (where, dep_clause, ex_clause), params + ex_params).fetchall()
         result = []
         # Cursor 榜只挂 cursor 订阅徽标,不带其他工具。
         subs_by_email = load_subscriptions(conn)
@@ -1833,15 +1893,16 @@ class H(BaseHTTPRequestHandler):
         where, params = _range_clause(qs)
         sd = _show_departed(qs)
         dep_clause = _departed_filter(sd, "")
+        ex_clause, ex_params = _excluded_filter(qs, "")
         # 取 email 级明细。注意 usage.dept 异构：订阅制/cursor 是完整路径
         # ('Keep/技术平台部/.../IT 组')，LiteLLM 却是裸团队别名('技术平台部')。
         # 若直接按 usage.dept roll-up，裸别名会裂成不挂在 Keep 树下的孤立顶级节点。
         rows = conn.execute("""
             SELECT email, dept, SUM(total), SUM(cost), SUM(messages)
             FROM usage
-            WHERE %s AND source != 'litellm_agent'%s
+            WHERE %s AND source != 'litellm_agent'%s%s
             GROUP BY email, dept
-        """ % (where, dep_clause), params).fetchall()
+        """ % (where, dep_clause, ex_clause), params + ex_params).fetchall()
 
         # 用 people.dept(飞连规范全路径)把每个人归一到唯一的真实组织部门，
         # 再把此人所有来源的用量收进该部门 → 单一 Keep 树，杜绝裸别名裂树。
@@ -1906,10 +1967,11 @@ class H(BaseHTTPRequestHandler):
         # 不与 token 加总;aily 的人并进活跃集 → 活跃渗透取并集。
         frng, fparams = _feishu_range(qs)
         fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
+        fex, fex_params = _excluded_filter(qs, "")
         aily_rows = conn.execute(
             "SELECT email, MAX(dept), SUM(credits) FROM feishu_member"
-            " WHERE 1=1%s%s GROUP BY email HAVING SUM(credits)>0" % (frng, fdep),
-            fparams).fetchall()
+            " WHERE 1=1%s%s%s GROUP BY email HAVING SUM(credits)>0" % (frng, fdep, fex),
+            fparams + fex_params).fetchall()
         for email, fdept, credits in aily_rows:
             # people.dept 优先,否则用 feishu_member.dept;统一过 _to_keep —— 裸供应商(SP码)
             # 也收口到外部合作商,不再因「不以 Keep 开头」误落未归类(codex 评审发现)。
@@ -1970,15 +2032,16 @@ class H(BaseHTTPRequestHandler):
             select_extra = "client, provider, model"
 
         where, params = _range_clause(qs)
+        ex_clause, ex_params = _excluded_filter(qs, "")
         sql = (
             "SELECT {extra}, "
             "SUM(input), SUM(output), SUM(cache_read), SUM(cache_write), "
             "SUM(reasoning), SUM(total), SUM(cost), SUM(messages) "
-            "FROM usage WHERE {where} AND source != 'litellm_agent' "
+            "FROM usage WHERE {where} AND source != 'litellm_agent'{ex} "
             "GROUP BY {grp} ORDER BY SUM(total) DESC"
-        ).format(extra=select_extra, where=where, grp=group_cols)
+        ).format(extra=select_extra, where=where, ex=ex_clause, grp=group_cols)
 
-        rows = conn.execute(sql, params).fetchall()
+        rows = conn.execute(sql, params + ex_params).fetchall()
         result = []
         for r in rows:
             result.append({

@@ -16,6 +16,30 @@ def test_cursor_leaderboard_request_uses_global_date_range():
     )
 
 
+def test_meta_default_range_becomes_request_state():
+    """默认页面展示的数据范围必须进入首批 API 请求参数。
+
+    根因(2026-06-18): fillMeta 只把 min/max 写入隐藏 input,没有同步 RANGE_FROM/RANGE_TO。
+    结果首屏 UI 显示 2026-02-28→2026-06-18,但 load() 仍按空 RANGE 请求 lifetime;
+    用户再点“应用”后才改成 day 桶区间,同一可见区间数字前后不一致。
+    """
+    html = DASHBOARD.read_text(encoding="utf-8")
+    fill_meta = html[html.index("async function fillMeta()"):html.index("var GOVERNANCE_METRICS=")]
+
+    assert "RANGE_FROM=m.min_date" in fill_meta
+    assert "RANGE_TO=m.max_date" in fill_meta
+
+
+def test_dashboard_explains_cost_and_agent_scope():
+    html = DASHBOARD.read_text(encoding="utf-8")
+
+    assert "个人榜公司实付 = 网关实销 + 订阅席位摊销 + 飞书点数折算" in html
+    assert "部门榜金额标为估算" in html
+    assert "个人榜默认不含归属 Agent 消耗" in html
+    assert "/v1/agent_owner_summary" in html
+    assert "估算 $" in html
+
+
 def test_no_duplicate_outer_range_buttons():
     """近7天/近30天 已并入日历预设, 顶栏不应再有重复的 r7/r30 独立按钮(2026-06-09)。"""
     html = DASHBOARD.read_text(encoding="utf-8")
