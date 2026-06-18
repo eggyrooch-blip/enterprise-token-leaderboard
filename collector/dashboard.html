@@ -69,6 +69,9 @@
   .rglab{font:600 13px var(--font);color:rgba(255,255,255,.9);white-space:nowrap;flex:0 0 auto}
   .rgsep{font:400 12px var(--font);color:rgba(255,255,255,.55);flex:0 0 auto}
   .rgcur{margin-left:auto;font:600 12px var(--font);color:#7CF0C0}
+  .authbar{display:inline-flex;align-items:center;gap:8px;flex:0 0 auto}
+  .authbar .who{max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    font:600 12px var(--font);color:rgba(255,255,255,.88)}
   /* list */
   .card{background:#fff;border-radius:14px;padding:6px 24px;box-shadow:var(--shadow)}
   .r{display:flex;align-items:center;gap:14px;padding:15px 0;border-bottom:1px solid var(--div);transition:background .12s ease}
@@ -197,6 +200,7 @@
       </div>
       <div class="ttl"><div class="t">AI 编程 Token 看板</div><div class="s" id="sub">tokscale 采集 · MDM 身份 · 实时</div></div>
       <div class="hdrange">
+        <span class="authbar" id="authbar"></span>
         <span class="rglab">时间范围</span>
         <span class="dwrap">
           <button class="dtrig" id="rangeTrig"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span id="rangeLbl">选择日期</span><svg class="ic caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
@@ -296,7 +300,27 @@ function subLogoHtml(s){
 }
 // 部门路径去掉最前面的 "Keep/" 前缀(以及单独 "Keep")
 function stripKeep(p){p=p||''; if(p==='Keep')return p; return p.replace(/^Keep\//,'');}
-async function j(u){var r=await fetch(u); return r.json();}
+function loginHref(){return '/v1/auth/login?next='+encodeURIComponent(location.pathname+location.search);}
+function loginHtml(){return '<a class="rg" href="'+loginHref()+'">登录</a>';}
+async function fillAuth(){
+  var el=$('authbar'); if(!el) return;
+  try{
+    var r=await fetch('/v1/me',{credentials:'same-origin'});
+    if(!r.ok){el.innerHTML=loginHtml();return;}
+    var me=await r.json();
+    var label=me.name||me.email||'已登录';
+    el.innerHTML='<span class="who">'+esc(label)+'</span><a class="rg" href="/v1/auth/logout">退出</a>';
+  }catch(e){el.innerHTML=loginHtml();}
+}
+async function j(u){
+  var r=await fetch(u,{credentials:'same-origin'});
+  var obj=await r.json().catch(function(){return {};});
+  if(r.status===401 && obj.login){
+    location.href=obj.login+'?next='+encodeURIComponent(location.pathname+location.search);
+    throw new Error('login required');
+  }
+  return obj;
+}
 // 默认渲染数据真实时间范围:首次加载把日期框填成数据起止日,副标题显示跨度+最后上报。
 async function fillMeta(){
   if(META_DONE) return; META_DONE=true;
@@ -326,6 +350,7 @@ var GOVERNANCE_METRICS=[
 ];
 
 async function load(){
+  await fillAuth();
   await fillMeta();              // 确保 META_MIN/MAX 已就绪(日均精确口径要用)
   var parts=[];
   if(RANGE_FROM||RANGE_TO){

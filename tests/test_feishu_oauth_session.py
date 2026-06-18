@@ -43,6 +43,13 @@ def _handler(cookie=None):
     return h
 
 
+def _route_handler(path="/", cookie=None):
+    h = _handler(cookie)
+    h.path = path
+    h._dashboard = lambda: h.captured.append(("dashboard",))
+    return h
+
+
 # --------------------------------------------------------------------------- #
 # state: one-time-use + expiry
 # --------------------------------------------------------------------------- #
@@ -253,3 +260,20 @@ def test_auth_enforced_reads_env(monkeypatch):
     assert dc.auth_enforced() is False
     monkeypatch.setenv("AUTH_ENFORCE", "1")
     assert dc.auth_enforced() is True
+
+
+def test_dashboard_redirects_to_login_when_enforced_without_session(conn, monkeypatch):
+    monkeypatch.setenv("AUTH_ENFORCE", "1")
+    monkeypatch.setattr(dc, "db", lambda: conn)
+    h = _route_handler("/")
+    dc.H.do_GET(h)
+    assert h.captured == [("redirect", "/v1/auth/login?next=%2F", None, False)]
+
+
+def test_dashboard_serves_when_enforced_with_session(conn, monkeypatch):
+    monkeypatch.setenv("AUTH_ENFORCE", "1")
+    monkeypatch.setattr(dc, "db", lambda: conn)
+    sid = dc.create_session(conn, "emp@keep.com")
+    h = _route_handler("/dashboard", cookie="%s=%s" % (dc.SESSION_COOKIE, sid))
+    dc.H.do_GET(h)
+    assert h.captured == [("dashboard",)]

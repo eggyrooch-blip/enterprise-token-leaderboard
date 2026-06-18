@@ -2130,6 +2130,18 @@ class H(BaseHTTPRequestHandler):
         """提供中性企业实时看板(同目录 dashboard.html,前端 fetch /v1/* 同源)。"""
         self._send_local("dashboard.html", "text/html;charset=utf-8")
 
+    def _dashboard_or_login(self, path, query=""):
+        if not auth_enforced():
+            return self._dashboard()
+        conn = db()
+        try:
+            if self._session_user(conn):
+                return self._dashboard()
+        finally:
+            conn.close()
+        nxt = path + (("?" + query) if query else "")
+        return self._send_redirect("/v1/auth/login?" + _urlencode({"next": nxt or "/"}))
+
     def _help(self):
         """数据说明页:数据来源 / 刷新周期 / MDM 失败时如何手工补报。"""
         self._send_local("help.html", "text/html;charset=utf-8")
@@ -2355,7 +2367,7 @@ class H(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
 
         if path == "/" or path == "/dashboard" or path == "/index.html":
-            return self._dashboard()
+            return self._dashboard_or_login(path, parsed.query)
         if path == "/help" or path == "/about":
             return self._help()
         if path == "/tokreport.sh":

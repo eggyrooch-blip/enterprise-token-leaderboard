@@ -52,6 +52,15 @@ def test_dashboard_embeds_subscription_logo_badges():
         assert fingerprint in html
 
 
+def test_dashboard_has_feishu_auth_controls():
+    html = DASHBOARD.read_text(encoding="utf-8")
+
+    assert 'id="authbar"' in html
+    assert "fetch('/v1/me'" in html
+    assert "/v1/auth/login?next=" in html
+    assert "/v1/auth/logout" in html
+
+
 def test_public_pages_use_generic_company_logo_path():
     text = "\n".join([
         DASHBOARD.read_text(encoding="utf-8"),
