@@ -535,12 +535,9 @@ DATA_ROUTES = {
 #  - OWNER_OR_ADMIN: member 403; department_owner sees own subtree (row-filtered).
 #  - everything else in DATA_ROUTES is ROW-SCOPED: the handler filters rows
 #    through _scope_rows() / email_in_scope() to the caller's visible set.
-# /v1/feishu is temporarily ADMIN_ONLY (SAFE — no leak) until its multi-section
-# per-person scoping lands.
 ADMIN_ONLY_ROUTES = {
     "/v1/governance_metrics", "/v1/raw", "/v1/breakdown",
     "/v1/agent_leaderboard", "/v1/agent_owner_summary",
-    "/v1/feishu",
 }
 OWNER_OR_ADMIN_ROUTES = {"/v1/teams"}
 
@@ -2437,10 +2434,13 @@ class H(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _feishu(self, conn, qs):
+    def _feishu(self, conn, qs, auth_user=None):
         """飞书 AI 权益(独立板块,单位=点)。按天聚合:额度盘 + 全员逐人榜 + 部门榜 + 趋势。
         区间同 token 榜:?from=&to= 或 ?days=N(usage_date 上过滤);默认近 30 天(=回填窗口)。
         ?show_departed=1 才纳入离职。"""
+        if auth_user is not None:
+            self._scope_user = auth_user
+        scope_user = getattr(self, "_scope_user", None)
         # usage_date 区间(默认近 30 天),统一走 _feishu_range。
         rng, params = _feishu_range(qs)
         billing = {"usd_per_point": FEISHU_USD_PER_POINT, "package_cny": PACKAGE_CNY,
@@ -2454,33 +2454,63 @@ class H(BaseHTTPRequestHandler):
                        "members": [], "dept": [], "trend": []}
             payload.update(billing)
             return self._send(200, payload)
-        ps, pe = span[0], span[1]
         sd = _show_departed(qs)
-        dep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
-        ex, ex_params = _excluded_filter(qs, "")
-        quota = [{"feature_key": r[0], "quota": r[1] or 0, "used": r[2] or 0, "remain": r[3] or 0}
-                 for r in conn.execute(
-                     "SELECT feature_key,quota,used,remain FROM feishu_quota WHERE period_start="
-                     "(SELECT max(period_start) FROM feishu_quota) ORDER BY quota DESC").fetchall()]
-        members = [{"email": r[0], "name": r[1] or (r[0] or "").split("@")[0], "dept": r[2] or "unknown",
-                    "avatar": r[3] or "", "credits": r[4] or 0,
-                    "ai_credits": r[5] or 0, "aily_credits": r[6] or 0}
-                   for r in conn.execute(
-                       "SELECT email, MAX(name), MAX(dept), MAX(avatar), SUM(credits),"
-                       " SUM(CASE WHEN feature_key='AI_credits' THEN credits ELSE 0 END),"
-                       " SUM(CASE WHEN feature_key='aily_credits' THEN credits ELSE 0 END)"
-                       " FROM feishu_member WHERE 1=1%s%s%s"
-                       " GROUP BY email HAVING SUM(credits)>0 ORDER BY SUM(credits) DESC" % (rng, dep, ex),
-                       params + ex_params).fetchall()]
-        dept = [{"dept": r[0] or "unknown", "credits": r[1] or 0, "people": r[2] or 0}
-                for r in conn.execute(
-                    "SELECT dept, SUM(credits), COUNT(DISTINCT email) FROM feishu_member"
-                    " WHERE 1=1%s%s%s GROUP BY dept ORDER BY SUM(credits) DESC" % (rng, dep, ex),
-                    params + ex_params).fetchall()]
-        trend = [{"usage_date": r[0], "biz_type": r[1], "credits": r[2] or 0, "user_count": r[3] or 0}
-                 for r in conn.execute(
-                     "SELECT usage_date,biz_type,credits,user_count FROM feishu_trend"
-                     " ORDER BY usage_date").fetchall()]
+        dep = "" if sd else " AND f.email NOT IN (SELECT email FROM departed)"
+        ex, ex_params = _excluded_filter(qs, "f.")
+        member_rows = conn.execute(
+            "SELECT f.email, MAX(f.name),"
+            " COALESCE(MAX(NULLIF(p.effective_dept,'')), MAX(NULLIF(p.dept,'')), MAX(f.dept)),"
+            " MAX(f.avatar), SUM(f.credits),"
+            " SUM(CASE WHEN f.feature_key='AI_credits' THEN f.credits ELSE 0 END),"
+            " SUM(CASE WHEN f.feature_key='aily_credits' THEN f.credits ELSE 0 END),"
+            " MIN(f.usage_date), MAX(f.usage_date)"
+            " FROM feishu_member f LEFT JOIN people p ON lower(p.email)=lower(f.email)"
+            " WHERE 1=1%s%s%s"
+            " GROUP BY f.email HAVING SUM(f.credits)>0 ORDER BY SUM(f.credits) DESC"
+            % (rng, dep, ex),
+            params + ex_params).fetchall()
+        if scope_user and not scope_user.get("is_admin"):
+            member_rows = [
+                r for r in member_rows
+                if email_in_scope(scope_user, r[0], _scope_dept(r[0], r[2] or ""))
+            ]
+        if member_rows:
+            ps = min((r[7] for r in member_rows if r[7]), default=None)
+            pe = max((r[8] for r in member_rows if r[8]), default=None)
+        else:
+            ps = pe = None
+        is_admin_scope = not scope_user or scope_user.get("is_admin")
+        quota = []
+        trend = []
+        if is_admin_scope:
+            quota = [{"feature_key": r[0], "quota": r[1] or 0,
+                      "used": r[2] or 0, "remain": r[3] or 0}
+                     for r in conn.execute(
+                         "SELECT feature_key,quota,used,remain FROM feishu_quota WHERE period_start="
+                         "(SELECT max(period_start) FROM feishu_quota) ORDER BY quota DESC").fetchall()]
+            trend = [{"usage_date": r[0], "biz_type": r[1],
+                      "credits": r[2] or 0, "user_count": r[3] or 0}
+                     for r in conn.execute(
+                         "SELECT usage_date,biz_type,credits,user_count FROM feishu_trend"
+                         " ORDER BY usage_date").fetchall()]
+        members = [{"email": r[0], "name": r[1] or (r[0] or "").split("@")[0],
+                    "dept": r[2] or "unknown", "avatar": r[3] or "",
+                    "credits": r[4] or 0, "ai_credits": r[5] or 0,
+                    "aily_credits": r[6] or 0}
+                   for r in member_rows]
+        dept_map = {}
+        for r in member_rows:
+            d = r[2] or "unknown"
+            cur = dept_map.setdefault(d, {"dept": d, "credits": 0, "people": set()})
+            cur["credits"] += r[4] or 0
+            if r[0]:
+                cur["people"].add(r[0])
+        dept = sorted(
+            ({"dept": v["dept"], "credits": v["credits"], "people": len(v["people"])}
+             for v in dept_map.values()),
+            key=lambda x: x["credits"],
+            reverse=True,
+        )
         payload = {"period_start": ps, "period_end": pe,
                    "quota": quota, "members": members, "dept": dept, "trend": trend}
         payload.update(billing)

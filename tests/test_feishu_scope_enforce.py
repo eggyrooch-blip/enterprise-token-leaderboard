@@ -16,6 +16,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "collector"))
 import dev_collector  # noqa: E402
 
+_DAY = "2026-06-18"
+
 
 @pytest.fixture
 def dc(monkeypatch, tmp_path):
@@ -49,6 +51,33 @@ def _seed(dc, conn):
     # lead is department_owner of 技术平台部
     conn.execute("INSERT INTO roles(email,role,dept_id,dept_path,source,updated_at)"
                  " VALUES('lead@keep.com','department_owner','d_tech','技术平台部','t','t')")
+    conn.commit()
+
+
+def _seed_feishu(conn):
+    rows = [
+        ("emp@keep.com", "员工", "技术平台部/固件组", "aily_credits", 11, _DAY, "", ""),
+        ("peer@keep.com", "同组", "技术平台部/固件组", "AI_credits", 13, _DAY, "", ""),
+        ("lead@keep.com", "组长", "技术平台部", "aily_credits", 17, _DAY, "", ""),
+        ("other@keep.com", "他部门", "运动消费事业部/市场营销部", "aily_credits", 19, _DAY, "", ""),
+    ]
+    conn.executemany(
+        "INSERT OR REPLACE INTO feishu_member"
+        "(email,name,dept,feature_key,credits,usage_date,avatar,entity_id)"
+        " VALUES(?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO feishu_quota"
+        "(feature_key,quota,used,remain,period_start,period_end)"
+        " VALUES('aily_credits',1000,60,940,?,?)",
+        (_DAY, _DAY),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO feishu_trend"
+        "(usage_date,biz_type,credits,user_count) VALUES(?,?,?,?)",
+        (_DAY, "aily", 60, 4),
+    )
     conn.commit()
 
 
@@ -162,11 +191,43 @@ def test_owner_trend_outside_scope_is_403(dc):
     assert h.captured["code"] == 403
 
 
-def test_gate_allows_member_aiusage_but_blocks_feishu(dc):
+def test_member_feishu_sees_only_self_and_no_global_totals(dc):
+    conn = dc.db()
+    _seed(dc, conn)
+    _seed_feishu(conn)
+    me = dc._user_roles(conn, "emp@keep.com")
+    h = _handler(dc, me)
+    dc.H._feishu(h, conn, {"from": [_DAY], "to": [_DAY]})
+    assert h.captured["code"] == 200
+    assert _emails(h.captured["obj"]["members"]) == {"emp@keep.com"}
+    assert h.captured["obj"]["dept"] == [{
+        "dept": "技术平台部/固件组", "credits": 11, "people": 1
+    }]
+    assert h.captured["obj"]["quota"] == []
+    assert h.captured["obj"]["trend"] == []
+
+
+def test_owner_feishu_sees_only_owned_subtree(dc):
+    conn = dc.db()
+    _seed(dc, conn)
+    _seed_feishu(conn)
+    owner = dc._user_roles(conn, "lead@keep.com")
+    h = _handler(dc, owner)
+    dc.H._feishu(h, conn, {"from": [_DAY], "to": [_DAY]})
+    assert h.captured["code"] == 200
+    assert _emails(h.captured["obj"]["members"]) == {
+        "emp@keep.com", "peer@keep.com", "lead@keep.com"
+    }
+    assert all("运动消费" not in (d or "") for d in _depts(h.captured["obj"]["dept"]))
+    assert h.captured["obj"]["quota"] == []
+    assert h.captured["obj"]["trend"] == []
+
+
+def test_gate_allows_member_aiusage_and_feishu(dc):
     member = {"email": "emp@keep.com", "roles": ["member"], "is_admin": False,
               "scope": "self", "owned_departments": []}
     assert dc.authorize_request(member, "/v1/ai/usage", True) == "allow"
-    assert dc.authorize_request(member, "/v1/feishu", True) == "403"
+    assert dc.authorize_request(member, "/v1/feishu", True) == "allow"
     # owner gets team view, member does not
     owner = {"email": "lead@keep.com", "roles": ["department_owner"], "is_admin": False,
              "scope": "department", "owned_departments": ["技术平台部"]}
