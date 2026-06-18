@@ -15,9 +15,10 @@
 - Contact sync uses Feishu contact APIs with `tenant_access_token`: department children API, department detail API, and `users/find_by_department` with pagination.
 - Department children must be recursively traversed. `GET /open-apis/contact/v3/departments/{department_id}/children` accepts pagination, but `fetch_child=true` is not valid on that endpoint. `page_size=50` works; `page_size=100` returns Feishu field validation error.
 - Department user sync uses `GET /open-apis/contact/v3/users/find_by_department` with `fetch_child=true/false`. `/contact/v3/departments/{id}/users` is not a valid endpoint.
-- Feishu department objects can include `leader_user_id`, `leaders`, `chat_id`, `member_count`, and status. Real `lark-cli` checks showed the root `合作商` node has no leader or chat, while supplier child nodes can have `leader_user_id`, `chat_id`, both missing, or both present.
-- Supplier/outsourcing users can have empty `email`; store them in `feishu_users` keyed by Feishu user ID and only mirror into `people` when a stable email exists.
+- Feishu department objects can include `leader_user_id`, `leaders`, `chat_id`, `member_count`, and status. With `user_id_type=open_id`, department `leader_user_id` is an `open_id`; directory storage and joins must preserve that ID space explicitly.
+- Supplier/outsourcing users can have empty `email`; store them in `feishu_users` keyed by Feishu `open_id` and only mirror into `people` when a stable email exists.
 - Department group chat owner is not a reliable first-pass API source: `im/v1/chats/{chat_id}` may return only partial chat data, and `im/v1/chats/{chat_id}/members` fails with `232011 Operator can NOT be out of the chat` unless the caller is in that department chat.
+- Existing `tokscale` usage upsert is keyed by `email` or `sn:<serial>`, but the raw department currently comes from serial attribution. Therefore emailless supplier spend can still roll up if `_tokscale_report` maps the raw Feilian department through `department_attributions`; it must not depend on a `people` row mirrored from Feishu email.
 - The Feishu app must have contact read permissions and its contact visibility range must cover all departments that should appear in the dashboard.
 
 Docs checked:
@@ -35,7 +36,7 @@ Source: Feishu group `tokscale 看板`, read via `lark-cli` on 2026-06-18.
 The group discussion adds a second business requirement to the SSO/Auth work:
 - Current dashboard has an `外部合作商` / supplier grouping. The expected outcome is not to keep supplier spend as a standalone department, but to merge business outsourcing spend back into the actual business department.
 - The preferred inference is Feishu-first: use the outsourcing department name/path to find the corresponding Feishu department, then use the supplier department's responsible person or department group owner to infer the real business department.
-- Example verified from screenshots and API: `合作商 -> W -> 北京再作品牌管理有限公司(SP000083)` has supplier members without email, a supplier department `chat_id`, and no `leader_user_id`; the human-expected mapping points at the department group owner whose Feishu profile belongs to a real business department.
+- Example verified from screenshots and API: `合作商 -> W -> 北京再作品牌管理有限公司(SP000083)` has supplier members without email, a supplier department `chat_id`, and no `leader_user_id`; the human-expected mapping points at the department group owner whose Feishu profile belongs to a real business department. Because IM APIs may not reveal group owner to the bot, first implementation treats this as a suggested attribution unless the owner can be resolved and promoted.
 - Example verified from API: `合作商 -> W -> 中软国际科技服务有限公司(SP004867)` has a `leader_user_id`; that leader has a Keep email and a real Feishu department, so this can be automatically attributed without using group-owner lookup.
 - DHR/main-data may have an interface, but the group called out higher data sensitivity and encrypted external interfaces. Treat DHR as a later/manual fallback, not the first implementation path.
 
@@ -65,8 +66,9 @@ Extend/create:
   - `attribution_source TEXT DEFAULT ''`
   - `updated_at TEXT`
 - `feishu_users`
-  - `user_id TEXT PRIMARY KEY`
-  - `open_id TEXT DEFAULT ''`
+  - `open_id TEXT PRIMARY KEY`
+  - `user_id TEXT DEFAULT ''`
+  - `union_id TEXT DEFAULT ''`
   - `email TEXT DEFAULT ''`
   - `name TEXT NOT NULL`
   - `dept_id TEXT DEFAULT ''`
@@ -92,6 +94,7 @@ Extend/create:
   - `target_dept_path TEXT DEFAULT ''`
   - `rule TEXT NOT NULL` where rule is `direct_feishu_dept`, `leader_department`, `chat_owner_department`, `manual_override`, or `unresolved`
   - `confidence TEXT NOT NULL` where confidence is `high`, `medium`, or `needs_review`
+  - `active INTEGER NOT NULL DEFAULT 0`
   - `reason TEXT DEFAULT ''`
   - `updated_at TEXT NOT NULL`
 - `roles`
@@ -116,6 +119,7 @@ Extend/create:
 Raw department and effective department are deliberately separate:
 - `departments.path` and `people.raw_dept` preserve Feishu's source-of-truth org path.
 - `department_attributions.target_dept_path` and `people.effective_dept` are used for dashboard spend roll-up.
+- Only active, high-confidence attributions feed non-admin dashboard roll-ups by default: `direct_feishu_dept`, `leader_department`, and `manual_override`. `chat_owner_department` starts as a review suggestion unless explicitly promoted.
 - When no confident attribution exists, keep the raw supplier path and mark the attribution `unresolved`; do not silently guess.
 
 ## Scope Rules
@@ -152,12 +156,14 @@ Department roll-up policy:
 Test cases:
 - `ensure_tables(conn)` creates/extends `people`, `feishu_users`, `departments`, `department_attributions`, and `roles`.
 - `write_directory_snapshot(conn, users, departments, admin_emails, synced_at)`:
-  - writes all Feishu users keyed by Feishu user ID, including supplier users whose `email` is empty
+  - writes all Feishu users keyed by Feishu `open_id`, including supplier users whose `email` is empty
+  - preserves `user_id` and `union_id` as separate columns
   - mirrors only stable-email users into `people`
   - writes raw department paths and preserves `chat_id`, `leader_user_id`, `open_dept_id`
-  - writes `department_owner` roles from department `leader_user_id`
+  - writes `department_owner` roles from department `leader_user_id` by joining `leader_user_id` to `feishu_users.open_id`
   - writes `admin` roles from configured admin emails
   - repeated run is idempotent
+  - fails if a department leader is present but cannot be joined to an `open_id` in the current snapshot unless explicitly allowed as partial visibility
 
 Run:
 ```bash
@@ -174,6 +180,7 @@ Create `collector/feishu_directory_sync.py` with:
 - `write_directory_snapshot`
 - path builder from department parent IDs
 - email-keyed `people` mirror from `feishu_users`
+- explicit ID-space helpers: `open_id` for Feishu joins, `email` for local dashboard/auth keys
 - `main --dry-run`
 
 Do not call real Feishu in unit tests. Inject fake API responses.
@@ -211,10 +218,12 @@ Test fake `_json_request` responses for:
 Assert:
 - all pages are visited
 - `department_id_type=department_id` and `user_id_type=open_id` are passed consistently
+- user payloads store both `open_id` and `user_id`, and leader/owner resolution joins on `open_id`
 - department children uses page size `50`, not `100`
 - department children does not pass invalid `fetch_child`
 - users endpoint may pass `fetch_child=true`
 - inactive/deleted users are either marked inactive or omitted according to Feishu response fields
+- fetched user count is compared to department `member_count` / `primary_member_count`; partial visibility creates a dry-run failure or explicit warning that blocks production enablement
 
 Run targeted tests and verify failure.
 
@@ -225,7 +234,8 @@ Methods:
 - `list_departments()`
 - `list_users_by_department(dept_id, fetch_child=True)`
 - `get_department(dept_id)`
-- `get_user(user_id)`
+- `get_user(open_id)`
+- `validate_visibility_coverage(snapshot)`
 - `fetch_snapshot() -> (departments, users)`
 
 Use `tenant_access_token` only. Do not use OAuth user token for directory sync.
@@ -258,10 +268,12 @@ Seed fake Feishu data:
 - Supplier users under these departments have empty `email`.
 
 Assert:
-- leader-owned supplier maps to leader's real department with rule `leader_department`, confidence `high`.
-- readable department chat owner maps to owner department with rule `chat_owner_department`, confidence `medium`.
+- leader-owned supplier maps to leader's real department with rule `leader_department`, confidence `high`, `active=1`.
+- readable department chat owner maps to owner department with rule `chat_owner_department`, confidence `medium`, `active=0` until manually promoted.
 - unreadable/missing owner maps to `unresolved`, confidence `needs_review`, and does not rewrite people rows to a guessed department.
 - non-outsourcing departments default to rule `direct_feishu_dept`.
+- if a leader or chat owner resolves to another outsourcing department, the source stays `unresolved` to avoid cycles and recursive supplier-to-supplier attribution.
+- an emailless supplier usage event whose raw Feilian department is `合作商/W/<supplier>` can still roll up through `department_attributions` when the attribution is active.
 
 Run:
 ```bash
@@ -280,8 +292,9 @@ Rules in order:
 1. Manual override wins if configured.
 2. Non-outsourcing path maps to itself (`direct_feishu_dept`).
 3. Outsourcing supplier department with `leader_user_id`: resolve leader's primary real department.
-4. Outsourcing supplier department with readable `chat_id` owner: resolve owner's primary real department.
-5. Else unresolved; preserve source path.
+4. Outsourcing supplier department with readable `chat_id` owner: resolve owner's primary real department, but write it inactive until admin/manual promotion.
+5. If the resolved target is still under any outsourcing prefix, mark unresolved.
+6. Else unresolved; preserve source path.
 
 Do not call real IM chat APIs in unit tests. Inject `chat_owner_lookup`.
 
@@ -300,6 +313,7 @@ lark-cli api GET /open-apis/contact/v3/users/find_by_department \
 Expected:
 - `合作商/W` supplier departments include mixed `leader_user_id`, `chat_id`, and empty cases.
 - supplier users may have `email=""`.
+- chat-owner suggestions are visible in admin review output but do not affect non-admin roll-ups until promoted.
 
 **Step 4: Commit**
 
@@ -373,6 +387,7 @@ git commit -m "chore: deploy feishu directory sync"
 Test pure helper functions first:
 - create state
 - reject missing/expired state
+- reject replayed state: consuming the same state twice must fail on the second attempt
 - create session
 - load current user from cookie
 - session expiration
@@ -432,11 +447,17 @@ Add env vars:
 - `AUTH_SESSION_SECRET` optional only if later adding signed cookies; first version uses DB session id.
 - `AUTH_ADMIN_EMAILS` comma-separated fallback admins.
 - `AUTH_COOKIE_SECURE=1` for production HTTPS.
+- `AUTH_ENFORCE=0|1`; `0` keeps existing data APIs open while directory sync and `/v1/me` are verified, `1` enforces 401/403 on data APIs.
 
 OAuth exchange:
 - POST `/open-apis/authen/v2/oauth/token`
 - Then get user info endpoint as documented by Feishu.
-- Map user to local `people` by email or Feishu user ID.
+- Map user to local `people` by email first, then Feishu `open_id`; never join department leaders by `user_id` when the directory snapshot was fetched with `user_id_type=open_id`.
+
+Shadow-mode tests:
+- `AUTH_ENFORCE=0`: `/v1/me` works for logged-in users, but existing data APIs keep current unauthenticated behavior.
+- `AUTH_ENFORCE=1`: data APIs require session and role scope.
+- Valid Feishu user not yet in synced directory becomes member/own-only if email is available; otherwise callback rejects with a clear 403 and no session.
 
 **Step 3: Verify**
 
@@ -462,6 +483,7 @@ git commit -m "feat: add feishu oauth routes"
 Seed `people`, `departments`, `roles`, and sessions. Assert:
 - admin scope has no SQL restriction
 - owner scope restricts to `effective_dept = owned OR effective_dept LIKE owned || '/%'`, falling back to `dept` only when `effective_dept` is empty
+- owner scope boundary is strict: owner of `技术平台部` sees `技术平台部/固件组`, but must not see `技术平台部门`
 - member scope restricts to own email
 - only admin can use `include_excluded=1`
 - member cannot request other user through `/v1/ai/usage`
@@ -506,7 +528,8 @@ For each role, call handler methods or HTTP harness:
 - member `/v1/teams` 403
 - owner `/v1/leaderboard` subtree rows only
 - owner `/v1/teams` subtree roll-up only
-- owner subtree includes resolved supplier spend when `effective_dept` maps a supplier raw department into the owned business department
+- owner subtree includes resolved supplier spend only when `department_attributions.active=1` and `effective_dept` maps a supplier raw department into the owned business department
+- owner subtree does not include inactive `chat_owner_department` suggestions until an admin/manual override promotes them
 - owner subtree does not include unresolved supplier spend from outside their owned department
 - owner cannot use `include_excluded=1`
 - admin can use full existing behavior
@@ -534,7 +557,7 @@ Apply visible filters to:
 - `_governance_metrics` admin-only
 - `_raw` admin-only
 
-Any team grouping SQL should group by `COALESCE(NULLIF(people.effective_dept, ''), people.dept)`, not raw `people.dept` alone.
+Any team grouping SQL should group by `COALESCE(NULLIF(people.effective_dept, ''), people.dept)`, not raw `people.dept` alone. For `sn:<serial>` or other non-email identities, `_tokscale_report` must compute `effective_dept` from the raw Feilian department through active `department_attributions` before writing lifetime/monthly/daily rows and `people`.
 
 **Step 4: Verify targeted suite**
 
@@ -563,17 +586,20 @@ Cases:
 - if Feishu person missing, Feilian department is used as temporary raw/effective fallback and people row marked source/fallback.
 - later directory sync overwrites fallback people row with Feishu data.
 - if Feishu raw department is a resolved supplier/outsourcing department, usage rolls up to attribution target while preserving raw department for admin audit.
+- if Feilian returns no email and the identity becomes `sn:<serial>`, but returns raw department `合作商/W/<supplier>`, the usage still rolls up through active `department_attributions`.
+- if the supplier attribution is inactive or unresolved, the usage keeps raw department and is visible only to admin review surfaces.
 
 **Step 2: Implement lookup precedence**
 
 Add helper:
 - `_directory_identity_for_email(conn, email)`
+- `_effective_dept_for_raw_dept(conn, raw_dept)`
 - `_merge_identity(serial_identity, reported_email, directory_identity)`
 
 Precedence:
 1. Email from Feilian or payload
 2. If email exists in Feishu-synced `people`, use Feishu name/avatar/raw_dept/effective_dept/status
-3. Else use Feilian result
+3. Else use Feilian result and compute `effective_dept` from raw Feilian department through active `department_attributions`
 4. Else `sn:<serial>`
 
 **Step 3: Verify**
@@ -651,6 +677,7 @@ DEV_DB=/tmp/feishu-auth-smoke.db python3 collector/feishu_directory_sync.py --dr
 Expected:
 - prints users/departments/roles counts
 - prints attribution counts by rule: `direct_feishu_dept`, `leader_department`, `chat_owner_department`, `manual_override`, `unresolved`
+- prints active vs inactive attribution counts
 - prints unresolved supplier department count and sample source paths, without printing secrets
 - exits 0
 - no secrets printed
@@ -658,11 +685,13 @@ Expected:
 **Step 3: Run local dev collector SIM**
 
 Start local collector using ftask env. Verify:
-- unauthenticated `/v1/leaderboard` is 401/redirect
+- with `AUTH_ENFORCE=0`, unauthenticated `/v1/leaderboard` keeps current behavior while `/v1/me` works for logged-in users
+- with `AUTH_ENFORCE=1`, unauthenticated `/v1/leaderboard` is 401/redirect
 - admin session can see global
 - member session cannot see others
 - owner session subtree is enforced
-- supplier spend mapped into an owned department is visible to that owner in team roll-up
+- active supplier spend mapped into an owned department is visible to that owner in team roll-up
+- inactive chat-owner suggestions are visible only to admins
 - unresolved supplier spend is visible only to admin review surfaces
 
 **Step 4: Production deployment checklist**
@@ -688,9 +717,12 @@ git commit -m "docs: document feishu sso org auth operations"
 Ask Claude/reviewer to specifically challenge:
 - Whether org sync should extend `people` in place, add `feishu_users`, or write a separate `people_directory`.
 - Whether `department_attributions` is the right place to model supplier/outsourcing roll-up, instead of rewriting `people.dept`.
+- Whether emailless supplier usage now has a real path from `_tokscale_report` raw Feilian department to active `department_attributions` to dashboard roll-up.
+- Whether pinning Feishu joins on `open_id` covers leader/owner/OAuth mapping without mis-joining `user_id`.
 - Whether the `合作商/` prefix is a safe first-version detector for outsourcing departments, or needs an explicit allowlist.
-- Whether `chat_owner_department` is too fragile because department group owner is not always readable through Feishu IM APIs.
+- Whether `chat_owner_department` being inactive by default is the right safety tradeoff, or whether sunke wants automatic medium-confidence roll-up.
 - Whether unresolved supplier departments should remain visible to admins only, or need a public "unattributed" bucket.
+- Whether `AUTH_ENFORCE=0/1` shadow mode is sufficient for production rollout and rollback.
 - Whether admin/owner role derivation from Feishu department leaders is reliable enough, or needs an override table first.
 - Whether `/v1/teams` for ordinary members should return own-only mini aggregation or hard 403.
 - Whether session storage in SQLite is acceptable for current single-node systemd production.
@@ -704,5 +736,6 @@ Ask Claude/reviewer to specifically challenge:
 - Department owner means Feishu department `leader_user_id`. If Keep uses another field or a separate approval owner table, adapt Tasks 1-3 before code.
 - Business outsourcing departments are initially detected by raw Feishu paths under `合作商/`. If Keep has other roots for suppliers, add them to config before enabling attribution.
 - Department group owner lookup may require extra IM scope and chat visibility. If unreadable, the implementation must mark those supplier departments unresolved and not guess.
+- First version makes `chat_owner_department` inactive by default for non-admin roll-ups. If sunke accepts medium-confidence automatic mapping, flip that as an explicit config/manual override, not hidden behavior.
 - DHR/main-data is not integrated in the first pass because the group context said its external interfaces are encrypted/high-sensitivity. It can become a later manual or service-backed fallback.
-- The first production rollout can be staged in “auth shadow mode”: sync directory and expose `/v1/me`, but keep API enforcement disabled until one verified admin login works. Then flip `AUTH_ENFORCE=1`.
+- The first production rollout uses `AUTH_ENFORCE=0` shadow mode: sync directory and expose `/v1/me`, but keep API enforcement disabled until one verified admin login works. Then flip `AUTH_ENFORCE=1`.
