@@ -226,10 +226,20 @@ def test_gate_enforce_admin_allowed_everywhere():
     assert dc.authorize_request(admin, "/v1/governance_metrics", enforced=True) == "allow"
 
 
-def test_gate_enforce_member_denied_data_routes():
+def test_gate_enforce_member_allowed_scoped_self_routes_but_not_admin_routes():
     m = _role("emp@keep.com", ["member"], "self")
-    assert dc.authorize_request(m, "/v1/leaderboard", enforced=True) == "403"
+    assert dc.authorize_request(m, "/v1/leaderboard", enforced=True) == "allow"
+    assert dc.authorize_request(m, "/v1/ai/usage", enforced=True) == "allow"
+    assert dc.authorize_request(m, "/v1/teams", enforced=True) == "403"
     assert dc.authorize_request(m, "/v1/raw", enforced=True) == "403"
+
+
+def test_gate_enforce_owner_allowed_team_and_person_routes():
+    owner = _role("lead@keep.com", ["department_owner"], "department", ["Keep/A"])
+    assert dc.authorize_request(owner, "/v1/leaderboard", enforced=True) == "allow"
+    assert dc.authorize_request(owner, "/v1/teams", enforced=True) == "allow"
+    assert dc.authorize_request(owner, "/v1/ai/usage", enforced=True) == "allow"
+    assert dc.authorize_request(owner, "/v1/raw", enforced=True) == "403"
 
 
 def test_gate_never_touches_report_or_auth_routes():

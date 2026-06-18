@@ -529,8 +529,21 @@ DATA_ROUTES = {
     "/v1/teams", "/v1/cursor", "/v1/breakdown", "/v1/trend", "/v1/ai/usage",
     "/v1/meta", "/v1/governance_metrics", "/v1/feishu", "/v1/raw",
 }
-# Endpoints that can leak company-wide totals -> admin only when enforcing.
-ADMIN_ONLY_ROUTES = {"/v1/governance_metrics", "/v1/raw"}
+# Route authorization categories (only consulted when AUTH_ENFORCE=1):
+#  - ADMIN_ONLY: company-wide aggregates that can't be row-scoped to an
+#    individual in v1 -> non-admin gets 403.
+#  - OWNER_OR_ADMIN: member 403; department_owner sees own subtree (row-filtered).
+#  - everything else in DATA_ROUTES is ROW-SCOPED: the handler filters rows
+#    through _scope_rows() / email_in_scope() to the caller's visible set.
+# /v1/ai/usage and /v1/feishu are temporarily ADMIN_ONLY (SAFE — no leak) until
+# their multi-section per-person scoping lands; the personal leaderboard already
+# gives members their own numbers.
+ADMIN_ONLY_ROUTES = {
+    "/v1/governance_metrics", "/v1/raw", "/v1/breakdown",
+    "/v1/agent_leaderboard", "/v1/agent_owner_summary",
+    "/v1/feishu",
+}
+OWNER_OR_ADMIN_ROUTES = {"/v1/teams"}
 
 
 def auth_enforced():
@@ -680,6 +693,27 @@ def email_in_scope(roleinfo, row_email, row_dept_path=""):
     return False
 
 
+def _scope_dept(email, dept, pdept=None, effective_dept=""):
+    if effective_dept:
+        trusted = _trusted_keep_path(effective_dept)
+        if trusted:
+            return trusted
+    if pdept:
+        cand = _to_keep(pdept.get(email))
+        if cand:
+            return cand
+    return _to_keep(dept) or _trusted_keep_path(dept) or dept or ""
+
+
+def filter_person_rows_for_auth(rows, auth_user):
+    if not auth_user or auth_user.get("is_admin"):
+        return rows
+    return [
+        r for r in rows
+        if email_in_scope(auth_user, r.get("email") or r.get("user"), r.get("dept") or "")
+    ]
+
+
 def authorize_request(user, path, enforced):
     """Pure endpoint-level authorization decision.
 
@@ -698,8 +732,10 @@ def authorize_request(user, path, enforced):
         return "allow"
     if path in ADMIN_ONLY_ROUTES:
         return "403"
-    # Non-admin, row-scope not yet wired -> safe deny.
-    return "403"
+    if path in OWNER_OR_ADMIN_ROUTES and user.get("scope") == "self":
+        return "403"  # plain members have no team view
+    # Row-scoped route: allow through; the handler filters rows to scope.
+    return "allow"
 
 
 def num(r, *keys):
@@ -1758,7 +1794,7 @@ def _dept_headcount_map():
 # ---------------------------------------------------------------------------
 # HTTP 处理
 # ---------------------------------------------------------------------------
-def _personal_board_rows(conn, qs):
+def _personal_board_rows(conn, qs, auth_user=None):
     """个人榜「按人」计算 —— 唯一口径, /v1/leaderboard 与 /v1/ai/usage 共用(2026-06-16)。
 
     token = SUM(total) + 飞书权益点(1点=1token);
@@ -1908,7 +1944,7 @@ def _personal_board_rows(conn, qs):
         m["composition"].extend(row["composition"])
         if row.get("feishu_credits"):
             m["feishu_credits"] = (m.get("feishu_credits") or 0) + row["feishu_credits"]
-    result = list(merged.values())
+    result = filter_person_rows_for_auth(list(merged.values()), auth_user)
 
     for row in result:
         tot = row["tokens"] or 0
@@ -1957,6 +1993,25 @@ class H(BaseHTTPRequestHandler):
         if not email:
             return None
         return _user_roles(conn, email)
+
+    def _scope_rows(self, rows):
+        """Filter per-person / per-dept row dicts to the caller's visible scope.
+
+        No-op when no scope user is set (admin, or shadow mode). Matches each
+        row by its email + effective_dept/dept through email_in_scope().
+        """
+        user = getattr(self, "_scope_user", None)
+        if not user or not isinstance(rows, list):
+            return rows
+        return [r for r in rows
+                if isinstance(r, dict) and email_in_scope(
+                    user, r.get("email", ""),
+                    r.get("effective_dept") or r.get("dept", ""))]
+
+    def _set_scope_arg(self, auth_user):
+        if auth_user is not None:
+            self._scope_user = auth_user
+        return getattr(self, "_scope_user", None)
 
     def _cookie_header(self, sid):
         parts = ["%s=%s" % (SESSION_COOKIE, sid), "Path=/", "HttpOnly",
@@ -2329,13 +2384,20 @@ class H(BaseHTTPRequestHandler):
                 return self._me(conn)
 
             # Authorization gate — only does work when enforcing (shadow=no-op).
+            self._scope_user = None
             if auth_enforced() and path in DATA_ROUTES:
-                decision = authorize_request(self._session_user(conn), path, True)
+                user = self._session_user(conn)
+                decision = authorize_request(user, path, True)
                 if decision == "401":
                     return self._send(401, {"error": "login required",
                                             "login": "/v1/auth/login"})
                 if decision == "403":
                     return self._send(403, {"error": "forbidden for your role"})
+                if user and not user.get("is_admin"):
+                    # Row-scoped route: filter rows to the caller + strip admin flags.
+                    self._scope_user = user
+                    qs.pop("include_excluded", None)
+                    qs.pop("show_departed", None)
 
             if path == "/v1/leaderboard":
                 return self._leaderboard(conn, qs)
@@ -2428,13 +2490,16 @@ class H(BaseHTTPRequestHandler):
         self._send(200, payload)
 
 
-    def _leaderboard(self, conn, qs):
+    def _leaderboard(self, conn, qs, auth_user=None):
         """按人聚合(区间 ?days=N 或全部),join people 取中文姓名+头像+完整部门路径。
         同一人当天 Cursor+Claude+Codex 的 token 自动求和(GROUP BY email)。
         无 ?client → 个人榜走共用 _personal_board_rows(与 /v1/ai/usage 同口径)。"""
+        if auth_user is not None:
+            self._scope_user = auth_user
         cli = (qs.get("client") or [None])[0]
         if not cli:
-            return self._send(200, {"leaderboard": _personal_board_rows(conn, qs)})
+            return self._send(200, {"leaderboard": filter_person_rows_for_auth(
+                _personal_board_rows(conn, qs), getattr(self, "_scope_user", None))})
         where, params = _range_clause(qs, "u.")
         sd = _show_departed(qs)
         dep_clause = _departed_filter(sd, "u.")
@@ -2582,7 +2647,8 @@ class H(BaseHTTPRequestHandler):
                 x["pct"] = round(x["tokens"] / tot * 100, 1) if tot else 0
             row["composition"].sort(key=lambda x: x["tokens"], reverse=True)
         result.sort(key=lambda x: x["tokens"] or 0, reverse=True)
-        self._send(200, {"leaderboard": result})
+        self._send(200, {"leaderboard": filter_person_rows_for_auth(
+            result, getattr(self, "_scope_user", None))})
 
     def _agent_leaderboard(self, conn, qs):
         """Agent 专属榜:只看 source='litellm_agent', 按 key_alias(email='agent:<alias>')聚合.
@@ -2681,12 +2747,16 @@ class H(BaseHTTPRequestHandler):
                 "departed": r[0] in departed,
                 "subs": _single_tool_subs(subs_by_email, r[0], "cursor", win_s, win_e),
             })
-        self._send(200, {"cursor": result})
+        self._send(200, {"cursor": filter_person_rows_for_auth(
+            result, getattr(self, "_scope_user", None))})
 
-    def _teams(self, conn, qs):
+    def _teams(self, conn, qs, auth_user=None):
         """按部门(team)聚合(区间或全部)。dept 完整路径,含使用人数(people)+部门总人数
         (headcount,来自飞连)+活跃率(active_rate=people/headcount*100)。跨工具求和。
         默认剔除离职用户(token 与人数都不计);?show_departed=1 时纳入。"""
+        if auth_user is not None:
+            self._scope_user = auth_user
+        scope_user = getattr(self, "_scope_user", None)
         where, params = _range_clause(qs)
         sd = _show_departed(qs)
         dep_clause = _departed_filter(sd, "")
@@ -2721,6 +2791,11 @@ class H(BaseHTTPRequestHandler):
         # 用 people.dept(飞连规范全路径)把每个人归一到唯一的真实组织部门，
         # 再把此人所有来源的用量收进该部门 → 单一 Keep 树，杜绝裸别名裂树。
         pdept = dict(conn.execute("SELECT email, dept FROM people").fetchall())
+        if scope_user and not scope_user.get("is_admin"):
+            rows = [
+                r for r in rows
+                if email_in_scope(scope_user, r[0], _scope_dept(r[0], r[2] or r[1], pdept, r[1]))
+            ]
         people_cols = _table_columns(conn, "people")
         if "spend_bucket" in people_cols:
             pbucket = dict(conn.execute(
@@ -2823,6 +2898,11 @@ class H(BaseHTTPRequestHandler):
             "SELECT email, MAX(dept), SUM(credits) FROM feishu_member"
             " WHERE 1=1%s%s%s GROUP BY email HAVING SUM(credits)>0" % (frng, fdep, fex),
             fparams + fex_params).fetchall()
+        if scope_user and not scope_user.get("is_admin"):
+            aily_rows = [
+                r for r in aily_rows
+                if email_in_scope(scope_user, r[0], _scope_dept(r[0], r[1], pdept, ""))
+            ]
         for email, fdept, credits in aily_rows:
             # people.dept 优先,否则用 feishu_member.dept;统一过 _to_keep —— 裸供应商(SP码)
             # 也收口到外部合作商,不再因「不以 Keep 开头」误落未归类(codex 评审发现)。
@@ -2943,6 +3023,18 @@ class H(BaseHTTPRequestHandler):
     def _trend(self, conn, qs):
         """月度时间序列（period_type=month）。可选 ?email=xxx 过滤。"""
         email_filter = (qs.get("email") or [None])[0]
+        su = getattr(self, "_scope_user", None)
+        if su:
+            # Non-admin: no-filter (company-wide) collapses to self; an explicit
+            # ?email must be inside the caller's scope or it's a 403.
+            if not email_filter:
+                email_filter = su["email"]
+            else:
+                _r = conn.execute(
+                    "SELECT COALESCE(effective_dept, dept, '') FROM people"
+                    " WHERE lower(email)=?", ((email_filter or "").lower(),)).fetchone()
+                if not email_in_scope(su, email_filter, _r[0] if _r else ""):
+                    return self._send(403, {"error": "forbidden for your role"})
         if email_filter:
             rows = conn.execute("""
                 SELECT period, SUM(input), SUM(output), SUM(cache_read),
@@ -2970,8 +3062,8 @@ class H(BaseHTTPRequestHandler):
             })
         self._send(200, {"email": email_filter, "trend": result})
 
-    def _ai_usage(self, conn, qs):
-        """AI 用的无鉴权用量接口(喂 Hermes skill)。
+    def _ai_usage(self, conn, qs, auth_user=None):
+        """AI 用量接口(喂 Hermes skill / dashboard)。
 
         - ?user=<邮箱或登录名>&days=N → 该人窗口内 token 汇总 + 每日明细。
           登录名(无 @)自动补公司域名 AI_EMAIL_DOMAIN; 邮箱大小写不敏感。
@@ -2980,6 +3072,9 @@ class H(BaseHTTPRequestHandler):
         窗口语义同其它榜: ?from=&to= 优先, 否则 ?days=N, 默认近 30 天(只看 day 桶)。
         每条响应都带数据时间戳: latest_usage_date(数据覆盖到哪天) + generated_at。
         """
+        if auth_user is not None:
+            self._scope_user = auth_user
+        scope_user = getattr(self, "_scope_user", None)
         latest = conn.execute(
             "SELECT max(period) FROM usage WHERE period_type='day'").fetchone()[0]
         now_iso = datetime.datetime.now().isoformat(timespec="seconds")
@@ -2995,7 +3090,7 @@ class H(BaseHTTPRequestHandler):
         eqs = dict(qs)
         if not (qs.get("from") or qs.get("to") or qs.get("days")):
             eqs["days"] = ["30"]
-        board = _personal_board_rows(conn, eqs)
+        board = _personal_board_rows(conn, eqs, auth_user=scope_user)
         dwhere, dparams = _range_clause(eqs, "")     # 个人榜同一窗口子句(每日明细复用)
         frng, fparams = _feishu_range(eqs)
 
@@ -3019,6 +3114,16 @@ class H(BaseHTTPRequestHandler):
             email = user.strip().lower()
             if "@" not in email:
                 email = "%s@%s" % (email, AI_EMAIL_DOMAIN)
+            if scope_user and not scope_user.get("is_admin"):
+                prof = conn.execute(
+                    "SELECT COALESCE(MAX(effective_dept), ''), COALESCE(MAX(dept), '')"
+                    " FROM people WHERE lower(email)=?",
+                    (email,),
+                ).fetchone()
+                scope_dept = _scope_dept(email, (prof[1] if prof else "") or "", None,
+                                         (prof[0] if prof else "") or "")
+                if not email_in_scope(scope_user, email, scope_dept):
+                    return self._send(403, {"error": "forbidden for requested user"})
             is_departed = email in departed_lower
             # 大小写不敏感聚合: 防 DB 里同一人有大小写不同的 email 行 → total 与 daily 分裂(评审 #4)。
             matches = [r for r in board if (r["email"] or "").lower() == email]
