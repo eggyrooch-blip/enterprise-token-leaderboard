@@ -4,6 +4,7 @@
 Pure unit tests with injected fake Feishu API responses — no live network.
 """
 import os
+import json
 import sqlite3
 import sys
 
@@ -391,6 +392,47 @@ def test_cli_snapshot_uses_group_owner_as_pending_candidate(monkeypatch, tmp_pat
         fds.RULE_CHAT_OWNER,
         0,
     )
+
+
+def test_cli_loads_manual_overrides_file_and_outputs_rule_counts(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(fds, "FeishuDirectoryClient", lambda: _FakeDirectoryClient())
+    db_path = tmp_path / "tok.db"
+    override_path = tmp_path / "department-overrides.json"
+    override_path.write_text(json.dumps({
+        "合作商/W/北京再作品牌管理有限公司(SP000083)": {
+            "target_dept_id": "d_mkt",
+            "target_dept_path": "运动消费事业部/市场营销部",
+            "spend_bucket": fds.BUCKET_BUSINESS,
+        }
+    }, ensure_ascii=False), encoding="utf-8")
+
+    rc = fds.main([
+        "--db", str(db_path),
+        "--manual-overrides", str(override_path),
+        "--allow-low-coverage",
+    ])
+
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT target_dept_id, target_dept_path, spend_bucket, rule, active"
+            " FROM department_attributions WHERE source_dept_id='d_sp_chat'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row == (
+        "d_mkt",
+        "运动消费事业部/市场营销部",
+        fds.BUCKET_BUSINESS,
+        fds.RULE_MANUAL,
+        1,
+    )
+    assert out["manual_overrides"] == 1
+    assert out["attribution_counts_by_rule"][fds.RULE_MANUAL] == 1
+    assert out["attribution_counts_by_rule"][fds.RULE_UNRESOLVED] == 1
 
 
 def test_cli_records_failure_health_without_erasing_last_success(monkeypatch, tmp_path):

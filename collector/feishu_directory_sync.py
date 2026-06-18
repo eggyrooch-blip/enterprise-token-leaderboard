@@ -523,6 +523,75 @@ def disable_unapproved_business_rollup(attributions):
     return rows
 
 
+def attribution_counts_by_rule(attributions):
+    counts = {
+        RULE_DIRECT: 0,
+        RULE_LEADER: 0,
+        RULE_CHAT_OWNER: 0,
+        RULE_MANUAL: 0,
+        RULE_UNRESOLVED: 0,
+    }
+    for attr in attributions:
+        rule = attr.get("rule") or RULE_UNRESOLVED
+        counts[rule] = counts.get(rule, 0) + 1
+    return counts
+
+
+def load_manual_overrides(path):
+    """Load department attribution overrides from JSON.
+
+    Supported shapes:
+    * {"合作商/W/供应商(SP000001)": {"target_dept_path": "技术平台部/固件组"}}
+    * [{"source_dept_path": "...", "target_dept_path": "..."}]
+    """
+    path = _sstr(path).strip()
+    if not path:
+        return {}
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if isinstance(data, dict) and "overrides" in data:
+        data = data["overrides"]
+
+    allowed_buckets = {
+        BUCKET_EMPLOYEE,
+        BUCKET_BUSINESS,
+        BUCKET_PENDING_BUSINESS,
+        BUCKET_UNRESOLVED,
+    }
+
+    def _one(raw_key, value):
+        if isinstance(value, str):
+            value = {"target_dept_path": value}
+        if not isinstance(value, dict):
+            raise ValueError("manual override for %s must be object or string" % raw_key)
+        source = value.get("source_dept_key") or value.get("source_dept_path") or raw_key
+        key = canonical_dept_key(source)
+        target = _sstr(value.get("target_dept_path")).strip()
+        if not key or not target:
+            raise ValueError("manual override requires source key/path and target_dept_path")
+        bucket = _sstr(value.get("spend_bucket") or BUCKET_BUSINESS)
+        if bucket not in allowed_buckets:
+            raise ValueError("unsupported spend_bucket in manual override: %s" % bucket)
+        return key, {
+            "target_dept_id": _sstr(value.get("target_dept_id")),
+            "target_dept_path": target,
+            "spend_bucket": bucket,
+        }
+
+    overrides = {}
+    if isinstance(data, list):
+        for item in data:
+            key, value = _one("", item)
+            overrides[key] = value
+    elif isinstance(data, dict):
+        for raw_key, value in data.items():
+            key, value = _one(raw_key, value)
+            overrides[key] = value
+    else:
+        raise ValueError("manual overrides JSON must be an object or list")
+    return overrides
+
+
 def resolved_business_outsourcing_rate(attributions, spend_by_key=None):
     """active resolved supplier spend / total supplier spend.
 
@@ -776,6 +845,7 @@ def write_directory_snapshot(
         "attributions": len(new_rows),
         "supplier_departments": len(supplier_rows),
         "unresolved": sum(1 for r in new_rows if r["rule"] == RULE_UNRESOLVED),
+        "attribution_counts_by_rule": attribution_counts_by_rule(new_rows),
         "roles_written": written_roles,
         "resolved_business_outsourcing_rate": resolved_business_outsourcing_rate(new_rows),
         "business_rollup_enabled": bool(business_rollup_enabled),
@@ -989,12 +1059,18 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--admin-emails", default=os.environ.get("AUTH_ADMIN_EMAILS", ""))
     parser.add_argument(
+        "--manual-overrides",
+        default=os.environ.get("FEISHU_DEPT_ATTRIBUTION_OVERRIDES", ""),
+        help="JSON file mapping supplier departments to approved target departments",
+    )
+    parser.add_argument(
         "--allow-low-coverage",
         action="store_true",
         default=os.environ.get("ALLOW_LOW_FEISHU_ATTRIBUTION_COVERAGE", "").strip() == "1",
         help="write even when resolved business-outsourcing coverage is below threshold",
     )
     args = parser.parse_args(argv)
+    manual_overrides = load_manual_overrides(args.manual_overrides)
 
     client = FeishuDirectoryClient()
     try:
@@ -1011,7 +1087,8 @@ def main(argv=None):
             "error": _sstr(exc),
         }, ensure_ascii=False, indent=2))
         return 1
-    attributions = derive_department_attributions(departments, users)
+    attributions = derive_department_attributions(
+        departments, users, manual_overrides=manual_overrides)
     rate = resolved_business_outsourcing_rate(attributions)
     admin_emails = [e for e in re.split(r"[,\s]+", args.admin_emails) if e]
 
@@ -1021,6 +1098,8 @@ def main(argv=None):
         "supplier_departments": sum(
             1 for a in attributions if is_outsourcing_department(a["source_dept_path"])),
         "unresolved": sum(1 for a in attributions if a["rule"] == RULE_UNRESOLVED),
+        "manual_overrides": len(manual_overrides),
+        "attribution_counts_by_rule": attribution_counts_by_rule(attributions),
         "resolved_business_outsourcing_rate": round(rate, 4),
         "visibility_warnings": warnings,
         "min_required_rate": MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE,
@@ -1037,6 +1116,7 @@ def main(argv=None):
     try:
         result = write_directory_snapshot(
             conn, users, departments, admin_emails=admin_emails,
+            manual_overrides=manual_overrides,
             business_rollup_enabled=business_rollup_enabled)
         _record_sync_success(
             conn,
@@ -1055,6 +1135,7 @@ def main(argv=None):
         "min_required_rate": MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE,
         "production_enablement_blocked": summary["production_enablement_blocked"],
         "business_rollup_enabled": business_rollup_enabled,
+        "manual_overrides": len(manual_overrides),
     })
     if summary["production_enablement_blocked"] and not args.allow_low_coverage:
         result["override"] = "--allow-low-coverage"

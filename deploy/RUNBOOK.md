@@ -239,7 +239,9 @@ SQLite 部署为准。
 **前置**：`pipeline/.env` 里需含 `FEISHU_APP_ID` + `FEISHU_APP_SECRET`，同一 bot
 必须开启 contact-read 通讯录读取权限，并对所有需要统计/授权的部门有可见范围。
 `FEISHU_ROOT_DEPT` 默认 `0`；`AUTH_ADMIN_EMAILS` 用于补充管理员 allowlist，
-`sunke@keep.com` 仍由代码固定为超管兜底。
+`sunke@keep.com` 仍由代码固定为超管兜底。管理员确认业务外包归并后，可在 `.env`
+设置 `FEISHU_DEPT_ATTRIBUTION_OVERRIDES=/path/to/department-overrides.json`；JSON 支持
+`{"合作商/W/供应商(SPxxxxxx)": {"target_dept_path": "真实业务部门路径"}}`。
 
 **手动运维**：
 ```bash
@@ -250,7 +252,7 @@ ssh it@collector.example.com 'sudo systemctl list-timers feishu-directory-sync.t
 FEISHU_APP_ID=... FEISHU_APP_SECRET=... python3 collector/feishu_directory_sync.py --dry-run --db /tmp/tok.db
 ```
 
-**上线门槛**：dry-run 的 `production_enablement_blocked` 必须为 `false`，或孙可明确接受
-低于阈值的业务外包归因覆盖率；否则 CLI 会返回 2 且不写 `tok.db`，避免把未解析供应商静默
-并入部门榜。明确接受时才设置 `ALLOW_LOW_FEISHU_ATTRIBUTION_COVERAGE=1`，或手工运行时加
-`--allow-low-coverage`。
+**上线门槛**：dry-run/正式输出会打印 `attribution_counts_by_rule`、`manual_overrides`、
+`resolved_business_outsourcing_rate` 和 `production_enablement_blocked`。低覆盖时目录、
+人员、角色和复核候选仍会同步，但未确认的业务外包 roll-up 不会启用；明确接受低覆盖后才设置
+`ALLOW_LOW_FEISHU_ATTRIBUTION_COVERAGE=1`，或手工运行时加 `--allow-low-coverage`。
