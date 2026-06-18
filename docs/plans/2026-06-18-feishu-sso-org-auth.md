@@ -99,7 +99,7 @@ Extend/create:
   - `active INTEGER NOT NULL DEFAULT 0`
   - `reason TEXT DEFAULT ''`
   - `updated_at TEXT NOT NULL`
-  - unique index on `source_dept_key`; if two Feishu departments normalize to the same key, the sync must mark both conflicted/unresolved and fail dry-run for production enablement
+  - no hard unique index on `source_dept_key`; pre-write validation groups by key, and if two Feishu departments normalize to the same key, the sync writes both as `unresolved`, `active=0`, `reason=key_conflict`, and fails dry-run for production enablement
 - `roles`
   - `email TEXT NOT NULL`
   - `role TEXT NOT NULL` where role is `admin`, `department_owner`, or `member`
@@ -129,6 +129,7 @@ Department canonical key:
 - Implement `canonical_dept_key(raw_path)`: Unicode NFKC, trim, normalize full-width slashes to `/`, collapse repeated slashes, collapse internal whitespace around separators, and strip known tenant/root prefixes such as `Keep/`.
 - Preserve supplier codes such as `(SP000083)`; do not fuzzy-match company names in the first version.
 - `_effective_dept_for_raw_dept` looks up by `canonical_dept_key(raw_dept)`, not by raw string equality.
+- `_effective_dept_for_raw_dept` only returns a target when exactly one active attribution row exists for the canonical key; zero or multiple active rows resolves to raw department plus an admin review signal.
 
 ## Scope Rules
 
@@ -173,7 +174,7 @@ Test cases:
   - writes `admin` roles from configured admin emails
   - repeated run is idempotent
   - fails if a department leader is present but cannot be joined to an `open_id` in the current snapshot unless explicitly allowed as partial visibility
-  - fails dry-run if two Feishu departments produce the same `source_dept_key` but different `dept_id`
+  - detects `source_dept_key` collisions before write; rows in the collision are persisted as inactive/unresolved with `reason=key_conflict`, and dry-run fails for production enablement
 
 Run:
 ```bash
@@ -286,6 +287,7 @@ Assert:
 - if a leader or chat owner resolves to another outsourcing department, the source stays `unresolved` to avoid cycles and recursive supplier-to-supplier attribution.
 - an emailless supplier usage event whose raw Feilian department is `Keep / 合作商 / W / <supplier>` can still roll up through `department_attributions` when the Feishu path is `合作商/W/<supplier>` and the attribution is active.
 - raw Feilian department strings that normalize to no synced Feishu attribution key are counted as `unmatched_feilian_dept_keys` and do not silently fall back to a guessed target.
+- Feilian raw path `Keep/合作商/W/<supplier>` and Feishu path `合作商/W/<supplier>` produce the same `canonical_dept_key`.
 
 Run:
 ```bash
