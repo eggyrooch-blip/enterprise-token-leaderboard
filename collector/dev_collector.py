@@ -475,6 +475,20 @@ def _feishu_sync_health(conn):
     }
 
 
+def _redacted_feishu_sync_health(sync):
+    return {
+        "status": sync.get("status", "unknown"),
+        "last_success": sync.get("last_success", ""),
+        "last_attempt": sync.get("last_attempt", ""),
+        "visibility_warnings_count": int(sync.get("visibility_warnings_count") or 0),
+        "production_enablement_blocked": bool(sync.get("production_enablement_blocked")),
+        "business_rollup_enabled": bool(sync.get("business_rollup_enabled")),
+        "resolved_business_outsourcing_rate": float(
+            sync.get("resolved_business_outsourcing_rate") or 0.0),
+        "min_required_rate": float(sync.get("min_required_rate") or 0.0),
+    }
+
+
 def _configured_admin_emails():
     emails = set(AUTH_SUPER_ADMIN_EMAILS)
     raw = os.environ.get("AUTH_ADMIN_EMAILS", "")
@@ -3226,6 +3240,12 @@ class H(BaseHTTPRequestHandler):
         """月度时间序列（period_type=month）。可选 ?email=xxx 过滤。"""
         email_filter = (qs.get("email") or [None])[0]
         su = getattr(self, "_scope_user", None)
+        filter_qs = dict(qs or {})
+        if su and not su.get("is_admin"):
+            filter_qs.pop("include_excluded", None)
+            filter_qs.pop("show_departed", None)
+        ex_clause, ex_params = _excluded_filter(filter_qs, "")
+        departed_clause = _departed_filter(_show_departed(filter_qs), "")
         scoped_department_default = False
         if su:
             # Member no-filter collapses to self. Department owners default to
@@ -3257,9 +3277,10 @@ class H(BaseHTTPRequestHandler):
                        SUM(cache_read), SUM(cache_write), SUM(reasoning),
                        SUM(total), SUM(cost), SUM(messages)
                 FROM usage
-                WHERE period_type='month'
+                WHERE period_type='month'{ex}{dep}
                 GROUP BY email, {dept_expr}, period
-            """.format(dept_expr=dept_expr)).fetchall()
+            """.format(dept_expr=dept_expr, ex=ex_clause, dep=departed_clause),
+                ex_params).fetchall()
             agg = {}
             for email, dept, period, *vals in scoped_rows:
                 if not email_in_scope(su, email, _scope_dept(email, dept, pdept, dept)):
@@ -3273,17 +3294,17 @@ class H(BaseHTTPRequestHandler):
                 SELECT period, SUM(input), SUM(output), SUM(cache_read),
                        SUM(cache_write), SUM(reasoning), SUM(total), SUM(cost), SUM(messages)
                 FROM usage
-                WHERE period_type='month' AND email=?
+                WHERE period_type='month' AND email=?%s%s
                 GROUP BY period ORDER BY period
-            """, (email_filter,)).fetchall()
+            """ % (ex_clause, departed_clause), [email_filter] + ex_params).fetchall()
         else:
             rows = conn.execute("""
                 SELECT period, SUM(input), SUM(output), SUM(cache_read),
                        SUM(cache_write), SUM(reasoning), SUM(total), SUM(cost), SUM(messages)
                 FROM usage
-                WHERE period_type='month'
+                WHERE period_type='month'%s%s
                 GROUP BY period ORDER BY period
-            """).fetchall()
+            """ % (ex_clause, departed_clause), ex_params).fetchall()
         result = []
         for r in rows:
             result.append({
@@ -3756,11 +3777,15 @@ class H(BaseHTTPRequestHandler):
         ).fetchone()
         last = conn.execute(
             "SELECT MAX(reported_at) FROM report_log").fetchone()
+        feishu_sync = _feishu_sync_health(conn)
+        scope_user = getattr(self, "_scope_user", None)
+        if scope_user and not scope_user.get("is_admin"):
+            feishu_sync = _redacted_feishu_sync_health(feishu_sync)
         self._send(200, {
             "min_date": (row[0] if row else "") or "",
             "max_date": (row[1] if row else "") or "",
             "last_report": (last[0] if last else "") or "",
-            "feishu_directory_sync": _feishu_sync_health(conn),
+            "feishu_directory_sync": feishu_sync,
         })
 
     def _raw(self, conn):

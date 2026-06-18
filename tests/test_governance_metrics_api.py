@@ -135,6 +135,35 @@ def test_meta_exposes_feishu_directory_sync_health(monkeypatch, tmp_path):
     assert handler.payload["feishu_directory_sync"]["visibility_warnings_count"] == 1
 
 
+def test_meta_redacts_feishu_sync_diagnostics_for_non_admin(monkeypatch, tmp_path):
+    monkeypatch.setattr(dev_collector, "DB", str(tmp_path / "tok.db"))
+    conn = dev_collector.db()
+    try:
+        dev_collector._state_set(conn, "feishu_directory_sync_status", "failure")
+        dev_collector._state_set(conn, "feishu_directory_sync_last_success", "2026-06-18T10:00:00Z")
+        dev_collector._state_set(conn, "feishu_directory_sync_last_attempt", "2026-06-18T11:00:00Z")
+        dev_collector._state_set(conn, "feishu_directory_sync_last_error", "tenant token denied")
+        dev_collector._state_set(
+            conn,
+            "feishu_directory_sync_visibility_warnings",
+            '[{"dept_id":"secret","path":"Keep/Secret","expected":9,"got":0}]',
+        )
+        conn.commit()
+
+        handler = _DummyHandler()
+        handler._scope_user = {"email": "emp@keep.com", "is_admin": False, "scope": "self"}
+        dev_collector.H._meta(handler, conn)
+    finally:
+        conn.close()
+
+    sync = handler.payload["feishu_directory_sync"]
+    assert sync["status"] == "failure"
+    assert sync["last_success"] == "2026-06-18T10:00:00Z"
+    assert "last_error" not in sync
+    assert "visibility_warnings" not in sync
+    assert sync["visibility_warnings_count"] == 1
+
+
 def test_raw_admin_api_includes_attribution_audit_fields(monkeypatch, tmp_path):
     monkeypatch.setattr(dev_collector, "DB", str(tmp_path / "tok.db"))
     conn = dev_collector.db()

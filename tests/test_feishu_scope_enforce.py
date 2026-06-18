@@ -163,6 +163,27 @@ def test_member_trend_no_filter_collapses_to_self(dc):
     assert h.captured["obj"]["email"] == "emp@keep.com"
 
 
+def test_member_trend_cannot_bypass_excluded_or_departed_filters(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADERBOARD_EXCLUDE_EMAILS", "emp@keep.com")
+    m = importlib.reload(dev_collector)
+    monkeypatch.setattr(m, "DB", str(tmp_path / "tok.db"))
+    conn = m.db()
+    _seed(m, conn)
+    conn.execute(m._UPSERT_SQL, (
+        "emp@keep.com", "技术平台部/固件组", "month", "2026-06",
+        "litellm", "Claude Code", "", "model-x", 10, 0, 0, 0, 0, 10, 1.0, 1))
+    conn.execute("INSERT INTO departed(email) VALUES('emp@keep.com')")
+    conn.commit()
+
+    me = m._user_roles(conn, "emp@keep.com")
+    h = _handler(m, me)
+    m.H._trend(h, conn, {"include_excluded": ["1"], "show_departed": ["1"]})
+
+    assert h.captured["code"] == 200
+    assert h.captured["obj"]["email"] == "emp@keep.com"
+    assert h.captured["obj"]["trend"] == []
+
+
 def test_member_trend_other_email_is_403(dc):
     conn = dc.db()
     _seed(dc, conn)
