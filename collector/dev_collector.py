@@ -3226,18 +3226,49 @@ class H(BaseHTTPRequestHandler):
         """月度时间序列（period_type=month）。可选 ?email=xxx 过滤。"""
         email_filter = (qs.get("email") or [None])[0]
         su = getattr(self, "_scope_user", None)
+        scoped_department_default = False
         if su:
-            # Non-admin: no-filter (company-wide) collapses to self; an explicit
-            # ?email must be inside the caller's scope or it's a 403.
+            # Member no-filter collapses to self. Department owners default to
+            # their owned subtree. Explicit ?email must be inside scope.
             if not email_filter:
-                email_filter = su["email"]
+                if su.get("scope") == "department" and su.get("owned_departments"):
+                    scoped_department_default = True
+                else:
+                    email_filter = su["email"]
             else:
                 _r = conn.execute(
                     "SELECT COALESCE(effective_dept, dept, '') FROM people"
                     " WHERE lower(email)=?", ((email_filter or "").lower(),)).fetchone()
                 if not email_in_scope(su, email_filter, _r[0] if _r else ""):
                     return self._send(403, {"error": "forbidden for your role"})
-        if email_filter:
+        if scoped_department_default:
+            usage_cols = _table_columns(conn, "usage")
+            dept_expr = "COALESCE(NULLIF(effective_dept,''), dept)" \
+                if "effective_dept" in usage_cols else "dept"
+            people_cols = _table_columns(conn, "people")
+            if "effective_dept" in people_cols:
+                pdept = dict(conn.execute(
+                    "SELECT email, COALESCE(NULLIF(effective_dept,''), dept) FROM people"
+                ).fetchall())
+            else:
+                pdept = dict(conn.execute("SELECT email, dept FROM people").fetchall())
+            scoped_rows = conn.execute("""
+                SELECT email, {dept_expr}, period, SUM(input), SUM(output),
+                       SUM(cache_read), SUM(cache_write), SUM(reasoning),
+                       SUM(total), SUM(cost), SUM(messages)
+                FROM usage
+                WHERE period_type='month'
+                GROUP BY email, {dept_expr}, period
+            """.format(dept_expr=dept_expr)).fetchall()
+            agg = {}
+            for email, dept, period, *vals in scoped_rows:
+                if not email_in_scope(su, email, _scope_dept(email, dept, pdept, dept)):
+                    continue
+                cur = agg.setdefault(period, [0, 0, 0, 0, 0, 0, 0.0, 0])
+                for i, val in enumerate(vals):
+                    cur[i] += val or 0
+            rows = [(period,) + tuple(vals) for period, vals in sorted(agg.items())]
+        elif email_filter:
             rows = conn.execute("""
                 SELECT period, SUM(input), SUM(output), SUM(cache_read),
                        SUM(cache_write), SUM(reasoning), SUM(total), SUM(cost), SUM(messages)

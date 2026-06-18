@@ -182,6 +182,39 @@ def test_owner_trend_subordinate_allowed(dc):
     assert h.captured["obj"]["email"] == "emp@keep.com"
 
 
+def test_owner_trend_no_filter_returns_owned_subtree(dc):
+    conn = dc.db()
+    _seed(dc, conn)
+    for email, dept, tokens in [
+        ("emp@keep.com", "技术平台部/固件组", 10),
+        ("peer@keep.com", "技术平台部/固件组", 20),
+        ("lead@keep.com", "技术平台部", 30),
+        ("other@keep.com", "运动消费事业部/市场营销部", 400),
+    ]:
+        conn.execute(dc._UPSERT_SQL, (
+            email, dept, "month", "2026-06", "litellm", "Claude Code", "",
+            "model-x", tokens, 0, 0, 0, 0, tokens, 1.0, 1))
+    conn.commit()
+
+    owner = dc._user_roles(conn, "lead@keep.com")
+    h = _handler(dc, owner)
+    dc.H._trend(h, conn, {})
+
+    assert h.captured["code"] == 200
+    assert h.captured["obj"]["email"] is None
+    assert h.captured["obj"]["trend"] == [{
+        "month": "2026-06",
+        "input": 60,
+        "output": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0,
+        "tokens": 60,
+        "cost": 3.0,
+        "messages": 3,
+    }]
+
+
 def test_owner_trend_outside_scope_is_403(dc):
     conn = dc.db()
     _seed(dc, conn)

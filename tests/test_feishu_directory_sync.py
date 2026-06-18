@@ -242,6 +242,24 @@ def test_snapshot_writes_owner_and_admin_roles():
     assert ("sunke@keep.com", "admin") in roles
 
 
+def test_snapshot_does_not_grant_owner_role_to_inactive_leader():
+    deps, _ = _paths()
+    users = _users()
+    for u in users:
+        if u["open_id"] == "ou_leader":
+            u["status"] = "inactive"
+    conn = sqlite3.connect(":memory:")
+
+    result = fds.write_directory_snapshot(
+        conn, users, deps, admin_emails=["sunke@keep.com"], synced_at=1)
+
+    roles = conn.execute(
+        "SELECT email, role FROM roles ORDER BY email, role").fetchall()
+    assert ("leader@keep.com", "department_owner") not in roles
+    assert ("owner@keep.com", "department_owner") in roles
+    assert any(a["kind"] == "leader_inactive" for a in result["alerts"])
+
+
 def test_snapshot_is_idempotent():
     deps, _ = _paths()
     conn = sqlite3.connect(":memory:")

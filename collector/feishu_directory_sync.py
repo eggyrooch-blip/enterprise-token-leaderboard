@@ -707,6 +707,15 @@ def write_directory_snapshot(
             continue
         email = _sstr(lu.get("email")).strip().lower()
         dept_id = _sstr(d.get("dept_id"))
+        status = _sstr(lu.get("status") or "active").strip().lower()
+        if status and status != "active":
+            alerts.append({
+                "source_dept_id": dept_id,
+                "kind": "leader_inactive",
+                "leader_open_id": leader,
+                "status": status,
+            })
+            continue
         path = d.get("path") or dept_path_by_id.get(dept_id, "")
         if _denied(email, "department_owner", dept_id):
             continue
