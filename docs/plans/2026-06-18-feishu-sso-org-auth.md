@@ -117,6 +117,13 @@ Extend/create:
   - `source TEXT NOT NULL`
   - `updated_at TEXT NOT NULL`
   - primary key `(email, role, dept_id)`
+- `role_overrides`
+  - `email TEXT NOT NULL`
+  - `role TEXT NOT NULL`
+  - `dept_id TEXT DEFAULT ''`
+  - `action TEXT NOT NULL` where action is `allow` or `deny`
+  - `reason TEXT DEFAULT ''`
+  - primary key `(email, role, dept_id, action)`
 - `auth_states`
   - `state TEXT PRIMARY KEY`
   - `redirect TEXT`
@@ -135,6 +142,7 @@ Raw department and effective department are deliberately separate:
   - `employee_staff_outsourcing`: regular employees plus personnel outsourcing; this is the "员工+人员外包" view.
   - `business_outsourcing`: business outsourcing / supplier spend attributed back to the real business department; this is the "业务外包" view.
   - `department_full`: not stored as a bucket; it is computed as `employee_staff_outsourcing + business_outsourcing` for the same effective department.
+  - `pending_business_outsourcing`: not part of normal roll-up; review-only business outsourcing that has a candidate/unknown owner but is not active enough to count in `department_full`.
 - Only active, high-confidence attributions feed non-admin dashboard roll-ups by default: `direct_feishu_dept`, `leader_department`, and `manual_override`. `chat_owner_department` starts as a review suggestion unless explicitly promoted.
 - When no confident attribution exists, keep the raw supplier path and mark the attribution `unresolved`; do not silently guess.
 
@@ -168,6 +176,11 @@ Department roll-up policy:
   - `department_full`: all visible spend attributed to that effective department.
   - `employee_staff_outsourcing`: regular employee spend plus personnel outsourcing spend.
   - `business_outsourcing`: business outsourcing / supplier spend attributed to that effective department.
+- If business outsourcing is not resolved/active, it must not silently disappear. The API must surface `pending_business_outsourcing` review counts/amounts:
+  - admins see all pending/unresolved business outsourcing;
+  - department owners see pending business outsourcing only when there is a candidate target inside their owned scope, e.g. inactive `chat_owner_department` suggestion;
+  - pending values are labeled and excluded from `department_full` until promoted.
+- Production enablement is blocked unless the dry-run resolved supplier-spend coverage meets a configured threshold, default `MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE=0.8`, or sunke explicitly accepts the lower rate.
 - `department_full` must equal `employee_staff_outsourcing + business_outsourcing` only for additive numeric metrics such as tokens, cost, and messages.
 - Active-user counts are not additive by default because the same person can appear under email and `sn:<serial>` or move buckets after attribution. Compute active users per view with the same canonical identity logic, but do not assert `full_active_users = employee_active_users + business_active_users`.
 - The UI may show these as three columns or a segmented mode switch (`部门全集`, `员工+人员外包`, `业务外包`), but the API must return all three so data can be checked independently.
@@ -192,9 +205,11 @@ Test cases:
   - writes `source_dept_key` from `canonical_dept_key(path)`
   - writes `department_owner` roles from department `leader_user_id` by joining `leader_user_id` to `feishu_users.open_id`
   - writes `admin` roles from configured admin emails
+  - applies `role_overrides` / env denylist after Feishu-derived roles, so a Feishu department leader can be denied before `AUTH_ENFORCE=1`
   - repeated run is idempotent
   - fails if a department leader is present but cannot be joined to an `open_id` in the current snapshot unless explicitly allowed as partial visibility
   - detects `source_dept_key` collisions before write; rows in the collision are persisted as inactive/unresolved with `reason=key_conflict`, and dry-run fails for production enablement
+  - if a nightly sync would deactivate or conflict a previously active attribution, it refuses to apply that downgrade automatically, records an alert/review item, and preserves the last-known-good active attribution until admin action
 
 Run:
 ```bash
@@ -306,11 +321,12 @@ Assert:
 - non-outsourcing departments default to rule `direct_feishu_dept`, `spend_bucket=employee_staff_outsourcing`.
 - personnel outsourcing departments that already encode or resolve to a real business department use `spend_bucket=employee_staff_outsourcing`.
 - business outsourcing supplier departments that are attributed back to a real business department use `spend_bucket=business_outsourcing`.
-- ambiguous supplier/personnel classification uses `spend_bucket=unresolved` and is visible only to admin review until a manual override sets the bucket.
+- ambiguous supplier/personnel classification uses `spend_bucket=unresolved`; admins see all such rows, while department owners only see labeled pending amounts when a candidate target department is inside their scope.
 - if a leader or chat owner resolves to another outsourcing department, the source stays `unresolved` to avoid cycles and recursive supplier-to-supplier attribution.
 - an emailless supplier usage event whose raw Feilian department is `Keep / 合作商 / W / <supplier>` can still roll up through `department_attributions` when the Feishu path is `合作商/W/<supplier>` and the attribution is active.
 - raw Feilian department strings that normalize to no synced Feishu attribution key are counted as `unmatched_feilian_dept_keys` and do not silently fall back to a guessed target.
 - Feilian raw path `Keep/合作商/W/<supplier>` and Feishu path `合作商/W/<supplier>` produce the same `canonical_dept_key`.
+- A real-DB validation fixture reads distinct existing `usage.dept` / `people.dept` values under supplier prefixes from the target DB and asserts intended supplier paths match a synced Feishu `source_dept_key`. This is not a fake matching-path unit test.
 
 Run:
 ```bash
@@ -355,6 +371,7 @@ Expected:
 - supplier users may have `email=""`.
 - chat-owner suggestions are visible in admin review output but do not affect non-admin roll-ups until promoted.
 - real or existing Feilian/DB raw department strings under `合作商/` produce matching `source_dept_key` rows, or are printed under `unmatched_feilian_dept_keys`.
+- dry-run prints `resolved_business_outsourcing_rate = active_resolved_supplier_spend / total_supplier_spend`; production enablement fails below `MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE` unless explicitly overridden.
 
 **Step 4: Commit**
 
@@ -498,7 +515,7 @@ OAuth exchange:
 Shadow-mode tests:
 - `AUTH_ENFORCE=0`: `/v1/me` works for logged-in users, but existing data APIs keep current unauthenticated behavior.
 - `AUTH_ENFORCE=1`: data APIs require session and role scope.
-- Valid Feishu user not yet in synced directory becomes member/own-only if email is available; otherwise callback rejects with a clear 403 and no session.
+- Valid Feishu user not yet in synced directory becomes member/own-only if email is available; if OAuth/user-info does not return email, callback rejects with a clear 403 and no session. Never mint an open_id-only session with empty email.
 
 **Step 3: Verify**
 
@@ -574,8 +591,12 @@ For each role, call handler methods or HTTP harness:
 - owner subtree does not include unresolved supplier spend from outside their owned department
 - `/v1/teams` returns split metrics for each department: `department_full`, `employee_staff_outsourcing`, and `business_outsourcing`.
 - For test fixture rows, `department_full.total = employee_staff_outsourcing.total + business_outsourcing.total`, and same for cost/messages where applicable.
+- Independently sum all visible resolved rows whose bucket is one of the two visible buckets, then assert `department_full` equals that independent sum. Do not rely only on comparing response fields to each other.
+- unresolved or inactive business outsourcing rows with a candidate department are surfaced as `pending_business_outsourcing` for admin and in-scope owners, and are excluded from `department_full`.
 - Sorting/filtering can use `department_full` by default, but bucket metrics stay available in the response.
 - `/v1/feishu` member/owner responses recompute summary/total/quota fields after auth filtering; no pre-filter company-wide totals remain beside filtered rows
+- Add an endpoint aggregate manifest in tests for `/v1/leaderboard`, `/v1/teams`, `/v1/feishu`, `/v1/ai/usage`, and `/v1/governance_metrics`: each derived field is classified as `keep`, `strip`, `recompute_after_filter`, or `admin_only`.
+- Tenant-level Feishu quota/package totals are `admin_only` or coarsened for owner/member; owner/member responses must not reveal company-wide quota used/remain values.
 - owner cannot use `include_excluded=1`
 - admin can use full existing behavior
 
@@ -609,7 +630,7 @@ Department split aggregation:
 - `business_outsourcing`: `SUM(...) WHERE spend_bucket='business_outsourcing'`.
 - `department_full`: arithmetic sum of the two visible buckets for the same effective department. Do not compute it as an independent `GROUP BY effective_dept` over all rows.
 - Admin-only review surfaces may show `unresolved` separately; owner/member views do not include unresolved in department_full.
-- Rows with `spend_bucket IS NULL`, stale values, or `unresolved` are excluded from non-admin `department_full` and surfaced in admin review counts.
+- Rows with `spend_bucket IS NULL`, stale values, or `unresolved` are excluded from non-admin `department_full` and surfaced in admin review counts. In-scope owners also see a labeled pending amount when the row has a candidate target department inside their scope.
 
 **Step 4: Verify targeted suite**
 
@@ -639,7 +660,7 @@ Cases:
 - later directory sync overwrites fallback people row with Feishu data.
 - if Feishu raw department is a resolved supplier/outsourcing department, usage rolls up to attribution target while preserving raw department for admin audit.
 - if Feilian returns no email and the identity becomes `sn:<serial>`, but returns raw department `Keep/合作商/W/<supplier>` or another normalizable supplier path, the usage still rolls up through active `department_attributions`.
-- if the supplier attribution is inactive or unresolved, the usage keeps raw department and is visible only to admin review surfaces.
+- if the supplier attribution is inactive or unresolved, the usage keeps raw department; admins see it in review surfaces, and in-scope owners see it only as labeled `pending_business_outsourcing` when a candidate target exists.
 - usage upserts populate `raw_dept`, `effective_dept`, and `spend_bucket`; existing `dept` remains the effective department for backward-compatible queries.
 - personnel outsourcing and regular employees count into `employee_staff_outsourcing`; business outsourcing suppliers count into `business_outsourcing` after active attribution.
 
@@ -708,7 +729,8 @@ Rules:
 - Use `_canonical_dept_key(raw_dept)` and active `department_attributions` to set `effective_dept`, `spend_bucket`, and `attribution_source`.
 - Write `usage.dept=effective_dept` only when the row has a resolved active attribution or direct department mapping.
 - Do not rewrite unresolved rows to guessed departments.
-- Bucket reclassification for historical windows only happens through this explicit backfill; future rule changes require rerunning the backfill intentionally.
+- Bucket reclassification for historical windows only happens through this explicit backfill.
+- When `department_attributions.active`, `target_dept_path`, or `spend_bucket` changes, the sync marks `usage_backfill_required=1`; production enablement and nightly health are red until `_backfill_usage_attribution` is rerun successfully.
 
 **Step 3: Verify split math**
 
@@ -795,6 +817,7 @@ Expected:
 - prints active vs inactive attribution counts
 - prints unresolved supplier department count and sample source paths, without printing secrets
 - prints `unmatched_feilian_dept_keys` from current DB/Feilian raw department samples; production enablement is blocked if active supplier spend depends on unmatched keys
+- prints resolved supplier-spend coverage and fails production enablement if below `MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE`
 - exits 0
 - no secrets printed
 
@@ -803,14 +826,15 @@ Expected:
 Start local collector using ftask env. Verify:
 - with `AUTH_ENFORCE=0`, unauthenticated `/v1/leaderboard` keeps current behavior while `/v1/me` works for logged-in users
 - with `AUTH_ENFORCE=1`, unauthenticated `/v1/leaderboard` is 401/redirect
+- final done evidence must include production `AUTH_ENFORCE=1` plus a real probe: unauthenticated `https://tokscale.gotokeep.com/v1/leaderboard` returns 401/redirect and authenticated admin/member/owner probes match scope
 - admin session can see global
 - member session cannot see others
 - owner session subtree is enforced
 - active supplier spend mapped into an owned department is visible to that owner in team roll-up
 - department leaderboard shows three metrics for the owned department: `部门全集`, `员工+人员外包`, and `业务外包`
 - `部门全集` equals `员工+人员外包 + 业务外包` for the same scoped data
-- inactive chat-owner suggestions are visible only to admins
-- unresolved supplier spend is visible only to admin review surfaces
+- inactive chat-owner suggestions are visible to admins and as labeled pending items to in-scope owners
+- unresolved supplier spend with no scoped candidate is visible only to admin review surfaces
 
 **Step 4: Production deployment checklist**
 
@@ -841,7 +865,7 @@ Ask Claude/reviewer to specifically challenge:
 - Whether the three department leaderboard metrics (`部门全集`, `员工+人员外包`, `业务外包`) are defined clearly enough and cannot double-count after attribution.
 - Whether the `合作商/` prefix is a safe first-version detector for outsourcing departments, or needs an explicit allowlist.
 - Whether `chat_owner_department` being inactive by default is the right safety tradeoff, or whether sunke wants automatic medium-confidence roll-up.
-- Whether unresolved supplier departments should remain visible to admins only, or need a public "unattributed" bucket.
+- Whether unresolved supplier departments with no candidate should remain visible to admins only, or need a public "unattributed" bucket.
 - Whether `AUTH_ENFORCE=0/1` shadow mode is sufficient for production rollout and rollback.
 - Whether admin/owner role derivation from Feishu department leaders is reliable enough, or needs an override table first.
 - Whether `/v1/teams` for ordinary members should return own-only mini aggregation or hard 403.
