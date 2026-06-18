@@ -521,7 +521,16 @@ FEISHU_OAUTH_REDIRECT_URI = os.environ.get("FEISHU_OAUTH_REDIRECT_URI", "").stri
 SESSION_COOKIE = "tok_auth"
 SESSION_TTL = int(os.environ.get("AUTH_SESSION_TTL", str(7 * 24 * 3600)))
 STATE_TTL = int(os.environ.get("AUTH_STATE_TTL", "600"))
-AUTH_COOKIE_SECURE = os.environ.get("AUTH_COOKIE_SECURE", "0").strip() == "1"
+
+
+def _default_auth_cookie_secure():
+    return FEISHU_OAUTH_REDIRECT_URI.lower().startswith("https://")
+
+
+AUTH_COOKIE_SECURE = os.environ.get(
+    "AUTH_COOKIE_SECURE",
+    "1" if _default_auth_cookie_secure() else "0",
+).strip() == "1"
 
 # Data routes guarded by AUTH_ENFORCE. The report/static/auth routes are NOT here.
 DATA_ROUTES = {
@@ -572,6 +581,24 @@ def feishu_authorize_url(state):
         "state": state,
     })
     return FEISHU_HOST + "/open-apis/authen/v1/authorize?" + q
+
+
+def _safe_next_path(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        return "/"
+    try:
+        p = urlparse(raw)
+    except Exception:
+        return "/"
+    if p.scheme or p.netloc:
+        return "/"
+    path = p.path or "/"
+    if not path.startswith("/") or path.startswith("//"):
+        return "/"
+    if path.startswith("/v1/auth/callback"):
+        return "/"
+    return path + (("?" + p.query) if p.query else "")
 
 
 def feishu_exchange_code(code):
@@ -2029,7 +2056,7 @@ class H(BaseHTTPRequestHandler):
     def _auth_login(self, conn, qs):
         if not FEISHU_APP_ID or not FEISHU_OAUTH_REDIRECT_URI:
             return self._send(500, {"error": "feishu oauth not configured"})
-        nxt = (qs.get("next") or ["/"])[0] or "/"
+        nxt = _safe_next_path((qs.get("next") or ["/"])[0])
         state = create_oauth_state(conn, nxt)
         return self._send_redirect(feishu_authorize_url(state))
 

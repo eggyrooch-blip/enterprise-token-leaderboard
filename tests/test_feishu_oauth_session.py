@@ -69,6 +69,25 @@ def test_unknown_state_rejected(conn):
     assert dc.consume_oauth_state(conn, "nope", now=1) is None
 
 
+def test_login_next_rejects_external_url(conn, monkeypatch):
+    monkeypatch.setattr(dc, "FEISHU_APP_ID", "cli_test")
+    monkeypatch.setattr(dc, "FEISHU_OAUTH_REDIRECT_URI", "https://example.com/v1/auth/callback")
+    h = _handler()
+    h._auth_login(conn, {"next": ["https://evil.example/phish"]})
+    assert h.captured and h.captured[0][0] == "redirect"
+    state = conn.execute("SELECT state FROM auth_states").fetchone()[0]
+    assert dc.consume_oauth_state(conn, state) == "/"
+
+
+def test_login_next_keeps_local_path_and_query(conn, monkeypatch):
+    monkeypatch.setattr(dc, "FEISHU_APP_ID", "cli_test")
+    monkeypatch.setattr(dc, "FEISHU_OAUTH_REDIRECT_URI", "https://example.com/v1/auth/callback")
+    h = _handler()
+    h._auth_login(conn, {"next": ["/dashboard?tab=team"]})
+    state = conn.execute("SELECT state FROM auth_states").fetchone()[0]
+    assert dc.consume_oauth_state(conn, state) == "/dashboard?tab=team"
+
+
 # --------------------------------------------------------------------------- #
 # session lifecycle + expiry
 # --------------------------------------------------------------------------- #
@@ -84,6 +103,14 @@ def test_session_roundtrip_and_expiry(conn):
 def test_session_unknown_sid(conn):
     assert dc.session_email(conn, "missing", now=1) is None
     assert dc.session_email(conn, None) is None
+
+
+def test_secure_cookie_default_follows_https_redirect(monkeypatch):
+    monkeypatch.delenv("AUTH_COOKIE_SECURE", raising=False)
+    monkeypatch.setattr(dc, "FEISHU_OAUTH_REDIRECT_URI", "https://example.com/v1/auth/callback")
+    assert dc._default_auth_cookie_secure() is True
+    monkeypatch.setattr(dc, "FEISHU_OAUTH_REDIRECT_URI", "http://localhost:8090/v1/auth/callback")
+    assert dc._default_auth_cookie_secure() is False
 
 
 # --------------------------------------------------------------------------- #
