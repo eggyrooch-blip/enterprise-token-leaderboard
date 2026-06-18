@@ -19,6 +19,7 @@
 - Supplier/outsourcing users can have empty `email`; store them in `feishu_users` keyed by Feishu `open_id` and only mirror into `people` when a stable email exists.
 - Department group chat owner is not a reliable first-pass API source: `im/v1/chats/{chat_id}` may return only partial chat data, and `im/v1/chats/{chat_id}/members` fails with `232011 Operator can NOT be out of the chat` unless the caller is in that department chat.
 - Existing `tokscale` usage upsert is keyed by `email` or `sn:<serial>`, but the raw department currently comes from serial attribution. Therefore emailless supplier spend can still roll up if `_tokscale_report` maps the raw Feilian department through `department_attributions`; it must not depend on a `people` row mirrored from Feishu email.
+- Feilian and Feishu department paths must not be compared byte-for-byte. Store and look up a canonical department key derived from both systems' raw path strings.
 - The Feishu app must have contact read permissions and its contact visibility range must cover all departments that should appear in the dashboard.
 
 Docs checked:
@@ -89,6 +90,7 @@ Extend/create:
   - `updated_at TEXT`
 - `department_attributions`
   - `source_dept_id TEXT PRIMARY KEY`
+  - `source_dept_key TEXT NOT NULL`
   - `source_dept_path TEXT NOT NULL`
   - `target_dept_id TEXT DEFAULT ''`
   - `target_dept_path TEXT DEFAULT ''`
@@ -97,6 +99,7 @@ Extend/create:
   - `active INTEGER NOT NULL DEFAULT 0`
   - `reason TEXT DEFAULT ''`
   - `updated_at TEXT NOT NULL`
+  - unique index on `source_dept_key`; if two Feishu departments normalize to the same key, the sync must mark both conflicted/unresolved and fail dry-run for production enablement
 - `roles`
   - `email TEXT NOT NULL`
   - `role TEXT NOT NULL` where role is `admin`, `department_owner`, or `member`
@@ -118,9 +121,14 @@ Extend/create:
 
 Raw department and effective department are deliberately separate:
 - `departments.path` and `people.raw_dept` preserve Feishu's source-of-truth org path.
-- `department_attributions.target_dept_path` and `people.effective_dept` are used for dashboard spend roll-up.
+- `department_attributions.source_dept_key`, `target_dept_path`, and `people.effective_dept` are used for dashboard spend roll-up.
 - Only active, high-confidence attributions feed non-admin dashboard roll-ups by default: `direct_feishu_dept`, `leader_department`, and `manual_override`. `chat_owner_department` starts as a review suggestion unless explicitly promoted.
 - When no confident attribution exists, keep the raw supplier path and mark the attribution `unresolved`; do not silently guess.
+
+Department canonical key:
+- Implement `canonical_dept_key(raw_path)`: Unicode NFKC, trim, normalize full-width slashes to `/`, collapse repeated slashes, collapse internal whitespace around separators, and strip known tenant/root prefixes such as `Keep/`.
+- Preserve supplier codes such as `(SP000083)`; do not fuzzy-match company names in the first version.
+- `_effective_dept_for_raw_dept` looks up by `canonical_dept_key(raw_dept)`, not by raw string equality.
 
 ## Scope Rules
 
@@ -160,10 +168,12 @@ Test cases:
   - preserves `user_id` and `union_id` as separate columns
   - mirrors only stable-email users into `people`
   - writes raw department paths and preserves `chat_id`, `leader_user_id`, `open_dept_id`
+  - writes `source_dept_key` from `canonical_dept_key(path)`
   - writes `department_owner` roles from department `leader_user_id` by joining `leader_user_id` to `feishu_users.open_id`
   - writes `admin` roles from configured admin emails
   - repeated run is idempotent
   - fails if a department leader is present but cannot be joined to an `open_id` in the current snapshot unless explicitly allowed as partial visibility
+  - fails dry-run if two Feishu departments produce the same `source_dept_key` but different `dept_id`
 
 Run:
 ```bash
@@ -181,6 +191,7 @@ Create `collector/feishu_directory_sync.py` with:
 - path builder from department parent IDs
 - email-keyed `people` mirror from `feishu_users`
 - explicit ID-space helpers: `open_id` for Feishu joins, `email` for local dashboard/auth keys
+- `canonical_dept_key(raw_path)`
 - `main --dry-run`
 
 Do not call real Feishu in unit tests. Inject fake API responses.
@@ -273,7 +284,8 @@ Assert:
 - unreadable/missing owner maps to `unresolved`, confidence `needs_review`, and does not rewrite people rows to a guessed department.
 - non-outsourcing departments default to rule `direct_feishu_dept`.
 - if a leader or chat owner resolves to another outsourcing department, the source stays `unresolved` to avoid cycles and recursive supplier-to-supplier attribution.
-- an emailless supplier usage event whose raw Feilian department is `合作商/W/<supplier>` can still roll up through `department_attributions` when the attribution is active.
+- an emailless supplier usage event whose raw Feilian department is `Keep / 合作商 / W / <supplier>` can still roll up through `department_attributions` when the Feishu path is `合作商/W/<supplier>` and the attribution is active.
+- raw Feilian department strings that normalize to no synced Feishu attribution key are counted as `unmatched_feilian_dept_keys` and do not silently fall back to a guessed target.
 
 Run:
 ```bash
@@ -285,6 +297,7 @@ Expected before implementation: attribution functions missing or failing.
 
 Add pure functions:
 - `is_outsourcing_department(path)`: true for paths under `合作商/` and future-configured prefixes.
+- `canonical_dept_key(raw_path)`.
 - `derive_department_attributions(departments, users, chat_owner_lookup=None, manual_overrides=None)`.
 - `effective_dept_for_person(raw_dept_path, attributions)`.
 
@@ -314,6 +327,7 @@ Expected:
 - `合作商/W` supplier departments include mixed `leader_user_id`, `chat_id`, and empty cases.
 - supplier users may have `email=""`.
 - chat-owner suggestions are visible in admin review output but do not affect non-admin roll-ups until promoted.
+- real or existing Feilian/DB raw department strings under `合作商/` produce matching `source_dept_key` rows, or are printed under `unmatched_feilian_dept_keys`.
 
 **Step 4: Commit**
 
@@ -531,6 +545,7 @@ For each role, call handler methods or HTTP harness:
 - owner subtree includes resolved supplier spend only when `department_attributions.active=1` and `effective_dept` maps a supplier raw department into the owned business department
 - owner subtree does not include inactive `chat_owner_department` suggestions until an admin/manual override promotes them
 - owner subtree does not include unresolved supplier spend from outside their owned department
+- `/v1/feishu` member/owner responses recompute summary/total/quota fields after auth filtering; no pre-filter company-wide totals remain beside filtered rows
 - owner cannot use `include_excluded=1`
 - admin can use full existing behavior
 
@@ -586,7 +601,7 @@ Cases:
 - if Feishu person missing, Feilian department is used as temporary raw/effective fallback and people row marked source/fallback.
 - later directory sync overwrites fallback people row with Feishu data.
 - if Feishu raw department is a resolved supplier/outsourcing department, usage rolls up to attribution target while preserving raw department for admin audit.
-- if Feilian returns no email and the identity becomes `sn:<serial>`, but returns raw department `合作商/W/<supplier>`, the usage still rolls up through active `department_attributions`.
+- if Feilian returns no email and the identity becomes `sn:<serial>`, but returns raw department `Keep/合作商/W/<supplier>` or another normalizable supplier path, the usage still rolls up through active `department_attributions`.
 - if the supplier attribution is inactive or unresolved, the usage keeps raw department and is visible only to admin review surfaces.
 
 **Step 2: Implement lookup precedence**
@@ -594,12 +609,13 @@ Cases:
 Add helper:
 - `_directory_identity_for_email(conn, email)`
 - `_effective_dept_for_raw_dept(conn, raw_dept)`
+- `_canonical_dept_key(raw_dept)`
 - `_merge_identity(serial_identity, reported_email, directory_identity)`
 
 Precedence:
 1. Email from Feilian or payload
 2. If email exists in Feishu-synced `people`, use Feishu name/avatar/raw_dept/effective_dept/status
-3. Else use Feilian result and compute `effective_dept` from raw Feilian department through active `department_attributions`
+3. Else use Feilian result and compute `effective_dept` from raw Feilian department through active `department_attributions.source_dept_key`
 4. Else `sn:<serial>`
 
 **Step 3: Verify**
@@ -679,6 +695,7 @@ Expected:
 - prints attribution counts by rule: `direct_feishu_dept`, `leader_department`, `chat_owner_department`, `manual_override`, `unresolved`
 - prints active vs inactive attribution counts
 - prints unresolved supplier department count and sample source paths, without printing secrets
+- prints `unmatched_feilian_dept_keys` from current DB/Feilian raw department samples; production enablement is blocked if active supplier spend depends on unmatched keys
 - exits 0
 - no secrets printed
 
@@ -717,7 +734,8 @@ git commit -m "docs: document feishu sso org auth operations"
 Ask Claude/reviewer to specifically challenge:
 - Whether org sync should extend `people` in place, add `feishu_users`, or write a separate `people_directory`.
 - Whether `department_attributions` is the right place to model supplier/outsourcing roll-up, instead of rewriting `people.dept`.
-- Whether emailless supplier usage now has a real path from `_tokscale_report` raw Feilian department to active `department_attributions` to dashboard roll-up.
+- Whether emailless supplier usage now has a real path from `_tokscale_report` raw Feilian department through `canonical_dept_key` to active `department_attributions` to dashboard roll-up.
+- Whether canonical department key normalization is strict enough to match Feilian/Feishu without creating false positives.
 - Whether pinning Feishu joins on `open_id` covers leader/owner/OAuth mapping without mis-joining `user_id`.
 - Whether the `合作商/` prefix is a safe first-version detector for outsourcing departments, or needs an explicit allowlist.
 - Whether `chat_owner_department` being inactive by default is the right safety tradeoff, or whether sunke wants automatic medium-confidence roll-up.
