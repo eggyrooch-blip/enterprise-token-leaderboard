@@ -535,9 +535,8 @@ DATA_ROUTES = {
 #  - OWNER_OR_ADMIN: member 403; department_owner sees own subtree (row-filtered).
 #  - everything else in DATA_ROUTES is ROW-SCOPED: the handler filters rows
 #    through _scope_rows() / email_in_scope() to the caller's visible set.
-# /v1/ai/usage and /v1/feishu are temporarily ADMIN_ONLY (SAFE — no leak) until
-# their multi-section per-person scoping lands; the personal leaderboard already
-# gives members their own numbers.
+# /v1/feishu is temporarily ADMIN_ONLY (SAFE — no leak) until its multi-section
+# per-person scoping lands.
 ADMIN_ONLY_ROUTES = {
     "/v1/governance_metrics", "/v1/raw", "/v1/breakdown",
     "/v1/agent_leaderboard", "/v1/agent_owner_summary",
@@ -718,10 +717,8 @@ def authorize_request(user, path, enforced):
     """Pure endpoint-level authorization decision.
 
     Returns 'allow' | '401' | '403'. Row-level scoping (member self-rows / owner
-    subtree) on the per-person boards is the NEXT increment; until it lands this
-    gate is deny-by-default for non-admins under enforce, which is SAFE (no data
-    leak) — production stays at AUTH_ENFORCE=0 (shadow) until that increment +
-    one verified admin login. `/v1/me` and the auth/report/static routes are
+    subtree) lives in each handler; endpoint-level auth only blocks routes that
+    cannot yet be scoped safely. `/v1/me` and the auth/report/static routes are
     never gated here.
     """
     if not enforced or path not in DATA_ROUTES:
