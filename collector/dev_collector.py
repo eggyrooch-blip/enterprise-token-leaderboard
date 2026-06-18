@@ -26,6 +26,7 @@ import sqlite3
 import sys
 import time
 import socketserver
+import unicodedata
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 try:
@@ -67,6 +68,13 @@ LEADERBOARD_EXCLUDE_EMAILS = {
     for e in os.environ.get("LEADERBOARD_EXCLUDE_EMAILS", "sunke@keep.com").split(",")
     if e.strip()
 }
+AUTH_SUPER_ADMIN_EMAILS = {"sunke@keep.com"}
+
+BUCKET_EMPLOYEE = "employee_staff_outsourcing"
+BUCKET_BUSINESS = "business_outsourcing"
+BUCKET_PENDING_BUSINESS = "pending_business_outsourcing"
+BUCKET_UNRESOLVED = "unresolved"
+VISIBLE_SPEND_BUCKETS = {BUCKET_EMPLOYEE, BUCKET_BUSINESS}
 
 # 飞书 AI 权益计费常量 —— 必须在 .env 加载之后取值,否则 .env 里的覆盖不生效。
 PACKAGE_CNY = _env_float("FEISHU_PACKAGE_CNY", 99000)
@@ -273,6 +281,7 @@ def db():
     # 人员档案:email → 中文姓名 + 飞连头像 + 部门(身份反解时落库,看板 join 用)
     c.execute("""CREATE TABLE IF NOT EXISTS people(
         email TEXT PRIMARY KEY, name TEXT, avatar TEXT, dept TEXT)""")
+    _ensure_people_directory_columns(c)
     # 上报审计:每台机器(序列号)最近一次订阅制上报的来源痕迹。
     # via='mdm'(飞连自动) / 'manual'(员工手工补报)。客户端推的订阅制数据是唯一
     # 可被伪造/出人为坏数据的来源(LiteLLM/Cursor 是服务端拉,无客户端输入),
@@ -291,6 +300,11 @@ def db():
     # 1000 人规模:按 period_type 过滤是所有榜单的公共前缀,建索引避免全表扫
     c.execute("CREATE INDEX IF NOT EXISTS idx_usage_period ON usage(period_type, total DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_usage_dept ON usage(period_type, dept)")
+    _ensure_usage_attribution_columns(c)
+    ensure_auth_tables(c)
+    _ensure_app_state_table(c)
+    if _usage_backfill_needed(c):
+        _backfill_usage_attribution(c, dry_run=False)
     # 飞书 AI 权益(独立三表,单位=「点」credits,与 token 不加总)。
     # feishu_member 按天落库(主键含 usage_date),部门/个人榜按区间聚合 —— 不再是月累计死快照。
     # 迁移:旧表主键含 period_start、无 usage_date(月快照,语义不兼容),检测到就 DROP 重建,
@@ -323,6 +337,168 @@ def db():
 # ---------------------------------------------------------------------------
 # 辅助
 # ---------------------------------------------------------------------------
+def _table_columns(conn, table):
+    try:
+        return {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table).fetchall()}
+    except Exception:
+        return set()
+
+
+def _add_column_if_missing(conn, table, column, ddl):
+    if column not in _table_columns(conn, table):
+        conn.execute("ALTER TABLE %s ADD COLUMN %s" % (table, ddl))
+
+
+def _ensure_usage_attribution_columns(conn):
+    if "usage" not in {
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }:
+        return
+    _add_column_if_missing(conn, "usage", "raw_dept", "raw_dept TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "usage", "effective_dept", "effective_dept TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "usage", "spend_bucket", "spend_bucket TEXT DEFAULT '%s'" % BUCKET_EMPLOYEE)
+    _add_column_if_missing(conn, "usage", "attribution_source", "attribution_source TEXT DEFAULT ''")
+
+
+def _ensure_people_directory_columns(conn):
+    if "people" not in {
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }:
+        return
+    _add_column_if_missing(conn, "people", "feishu_user_id", "feishu_user_id TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "people", "feishu_open_id", "feishu_open_id TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "people", "status", "status TEXT DEFAULT 'active'")
+    _add_column_if_missing(conn, "people", "source", "source TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "people", "raw_dept", "raw_dept TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "people", "effective_dept", "effective_dept TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "people", "attribution_source", "attribution_source TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "people", "spend_bucket", "spend_bucket TEXT DEFAULT '%s'" % BUCKET_EMPLOYEE)
+    _add_column_if_missing(conn, "people", "updated_at", "updated_at TEXT DEFAULT ''")
+
+
+def ensure_auth_tables(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS roles(
+        email TEXT NOT NULL,
+        role TEXT NOT NULL,
+        dept_id TEXT DEFAULT '',
+        dept_path TEXT DEFAULT '',
+        source TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(email, role, dept_id))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS role_overrides(
+        email TEXT NOT NULL,
+        role TEXT NOT NULL,
+        dept_id TEXT DEFAULT '',
+        action TEXT NOT NULL,
+        reason TEXT DEFAULT '',
+        PRIMARY KEY(email, role, dept_id, action))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS auth_states(
+        state TEXT PRIMARY KEY,
+        redirect TEXT,
+        created_at INTEGER)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS auth_sessions(
+        sid TEXT PRIMARY KEY,
+        email TEXT NOT NULL,
+        created_at INTEGER,
+        expires_at INTEGER,
+        last_seen_at INTEGER)""")
+
+
+def _ensure_app_state_table(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS app_state(
+        key TEXT PRIMARY KEY,
+        value TEXT DEFAULT '')""")
+
+
+def _state_get(conn, key, default=""):
+    try:
+        row = conn.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
+    except Exception:
+        return default
+    return row[0] if row else default
+
+
+def _state_set(conn, key, value):
+    _ensure_app_state_table(conn)
+    conn.execute("INSERT OR REPLACE INTO app_state(key,value) VALUES(?,?)", (key, value))
+
+
+def _configured_admin_emails():
+    emails = set(AUTH_SUPER_ADMIN_EMAILS)
+    raw = os.environ.get("AUTH_ADMIN_EMAILS", "")
+    for item in raw.split(","):
+        email = item.strip().lower()
+        if email:
+            emails.add(email)
+    return emails
+
+
+def _role_override_rows(conn, email):
+    try:
+        return conn.execute(
+            "SELECT role, COALESCE(dept_id,''), action FROM role_overrides WHERE lower(email)=?",
+            ((email or "").lower(),),
+        ).fetchall()
+    except Exception:
+        return []
+
+
+def _role_denied(overrides, role, dept_id=""):
+    did = dept_id or ""
+    return any(r == role and action == "deny" and ((odid or "") in ("", did))
+               for r, odid, action in overrides)
+
+
+def _user_roles(conn, email):
+    email = (email or "").strip().lower()
+    overrides = _role_override_rows(conn, email)
+    roles = set()
+    owned = set()
+
+    is_super_admin = email in AUTH_SUPER_ADMIN_EMAILS
+    if is_super_admin:
+        roles.add("admin")
+    elif email in _configured_admin_emails() and not _role_denied(overrides, "admin"):
+        roles.add("admin")
+
+    try:
+        rows = conn.execute(
+            "SELECT role, COALESCE(dept_id,''), COALESCE(dept_path,'')"
+            " FROM roles WHERE lower(email)=?",
+            (email,),
+        ).fetchall()
+    except Exception:
+        rows = []
+    for role, dept_id, dept_path in rows:
+        if _role_denied(overrides, role, dept_id):
+            continue
+        if role:
+            roles.add(role)
+        if role == "department_owner" and dept_path:
+            owned.add(dept_path)
+
+    for role, dept_id, action in overrides:
+        if role == "department_owner":
+            continue
+        if action == "allow" and not _role_denied(overrides, role, dept_id):
+            roles.add(role)
+
+    if "admin" in roles:
+        scope = "global"
+    elif "department_owner" in roles:
+        scope = "department"
+    else:
+        roles.add("member")
+        scope = "self"
+    return {
+        "email": email,
+        "roles": sorted(roles),
+        "is_admin": "admin" in roles,
+        "scope": scope,
+        "owned_departments": sorted(owned),
+    }
+
+
 def num(r, *keys):
     """从 dict r 中按 keys 顺序取第一个非 None 整数，失败返回 0。"""
     for k in keys:
@@ -610,9 +786,10 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
 
 
-def _upsert_lifetime(conn, email, dept, entries):
+def _upsert_lifetime(conn, email, dept, entries, identity=None):
     """将 tokscale models --json entries UPSERT 为 period_type=lifetime。"""
     up = 0
+    identity = identity or _attribution_for_raw_dept(conn, dept)
     for e in entries:
         client = _client_label(e.get("client", "unknown"))
         provider = _sstr(e.get("provider"))
@@ -630,11 +807,13 @@ def _upsert_lifetime(conn, email, dept, entries):
             client, provider, model,
             inp, out, cr, cw, reasoning, total, cost, messages,
         ))
+        _set_usage_attribution(conn, email, "lifetime", "all", "subscription",
+                               client, provider, model, identity)
         up += 1
     return up
 
 
-def _upsert_monthly(conn, email, dept, entries):
+def _upsert_monthly(conn, email, dept, entries, identity=None):
     """将 tokscale monthly --json entries UPSERT 为 period_type=month。
 
     monthly 格式: {month, models(list), input, output, cacheRead, cacheWrite,
@@ -642,6 +821,7 @@ def _upsert_monthly(conn, email, dept, entries):
     无 provider/reasoning/client — 存为空字符串/0，client 固定 '__monthly__'。
     """
     up = 0
+    identity = identity or _attribution_for_raw_dept(conn, dept)
     for e in entries:
         month = _sstr(e.get("month"))
         if not month:
@@ -661,15 +841,18 @@ def _upsert_monthly(conn, email, dept, entries):
             "__monthly__", "", "__aggregated__",
             inp, out, cr, cw, reasoning, total, cost, messages,
         ))
+        _set_usage_attribution(conn, email, "month", month, "subscription",
+                               "__monthly__", "", "__aggregated__", identity)
         up += 1
     return up
 
 
-def _upsert_daily(conn, email, dept, graph):
+def _upsert_daily(conn, email, dept, graph, identity=None):
     """将 tokscale graph 的 contributions[] 落为 period_type='day' 日桶(每天每模型 token)。
     graph: {contributions:[{date:'YYYY-MM-DD', clients:[{client,modelId,providerId,
             tokens:{input,output,cacheRead,cacheWrite,reasoning}, cost, messages}]}]}"""
     up = 0
+    identity = identity or _attribution_for_raw_dept(conn, dept)
     for d in (graph or {}).get("contributions") or []:
         day = _sstr(d.get("date"))
         if not day:
@@ -685,6 +868,9 @@ def _upsert_daily(conn, email, dept, graph):
                 client, _sstr(c.get("providerId")), _sstr(c.get("modelId")) or "unknown",
                 inp, out, cr, cw, rs, total, _sfloat(c.get("cost")), num(c, "messages"),
             ))
+            _set_usage_attribution(conn, email, "day", day, "subscription",
+                                   client, _sstr(c.get("providerId")), _sstr(c.get("modelId")) or "unknown",
+                                   identity)
             up += 1
     return up
 
@@ -981,6 +1167,308 @@ def _to_keep(raw):
         return None
     n = _normalize_dept_path(raw)
     return n if n and n.startswith("Keep") else None
+
+
+def _trusted_keep_path(raw):
+    """Feishu/attribution 写入的 effective_dept 是可信组织路径。
+
+    旧 usage.dept 的裸团队别名不能自动挂到 Keep 树；但新 attribution 的
+    effective_dept 已经过同步/回填确认，可以补上 Keep 根以便部门榜 roll-up。
+    """
+    if not raw:
+        return None
+    n = _normalize_dept_path(raw)
+    if not n or str(n).lower() in ("unknown", "none"):
+        return None
+    if n.startswith("Keep"):
+        return n
+    if "/" in n:
+        return "Keep/" + n
+    return None
+
+
+def _canonical_dept_key(raw_path):
+    """Feishu/Feilian department path -> stable comparison key."""
+    text = unicodedata.normalize("NFKC", _sstr(raw_path)).strip()
+    if not text:
+        return ""
+    text = text.replace("\\", "/")
+    parts = []
+    for part in re.split(r"/+", text):
+        part = re.sub(r"\s+", " ", part).strip()
+        if part:
+            parts.append(part)
+    if parts and parts[0].lower() == "keep":
+        parts = parts[1:]
+    return "/".join(parts)
+
+
+def _is_business_outsourcing_dept(raw_path):
+    key = _canonical_dept_key(raw_path)
+    parts = key.split("/") if key else []
+    if "合作商" in parts:
+        i = parts.index("合作商")
+        if len(parts) > i + 1 and parts[i + 1] == "W":
+            return True
+    return bool(_SP_RE.search(_sstr(raw_path)))
+
+
+def _active_attribution_map(conn):
+    out = {}
+    try:
+        rows = conn.execute(
+            "SELECT source_dept_key, target_dept_path, spend_bucket, rule"
+            " FROM department_attributions"
+            " WHERE active=1 AND COALESCE(target_dept_path,'')<>''"
+        ).fetchall()
+    except Exception:
+        return out
+    for key, target, bucket, rule in rows:
+        out.setdefault(key or "", []).append((target, bucket, rule))
+    return out
+
+
+def _attribution_signature(conn):
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(updated_at), ''),"
+            " SUM(CASE WHEN active=1 THEN 1 ELSE 0 END)"
+            " FROM department_attributions"
+        ).fetchone()
+    except Exception:
+        return "missing"
+    return "%s:%s:%s" % (row[0] or 0, row[1] or "", row[2] or 0)
+
+
+def _usage_backfill_needed(conn):
+    usage_cols = _table_columns(conn, "usage")
+    required = {"raw_dept", "effective_dept", "spend_bucket", "attribution_source"}
+    if not required.issubset(usage_cols):
+        return True
+    if _state_get(conn, "usage_backfill_required") == "1":
+        return True
+    current_sig = _attribution_signature(conn)
+    if _state_get(conn, "usage_attribution_signature") != current_sig:
+        return True
+    if _state_get(conn, "usage_backfill_complete") == "1":
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM usage WHERE COALESCE(raw_dept,'')=''"
+            " OR COALESCE(effective_dept,'')=''"
+            " OR COALESCE(spend_bucket,'')='' LIMIT 1"
+        ).fetchone()
+    except Exception:
+        return False
+    return bool(row)
+
+
+def _attribution_for_raw_dept(conn, raw_dept, active_map=None):
+    raw_dept = _sstr(raw_dept)
+    key = _canonical_dept_key(raw_dept)
+    default_bucket = BUCKET_UNRESOLVED if _is_business_outsourcing_dept(raw_dept) else BUCKET_EMPLOYEE
+    default = {
+        "raw_dept": raw_dept,
+        "effective_dept": raw_dept,
+        "spend_bucket": default_bucket,
+        "attribution_source": "unresolved" if default_bucket == BUCKET_UNRESOLVED else "direct",
+    }
+    if not key:
+        return default
+    if active_map is None:
+        try:
+            rows = conn.execute(
+                "SELECT target_dept_path, spend_bucket, rule FROM department_attributions"
+                " WHERE source_dept_key=? AND active=1 AND COALESCE(target_dept_path,'')<>''",
+                (key,),
+            ).fetchall()
+        except Exception:
+            return default
+    else:
+        rows = active_map.get(key, [])
+    if len(rows) != 1:
+        return default
+    target, bucket, rule = rows[0]
+    bucket = bucket or default_bucket
+    if bucket not in (BUCKET_EMPLOYEE, BUCKET_BUSINESS, BUCKET_PENDING_BUSINESS, BUCKET_UNRESOLVED):
+        bucket = default_bucket
+    return {
+        "raw_dept": raw_dept,
+        "effective_dept": target or raw_dept,
+        "spend_bucket": bucket,
+        "attribution_source": rule or "department_attribution",
+    }
+
+
+def _backfill_usage_attribution(conn, dry_run=True):
+    _ensure_usage_attribution_columns(conn)
+    _ensure_app_state_table(conn)
+    active_map = _active_attribution_map(conn)
+    rows = conn.execute(
+        "SELECT rowid, COALESCE(raw_dept,''), COALESCE(dept,''),"
+        " COALESCE(effective_dept,''), COALESCE(spend_bucket,'') FROM usage"
+    ).fetchall()
+    summary = {
+        "dry_run": bool(dry_run),
+        "would_update": 0,
+        "updated": 0,
+        "employee_staff_outsourcing": 0,
+        "business_outsourcing": 0,
+        "pending_business_outsourcing": 0,
+        "unresolved": 0,
+    }
+    for rowid, raw_dept, dept, effective_dept, spend_bucket in rows:
+        raw = raw_dept or dept
+        attr = _attribution_for_raw_dept(conn, raw, active_map)
+        bucket = attr["spend_bucket"]
+        if bucket not in summary:
+            bucket = BUCKET_UNRESOLVED
+            attr["spend_bucket"] = bucket
+        summary[bucket] += 1
+        needs = (
+            raw_dept != attr["raw_dept"]
+            or effective_dept != attr["effective_dept"]
+            or dept != attr["effective_dept"]
+            or spend_bucket != attr["spend_bucket"]
+        )
+        if not needs:
+            continue
+        summary["would_update"] += 1
+        if dry_run:
+            continue
+        conn.execute(
+            "UPDATE usage SET raw_dept=?, effective_dept=?, dept=?, spend_bucket=?,"
+            " attribution_source=? WHERE rowid=?",
+            (
+                attr["raw_dept"],
+                attr["effective_dept"],
+                attr["effective_dept"],
+                attr["spend_bucket"],
+                attr["attribution_source"],
+                rowid,
+            ),
+        )
+        summary["updated"] += 1
+    if not dry_run:
+        _state_set(conn, "usage_backfill_required", "0")
+        _state_set(conn, "usage_attribution_signature", _attribution_signature(conn))
+        _state_set(conn, "usage_backfill_complete", "1")
+    return summary
+
+
+def _directory_identity_for_email(conn, email):
+    if not email or "@" not in email:
+        return None
+    cols = _table_columns(conn, "people")
+    if not {"source", "raw_dept", "effective_dept", "spend_bucket"}.issubset(cols):
+        return None
+    row = conn.execute(
+        "SELECT name, avatar, dept, raw_dept, effective_dept, spend_bucket,"
+        " attribution_source, source, status FROM people WHERE lower(email)=?",
+        (email.lower(),),
+    ).fetchone()
+    if not row:
+        return None
+    source = row[7] or ""
+    if source != "feishu":
+        return None
+    return {
+        "name": row[0] or "",
+        "avatar": row[1] or "",
+        "dept": row[4] or row[2] or row[3] or "",
+        "raw_dept": row[3] or row[2] or "",
+        "effective_dept": row[4] or row[2] or row[3] or "",
+        "spend_bucket": row[5] or BUCKET_EMPLOYEE,
+        "attribution_source": row[6] or "feishu_directory",
+        "source": source or "people",
+        "status": row[8] or "active",
+    }
+
+
+def _report_identity(conn, serial, payload_email, serial_identity):
+    ident = serial_identity or {}
+    email = ident.get("email") or payload_email or ("sn:" + serial)
+    email = _sstr(email)
+    directory = _directory_identity_for_email(conn, email)
+    if directory:
+        return {
+            "email": email,
+            "name": directory.get("name") or email.split("@")[0],
+            "avatar": directory.get("avatar") or "",
+            "dept": directory.get("effective_dept") or directory.get("dept") or "unknown",
+            "raw_dept": directory.get("raw_dept") or directory.get("dept") or "unknown",
+            "effective_dept": directory.get("effective_dept") or directory.get("dept") or "unknown",
+            "spend_bucket": directory.get("spend_bucket") or BUCKET_EMPLOYEE,
+            "attribution_source": directory.get("attribution_source") or "feishu_directory",
+            "source": "feishu",
+            "preserve_people": True,
+        }
+    raw_dept = ident.get("department") or "unknown"
+    attr = _attribution_for_raw_dept(conn, raw_dept)
+    return {
+        "email": email,
+        "name": ident.get("name") or email.split("@")[0],
+        "avatar": ident.get("avatar") or "",
+        "dept": attr["effective_dept"] or raw_dept,
+        "raw_dept": attr["raw_dept"] or raw_dept,
+        "effective_dept": attr["effective_dept"] or raw_dept,
+        "spend_bucket": attr["spend_bucket"],
+        "attribution_source": attr["attribution_source"],
+        "source": "feilian" if ident else "payload",
+        "preserve_people": False,
+    }
+
+
+def _set_usage_attribution(conn, email, period_type, period, source, client, provider, model, identity):
+    cols = _table_columns(conn, "usage")
+    if not {"raw_dept", "effective_dept", "spend_bucket", "attribution_source"}.issubset(cols):
+        return
+    conn.execute(
+        "UPDATE usage SET dept=?, raw_dept=?, effective_dept=?, spend_bucket=?, attribution_source=?"
+        " WHERE email=? AND period_type=? AND period=? AND source=? AND client=?"
+        " AND provider=? AND model=?",
+        (
+            identity.get("effective_dept") or identity.get("dept") or "",
+            identity.get("raw_dept") or identity.get("dept") or "",
+            identity.get("effective_dept") or identity.get("dept") or "",
+            identity.get("spend_bucket") or BUCKET_EMPLOYEE,
+            identity.get("attribution_source") or "",
+            email, period_type, period, source, client, provider, model,
+        ),
+    )
+
+
+def _upsert_report_person(conn, identity):
+    email = identity.get("email") or ""
+    if not email:
+        return
+    cols = _table_columns(conn, "people")
+    if identity.get("preserve_people") and "source" in cols:
+        existing = conn.execute("SELECT source FROM people WHERE email=?", (email,)).fetchone()
+        if existing and existing[0] == "feishu":
+            return
+    name = identity.get("name") or email.split("@")[0]
+    avatar = identity.get("avatar") or ""
+    dept = identity.get("effective_dept") or identity.get("dept") or "unknown"
+    if {"raw_dept", "effective_dept", "spend_bucket", "source"}.issubset(cols):
+        conn.execute(
+            "INSERT OR REPLACE INTO people(email, name, avatar, dept, raw_dept, effective_dept,"
+            " spend_bucket, attribution_source, source, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                email, name, avatar, dept,
+                identity.get("raw_dept") or dept,
+                identity.get("effective_dept") or dept,
+                identity.get("spend_bucket") or BUCKET_EMPLOYEE,
+                identity.get("attribution_source") or "",
+                identity.get("source") or "",
+                datetime.datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+    else:
+        conn.execute(
+            "INSERT OR REPLACE INTO people(email, name, avatar, dept) VALUES(?,?,?,?)",
+            (email, name, avatar, dept))
 
 
 # ---------------------------------------------------------------------------
@@ -1486,22 +1974,21 @@ class H(BaseHTTPRequestHandler):
         lifetime_entries = (p.get("models") or {}).get("entries") or []
         monthly_entries = (p.get("monthly") or {}).get("entries") or []
 
-        # 服务端用序列号经飞连反解身份（机器侧零配置）
-        ident = _resolve_serial(serial)
-        email = ident.get("email") or p.get("email") or ("sn:" + serial)
-        dept = ident.get("department") or "unknown"
         # 上报来源:仅接受 mdm / manual,其它一律按 mdm(老客户端不带 via 时也是 mdm)
         via = p.get("via") if p.get("via") in ("mdm", "manual") else "mdm"
 
+        # 服务端用序列号经飞连反解身份（机器侧零配置），但一旦能拿到 email，
+        # 飞书 people 目录是人和组织架构真源；飞连只做设备归属兜底。
+        ident = _resolve_serial(serial)
         conn = db()
-        up_lt = _upsert_lifetime(conn, email, dept, lifetime_entries)
-        up_mo = _upsert_monthly(conn, email, dept, monthly_entries)
-        up_dy = _upsert_daily(conn, email, dept, p.get("graph") or {})
+        identity = _report_identity(conn, serial, p.get("email"), ident)
+        email = identity["email"]
+        dept = identity["effective_dept"] or identity["dept"] or "unknown"
+        up_lt = _upsert_lifetime(conn, email, dept, lifetime_entries, identity)
+        up_mo = _upsert_monthly(conn, email, dept, monthly_entries, identity)
+        up_dy = _upsert_daily(conn, email, dept, p.get("graph") or {}, identity)
         # 落人员档案:中文姓名 + 飞连头像 + 完整部门路径（看板 join 用）
-        conn.execute(
-            "INSERT OR REPLACE INTO people(email, name, avatar, dept) VALUES(?,?,?,?)",
-            (email, ident.get("name") or email.split("@")[0],
-             ident.get("avatar") or "", dept))
+        _upsert_report_person(conn, identity)
         # 上报审计:记这台机器最近一次上报的来源/主机/IP/时间(回溯坏数据用)
         conn.execute(
             "INSERT OR REPLACE INTO report_log(serial,email,hostname,os,ip,via,reported_at)"
@@ -1894,36 +2381,72 @@ class H(BaseHTTPRequestHandler):
         sd = _show_departed(qs)
         dep_clause = _departed_filter(sd, "")
         ex_clause, ex_params = _excluded_filter(qs, "")
-        # 取 email 级明细。注意 usage.dept 异构：订阅制/cursor 是完整路径
-        # ('Keep/技术平台部/.../IT 组')，LiteLLM 却是裸团队别名('技术平台部')。
-        # 若直接按 usage.dept roll-up，裸别名会裂成不挂在 Keep 树下的孤立顶级节点。
-        rows = conn.execute("""
-            SELECT email, dept, SUM(total), SUM(cost), SUM(messages)
-            FROM usage
-            WHERE %s AND source != 'litellm_agent'%s%s
-            GROUP BY email, dept
-        """ % (where, dep_clause, ex_clause), params + ex_params).fetchall()
+        # 取 email 级明细。新 attribution schema 存在时,以 effective_dept + spend_bucket
+        # 作为部门榜口径；旧 schema 不存在这些列时保持原有 usage.dept 行为。
+        usage_cols = _table_columns(conn, "usage")
+        has_attr = "effective_dept" in usage_cols and "spend_bucket" in usage_cols
+        if has_attr:
+            rows = conn.execute("""
+                SELECT email,
+                       COALESCE(NULLIF(effective_dept,''), dept) AS effective_dept,
+                       COALESCE(NULLIF(raw_dept,''), dept) AS raw_dept,
+                       COALESCE(NULLIF(spend_bucket,''), ?) AS spend_bucket,
+                       SUM(total), SUM(cost), SUM(messages)
+                FROM usage
+                WHERE %s AND source != 'litellm_agent'%s%s
+                GROUP BY 1,2,3,4
+            """ % (where, dep_clause, ex_clause),
+                [BUCKET_EMPLOYEE] + params + ex_params).fetchall()
+        else:
+            rows = [
+                (email, dept, dept, BUCKET_EMPLOYEE, tok, cost, msg)
+                for email, dept, tok, cost, msg in conn.execute("""
+                    SELECT email, dept, SUM(total), SUM(cost), SUM(messages)
+                    FROM usage
+                    WHERE %s AND source != 'litellm_agent'%s%s
+                    GROUP BY email, dept
+                """ % (where, dep_clause, ex_clause), params + ex_params).fetchall()
+            ]
 
         # 用 people.dept(飞连规范全路径)把每个人归一到唯一的真实组织部门，
         # 再把此人所有来源的用量收进该部门 → 单一 Keep 树，杜绝裸别名裂树。
         pdept = dict(conn.execute("SELECT email, dept FROM people").fetchall())
+        people_cols = _table_columns(conn, "people")
+        if "spend_bucket" in people_cols:
+            pbucket = dict(conn.execute(
+                "SELECT email, COALESCE(NULLIF(spend_bucket,''), ?) FROM people",
+                (BUCKET_EMPLOYEE,),
+            ).fetchall())
+        else:
+            pbucket = {}
 
-        per = {}  # email -> {tok, cost, msg, depts:[...]}
-        for email, dept, tok, cost, msg in rows:
-            p = per.get(email)
+        per = {}  # (email, effective_dept, spend_bucket) -> {tok, cost, msg, depts:[...]}
+        for email, dept, raw_dept, bucket, tok, cost, msg in rows:
+            bucket = bucket or BUCKET_EMPLOYEE
+            if bucket not in (BUCKET_EMPLOYEE, BUCKET_BUSINESS, BUCKET_PENDING_BUSINESS, BUCKET_UNRESOLVED):
+                bucket = BUCKET_UNRESOLVED
+            pkey = (email, dept or "", bucket)
+            p = per.get(pkey)
             if p is None:
-                p = {"tok": 0, "cost": 0.0, "msg": 0, "depts": []}
-                per[email] = p
+                p = {"tok": 0, "cost": 0.0, "msg": 0, "depts": [], "bucket": bucket,
+                     "effective_dept": dept or ""}
+                per[pkey] = p
             p["tok"] += tok or 0
             p["cost"] += cost or 0
             p["msg"] += msg or 0
             if dept:
                 p["depts"].append(dept)
+            if raw_dept and raw_dept != dept:
+                p["depts"].append(raw_dept)
 
-        def _canon_dept(email, depts):
+        def _canon_dept(email, depts, effective_dept=""):
             """每人规范部门：people.dept 优先 → usage 里最具体的可归一 Keep 路径 →
             都归不到则 'Keep/未归类'。统一过 _to_keep：外包折回真实部门、裸供应商(SP码)收口外部合作商，
             与 headcount 同口径。裸非 SP 组名/unknown 归不到 Keep → 未归类。"""
+            if has_attr:
+                trusted = _trusted_keep_path(effective_dept)
+                if trusted:
+                    return trusted
             cand = _to_keep(pdept.get(email))
             if cand:
                 return cand
@@ -1941,26 +2464,44 @@ class H(BaseHTTPRequestHandler):
             for anc in _ancestors(_normalize_dept_path(path)):
                 node_hc[anc] = node_hc.get(anc, 0) + (cnt or 0)
 
+        def _bucket_metric():
+            return {"tokens": 0, "cost": 0.0, "messages": 0, "credits": 0.0,
+                    "token_users": set(), "aily_users": set()}
+
         def _node(path):
             n = nodes.get(path)
             if n is None:
                 # token_users/aily_users 分开:人均按各自口径,活跃渗透取并集
                 n = {"tokens": 0, "cost": 0.0, "messages": 0, "credits": 0.0,
-                     "token_users": set(), "aily_users": set()}
+                     "token_users": set(), "aily_users": set(),
+                     "buckets": {
+                         BUCKET_EMPLOYEE: _bucket_metric(),
+                         BUCKET_BUSINESS: _bucket_metric(),
+                         BUCKET_PENDING_BUSINESS: _bucket_metric(),
+                         BUCKET_UNRESOLVED: _bucket_metric(),
+                     }}
                 nodes[path] = n
             return n
 
         nodes = {}  # path -> {tokens, cost, messages, credits, token_users, aily_users}
-        for email, p in per.items():
-            cd = _canon_dept(email, p["depts"])
+        for (email, _edept, _bucket), p in per.items():
+            bucket = p.get("bucket") or BUCKET_EMPLOYEE
+            cd = _canon_dept(email, p["depts"], p.get("effective_dept"))
             if cd == "Keep/未归类":
                 continue   # 解析不到真实部门(离职/飞连外)→ 跳过,不污染部门榜(孙可 2026-06-11)
             for anc in _ancestors(cd):
                 n = _node(anc)
-                n["tokens"] += p["tok"]
-                n["cost"] += p["cost"]
-                n["messages"] += p["msg"]
-                n["token_users"].add(email)
+                if bucket in VISIBLE_SPEND_BUCKETS:
+                    n["tokens"] += p["tok"]
+                    n["cost"] += p["cost"]
+                    n["messages"] += p["msg"]
+                    n["token_users"].add(email)
+                if bucket in n["buckets"]:
+                    b = n["buckets"][bucket]
+                    b["tokens"] += p["tok"]
+                    b["cost"] += p["cost"]
+                    b["messages"] += p["msg"]
+                    b["token_users"].add(email)
 
         # aily(飞书 AI 权益)并入部门榜:按天聚合,跟随所选区间(与 token 同窗口,默认近30天),
         # 不再取「最新月快照」死数据(孙可 2026-06-12:月累计污染部门榜)。单位「点」credits,
@@ -1978,10 +2519,41 @@ class H(BaseHTTPRequestHandler):
             cd = _to_keep(pdept.get(email)) or _to_keep(fdept)
             if not cd:
                 continue   # 飞连查不到真实部门(离职/飞连外纯飞书用户)→ 跳过,不进未归类(孙可 2026-06-11)
+            bucket = pbucket.get(email) or BUCKET_EMPLOYEE
+            if bucket not in (BUCKET_EMPLOYEE, BUCKET_BUSINESS, BUCKET_PENDING_BUSINESS, BUCKET_UNRESOLVED):
+                bucket = BUCKET_EMPLOYEE
             for anc in _ancestors(cd):
                 n = _node(anc)
-                n["credits"] += credits or 0
                 n["aily_users"].add(email)
+                if bucket in VISIBLE_SPEND_BUCKETS:
+                    n["credits"] += credits or 0
+                b = n["buckets"][bucket]
+                b["credits"] += credits or 0
+                b["aily_users"].add(email)
+
+        def _view_metric(n, bucket=None):
+            if bucket is None:
+                token_users = n["token_users"]
+                aily_users = n["aily_users"]
+                return {
+                    "tokens": n["tokens"],
+                    "cost": round(n["cost"], 4),
+                    "messages": n["messages"],
+                    "credits": round(n["credits"], 2),
+                    "people": len(token_users | aily_users),
+                    "token_people": len(token_users),
+                    "aily_people": len(aily_users),
+                }
+            b = n["buckets"].get(bucket) or _bucket_metric()
+            return {
+                "tokens": b["tokens"],
+                "cost": round(b["cost"], 4),
+                "messages": b["messages"],
+                "credits": round(b["credits"], 2),
+                "people": len(b["token_users"] | b["aily_users"]),
+                "token_people": len(b["token_users"]),
+                "aily_people": len(b["aily_users"]),
+            }
 
         result = []
         for path, n in nodes.items():
@@ -2007,6 +2579,11 @@ class H(BaseHTTPRequestHandler):
                 "credits": round(n["credits"], 2),  # aily 总点数(单位「点」,不与 token 加总)
                 "per_capita_tokens": round(n["tokens"] / token_people) if token_people else 0,
                 "per_capita_credits": round(n["credits"] / aily_people, 1) if aily_people else 0,
+                "department_full": _view_metric(n),
+                "employee_staff_outsourcing": _view_metric(n, BUCKET_EMPLOYEE),
+                "business_outsourcing": _view_metric(n, BUCKET_BUSINESS),
+                "pending_business_outsourcing": _view_metric(n, BUCKET_PENDING_BUSINESS),
+                "unresolved": _view_metric(n, BUCKET_UNRESOLVED),
             })
         result.sort(key=lambda x: -x["tokens"])
         self._send(200, {"teams": result})
