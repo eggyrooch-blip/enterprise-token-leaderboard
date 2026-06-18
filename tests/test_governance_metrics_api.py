@@ -14,6 +14,7 @@ REQUIRED_METRIC_IDS = {
     "adoption_coverage",
     "code_acceptance",
     "delivery_quality",
+    "feishu_directory_sync_health",
     "reliability_budget",
     "privacy_purpose",
     "collection_health",
@@ -55,6 +56,13 @@ def test_governance_metrics_api_computes_available_metrics(monkeypatch, tmp_path
             "VALUES (?,?,?,?,?,?)",
             ("SER-1", "a@example.com", "mac-a", "127.0.0.1", "mdm", "2026-06-08T10:00:00"),
         )
+        dev_collector._state_set(conn, "feishu_directory_sync_status", "success")
+        dev_collector._state_set(conn, "feishu_directory_sync_last_success", "2026-06-18T10:00:00Z")
+        dev_collector._state_set(conn, "feishu_directory_sync_visibility_warnings", "[]")
+        dev_collector._state_set(conn, "feishu_directory_sync_production_enablement_blocked", "1")
+        dev_collector._state_set(conn, "feishu_directory_sync_business_rollup_enabled", "0")
+        dev_collector._state_set(conn, "feishu_directory_sync_resolved_business_outsourcing_rate", "0.3333")
+        dev_collector._state_set(conn, "feishu_directory_sync_min_required_rate", "0.8")
         conn.commit()
 
         handler = _DummyHandler()
@@ -71,6 +79,7 @@ def test_governance_metrics_api_computes_available_metrics(monkeypatch, tmp_path
     assert metrics["adoption_coverage"]["availability"] == "computed"
     assert metrics["code_acceptance"]["availability"] == "partial"
     assert metrics["delivery_quality"]["availability"] == "pending"
+    assert metrics["feishu_directory_sync_health"]["availability"] == "partial"
     assert metrics["privacy_purpose"]["availability"] == "computed"
 
     assert payload["summary"]["lifetime"]["users"] == 3
@@ -80,6 +89,81 @@ def test_governance_metrics_api_computes_available_metrics(monkeypatch, tmp_path
     assert payload["summary"]["day"]["max_date"] == "2026-06-08"
     assert payload["summary"]["last7"]["users"] == 3
     assert payload["summary"]["report_log"]["reports"] == 1
+    assert payload["summary"]["feishu_directory_sync"] == {
+        "status": "success",
+        "last_success": "2026-06-18T10:00:00Z",
+        "last_attempt": "",
+        "last_error": "",
+        "visibility_warnings": [],
+        "visibility_warnings_count": 0,
+        "production_enablement_blocked": True,
+        "business_rollup_enabled": False,
+        "resolved_business_outsourcing_rate": 0.3333,
+        "min_required_rate": 0.8,
+        "users": 0,
+        "departments": 0,
+        "supplier_departments": 0,
+        "unresolved": 0,
+    }
+
+
+def test_meta_exposes_feishu_directory_sync_health(monkeypatch, tmp_path):
+    monkeypatch.setattr(dev_collector, "DB", str(tmp_path / "tok.db"))
+    conn = dev_collector.db()
+    try:
+        dev_collector._state_set(conn, "feishu_directory_sync_status", "failure")
+        dev_collector._state_set(conn, "feishu_directory_sync_last_success", "2026-06-18T10:00:00Z")
+        dev_collector._state_set(conn, "feishu_directory_sync_last_attempt", "2026-06-18T11:00:00Z")
+        dev_collector._state_set(conn, "feishu_directory_sync_last_error", "feishu unavailable")
+        dev_collector._state_set(
+            conn,
+            "feishu_directory_sync_visibility_warnings",
+            '[{"dept_id":"d1","expected":3,"got":1}]',
+        )
+        conn.commit()
+
+        handler = _DummyHandler()
+        dev_collector.H._meta(handler, conn)
+    finally:
+        conn.close()
+
+    assert handler.code == 200
+    assert handler.payload["feishu_directory_sync"]["status"] == "failure"
+    assert handler.payload["feishu_directory_sync"]["last_success"] == "2026-06-18T10:00:00Z"
+    assert handler.payload["feishu_directory_sync"]["last_attempt"] == "2026-06-18T11:00:00Z"
+    assert handler.payload["feishu_directory_sync"]["last_error"] == "feishu unavailable"
+    assert handler.payload["feishu_directory_sync"]["visibility_warnings_count"] == 1
+
+
+def test_raw_admin_api_includes_attribution_audit_fields(monkeypatch, tmp_path):
+    monkeypatch.setattr(dev_collector, "DB", str(tmp_path / "tok.db"))
+    conn = dev_collector.db()
+    try:
+        _insert_usage(conn, "supplier@keep.com", "Keep/合作商/W/供应商(SP000001)",
+                      "lifetime", "all", "subscription", "Claude Code", 100, 1.0, 1)
+        conn.execute(
+            "UPDATE usage SET raw_dept=?, effective_dept=?, spend_bucket=?, attribution_source=?"
+            " WHERE email=?",
+            (
+                "Keep/合作商/W/供应商(SP000001)",
+                "Keep/技术平台部/固件组",
+                "pending_business_outsourcing",
+                "leader_department",
+                "supplier@keep.com",
+            ),
+        )
+        conn.commit()
+
+        handler = _DummyHandler()
+        dev_collector.H._raw(handler, conn)
+    finally:
+        conn.close()
+
+    row = handler.payload["rows"][0]
+    assert row["raw_dept"] == "Keep/合作商/W/供应商(SP000001)"
+    assert row["effective_dept"] == "Keep/技术平台部/固件组"
+    assert row["spend_bucket"] == "pending_business_outsourcing"
+    assert row["attribution_source"] == "leader_department"
 
 
 def test_governance_metrics_respect_configured_excluded_accounts(monkeypatch, tmp_path):

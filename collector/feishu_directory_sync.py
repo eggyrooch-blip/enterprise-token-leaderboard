@@ -262,6 +262,62 @@ def ensure_tables(conn):
             reason TEXT DEFAULT '',
             PRIMARY KEY(email, role, dept_id, action))"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS app_state(
+            key TEXT PRIMARY KEY,
+            value TEXT DEFAULT '')"""
+    )
+    conn.commit()
+
+
+def _state_set(conn, key, value):
+    conn.execute(
+        "INSERT OR REPLACE INTO app_state(key,value) VALUES(?,?)",
+        (key, "" if value is None else str(value)),
+    )
+
+
+def _record_sync_success(
+    conn,
+    result,
+    visibility_warnings,
+    production_enablement_blocked,
+    coverage_rate,
+    min_required_rate,
+    business_rollup_enabled,
+):
+    stamp = result.get("synced_at") or _now_iso()
+    _state_set(conn, "feishu_directory_sync_status", "success")
+    _state_set(conn, "feishu_directory_sync_last_success", stamp)
+    _state_set(conn, "feishu_directory_sync_last_attempt", stamp)
+    _state_set(conn, "feishu_directory_sync_last_error", "")
+    _state_set(
+        conn,
+        "feishu_directory_sync_visibility_warnings",
+        json.dumps(visibility_warnings or [], ensure_ascii=False),
+    )
+    _state_set(conn, "feishu_directory_sync_production_enablement_blocked",
+               "1" if production_enablement_blocked else "0")
+    _state_set(conn, "feishu_directory_sync_business_rollup_enabled",
+               "1" if business_rollup_enabled else "0")
+    _state_set(conn, "feishu_directory_sync_resolved_business_outsourcing_rate",
+               "%.4f" % float(coverage_rate or 0.0))
+    _state_set(conn, "feishu_directory_sync_min_required_rate",
+               _sstr(min_required_rate))
+    for key in ("users", "departments", "supplier_departments", "unresolved"):
+        _state_set(conn, "feishu_directory_sync_" + key, int(result.get(key) or 0))
+    _state_set(
+        conn,
+        "feishu_directory_sync_alerts",
+        json.dumps(result.get("alerts") or [], ensure_ascii=False),
+    )
+
+
+def _record_sync_failure(conn, error):
+    ensure_tables(conn)
+    _state_set(conn, "feishu_directory_sync_status", "failure")
+    _state_set(conn, "feishu_directory_sync_last_attempt", _now_iso())
+    _state_set(conn, "feishu_directory_sync_last_error", _sstr(error))
     conn.commit()
 
 
@@ -932,8 +988,20 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     client = FeishuDirectoryClient()
-    departments, users = client.fetch_snapshot(args.root)
-    warnings = client.validate_visibility_coverage(departments, users)
+    try:
+        departments, users = client.fetch_snapshot(args.root)
+        warnings = client.validate_visibility_coverage(departments, users)
+    except Exception as exc:
+        conn = sqlite3.connect(args.db)
+        try:
+            _record_sync_failure(conn, exc)
+        finally:
+            conn.close()
+        print(json.dumps({
+            "status": "failure",
+            "error": _sstr(exc),
+        }, ensure_ascii=False, indent=2))
+        return 1
     attributions = derive_department_attributions(departments, users)
     rate = resolved_business_outsourcing_rate(attributions)
     admin_emails = [e for e in re.split(r"[,\s]+", args.admin_emails) if e]
@@ -961,6 +1029,16 @@ def main(argv=None):
         result = write_directory_snapshot(
             conn, users, departments, admin_emails=admin_emails,
             business_rollup_enabled=business_rollup_enabled)
+        _record_sync_success(
+            conn,
+            result,
+            warnings,
+            summary["production_enablement_blocked"],
+            rate,
+            MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE,
+            business_rollup_enabled,
+        )
+        conn.commit()
     finally:
         conn.close()
     result.update({

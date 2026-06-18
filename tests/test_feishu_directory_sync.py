@@ -310,6 +310,7 @@ def test_cli_low_coverage_syncs_directory_but_blocks_business_rollup(monkeypatch
             "SELECT target_dept_path, spend_bucket, rule, active, reason"
             " FROM department_attributions WHERE source_dept_id='d_sp_leader'"
         ).fetchone()
+        state = dict(conn.execute("SELECT key, value FROM app_state").fetchall())
     finally:
         conn.close()
 
@@ -320,6 +321,10 @@ def test_cli_low_coverage_syncs_directory_but_blocks_business_rollup(monkeypatch
         0,
         "production_enablement_blocked_low_coverage",
     )
+    assert state["feishu_directory_sync_status"] == "success"
+    assert state["feishu_directory_sync_production_enablement_blocked"] == "1"
+    assert state["feishu_directory_sync_business_rollup_enabled"] == "0"
+    assert state["feishu_directory_sync_resolved_business_outsourcing_rate"] == "0.3333"
 
 
 def test_cli_allows_low_coverage_only_with_explicit_override(monkeypatch, tmp_path):
@@ -368,6 +373,34 @@ def test_cli_snapshot_uses_group_owner_as_pending_candidate(monkeypatch, tmp_pat
         fds.RULE_CHAT_OWNER,
         0,
     )
+
+
+def test_cli_records_failure_health_without_erasing_last_success(monkeypatch, tmp_path):
+    monkeypatch.setattr(fds, "FeishuDirectoryClient", lambda: _FakeDirectoryClient())
+    db_path = tmp_path / "tok.db"
+
+    assert fds.main(["--db", str(db_path), "--allow-low-coverage"]) == 0
+
+    class BrokenDirectoryClient:
+        def fetch_snapshot(self, root="0"):
+            raise RuntimeError("feishu unavailable")
+
+    monkeypatch.setattr(fds, "FeishuDirectoryClient", lambda: BrokenDirectoryClient())
+
+    rc = fds.main(["--db", str(db_path)])
+
+    assert rc == 1
+    conn = sqlite3.connect(str(db_path))
+    try:
+        state = dict(conn.execute("SELECT key, value FROM app_state").fetchall())
+        users = conn.execute("SELECT COUNT(*) FROM feishu_users").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert users == 5
+    assert state["feishu_directory_sync_status"] == "failure"
+    assert state["feishu_directory_sync_last_success"]
+    assert "feishu unavailable" in state["feishu_directory_sync_last_error"]
 
 
 # --------------------------------------------------------------------------- #

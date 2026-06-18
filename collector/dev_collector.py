@@ -423,6 +423,58 @@ def _state_set(conn, key, value):
     conn.execute("INSERT OR REPLACE INTO app_state(key,value) VALUES(?,?)", (key, value))
 
 
+def _state_bool(v):
+    return _sstr(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _state_float(v):
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _state_int(v):
+    try:
+        return int(float(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _state_json_list(v):
+    try:
+        data = json.loads(v or "[]")
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _feishu_sync_health(conn):
+    warnings = _state_json_list(
+        _state_get(conn, "feishu_directory_sync_visibility_warnings", "[]"))
+    return {
+        "status": _state_get(conn, "feishu_directory_sync_status", "unknown"),
+        "last_success": _state_get(conn, "feishu_directory_sync_last_success", ""),
+        "last_attempt": _state_get(conn, "feishu_directory_sync_last_attempt", ""),
+        "last_error": _state_get(conn, "feishu_directory_sync_last_error", ""),
+        "visibility_warnings": warnings,
+        "visibility_warnings_count": len(warnings),
+        "production_enablement_blocked": _state_bool(
+            _state_get(conn, "feishu_directory_sync_production_enablement_blocked", "0")),
+        "business_rollup_enabled": _state_bool(
+            _state_get(conn, "feishu_directory_sync_business_rollup_enabled", "0")),
+        "resolved_business_outsourcing_rate": _state_float(
+            _state_get(conn, "feishu_directory_sync_resolved_business_outsourcing_rate", "0")),
+        "min_required_rate": _state_float(
+            _state_get(conn, "feishu_directory_sync_min_required_rate", "0")),
+        "users": _state_int(_state_get(conn, "feishu_directory_sync_users", "0")),
+        "departments": _state_int(_state_get(conn, "feishu_directory_sync_departments", "0")),
+        "supplier_departments": _state_int(
+            _state_get(conn, "feishu_directory_sync_supplier_departments", "0")),
+        "unresolved": _state_int(_state_get(conn, "feishu_directory_sync_unresolved", "0")),
+    }
+
+
 def _configured_admin_emails():
     emails = set(AUTH_SUPER_ADMIN_EMAILS)
     raw = os.environ.get("AUTH_ADMIN_EMAILS", "")
@@ -3521,6 +3573,21 @@ class H(BaseHTTPRequestHandler):
         cursor = source_map.get("cursor") or {"users": 0, "tokens": 0}
         agent = source_map.get("litellm_agent") or {"users": 0, "tokens": 0}
         freshness = ("数据至 " + day["max_date"]) if day["max_date"] else "暂无日粒度数据"
+        feishu_sync = _feishu_sync_health(conn)
+        if not feishu_sync["last_success"]:
+            sync_availability = "pending"
+            sync_value = "未同步"
+        elif feishu_sync["status"] == "failure":
+            sync_availability = "partial"
+            sync_value = "同步失败"
+        elif (feishu_sync["production_enablement_blocked"]
+              or feishu_sync["visibility_warnings_count"]):
+            sync_availability = "partial"
+            sync_value = "覆盖率 {:.1f}%".format(
+                feishu_sync["resolved_business_outsourcing_rate"] * 100.0)
+        else:
+            sync_availability = "computed"
+            sync_value = "同步正常"
 
         metrics = [
             {
@@ -3573,6 +3640,24 @@ class H(BaseHTTPRequestHandler):
                 "detail": "现有库没有发布、PR、CI、事故恢复时间，暂不能计算 DORA 指标。",
             },
             {
+                "id": "feishu_directory_sync_health",
+                "family": "Feishu org source of truth",
+                "label": "飞书组织同步健康",
+                "value": sync_value,
+                "status": sync_availability,
+                "availability": sync_availability,
+                "benchmark": "组织真源需要展示最后成功同步、失败原因、可见性缺口和业务外包归因覆盖率。",
+                "detail": "最后成功 {}；最后尝试 {}；visibility warnings {}；业务外包归因覆盖率 {:.1f}% / 阈值 {:.1f}%；roll-up {}。{}".format(
+                    feishu_sync["last_success"] or "暂无",
+                    feishu_sync["last_attempt"] or "暂无",
+                    _fmt_int(feishu_sync["visibility_warnings_count"]),
+                    feishu_sync["resolved_business_outsourcing_rate"] * 100.0,
+                    feishu_sync["min_required_rate"] * 100.0,
+                    "已启用" if feishu_sync["business_rollup_enabled"] else "未启用",
+                    ("错误: " + feishu_sync["last_error"]) if feishu_sync["last_error"] else "",
+                ),
+            },
+            {
                 "id": "reliability_budget",
                 "family": "Google SRE",
                 "label": "可靠性与错误预算",
@@ -3616,6 +3701,7 @@ class H(BaseHTTPRequestHandler):
                 "day": day,
                 "last7": last7,
                 "report_log": report_log,
+                "feishu_directory_sync": feishu_sync,
                 "subscriptions": {
                     "unresolved": _num(subs_unresolved),
                     "idle": idle_subscriptions,
@@ -3637,17 +3723,27 @@ class H(BaseHTTPRequestHandler):
             "min_date": (row[0] if row else "") or "",
             "max_date": (row[1] if row else "") or "",
             "last_report": (last[0] if last else "") or "",
+            "feishu_directory_sync": _feishu_sync_health(conn),
         })
 
     def _raw(self, conn):
         """明细（调试用，LIMIT 100）。"""
+        usage_cols = _table_columns(conn, "usage")
+        audit_select = []
+        for col in ("raw_dept", "effective_dept", "spend_bucket", "attribution_source"):
+            if col in usage_cols:
+                audit_select.append("COALESCE(%s,'') AS %s" % (col, col))
+            else:
+                audit_select.append("'' AS %s" % col)
         rows = conn.execute("""
             SELECT email, period_type, period, source, client, provider, model,
-                   input, output, cache_read, cache_write, reasoning, total, cost, messages
+                   input, output, cache_read, cache_write, reasoning, total, cost, messages,
+                   %s
             FROM usage ORDER BY total DESC LIMIT 100
-        """).fetchall()
+        """ % ", ".join(audit_select)).fetchall()
         cols = ["email", "period_type", "period", "source", "client", "provider", "model",
-                "input", "output", "cache_read", "cache_write", "reasoning", "total", "cost", "messages"]
+                "input", "output", "cache_read", "cache_write", "reasoning", "total", "cost",
+                "messages", "raw_dept", "effective_dept", "spend_bucket", "attribution_source"]
         self._send(200, {"rows": [dict(zip(cols, r)) for r in rows]})
 
 
