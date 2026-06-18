@@ -449,6 +449,22 @@ def _role_denied(overrides, role, dept_id=""):
                for r, odid, action in overrides)
 
 
+def _dept_path_for_override(conn, dept_id):
+    dept_id = (dept_id or "").strip()
+    if not dept_id:
+        return ""
+    if "/" in dept_id:
+        return dept_id
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(path, '') FROM departments WHERE dept_id=?",
+            (dept_id,),
+        ).fetchone()
+    except Exception:
+        return ""
+    return row[0] if row and row[0] else ""
+
+
 def _user_roles(conn, email):
     email = (email or "").strip().lower()
     overrides = _role_override_rows(conn, email)
@@ -478,9 +494,12 @@ def _user_roles(conn, email):
             owned.add(dept_path)
 
     for role, dept_id, action in overrides:
-        if role == "department_owner":
-            continue
         if action == "allow" and not _role_denied(overrides, role, dept_id):
+            if role == "department_owner":
+                dept_path = _dept_path_for_override(conn, dept_id)
+                if not dept_path:
+                    continue
+                owned.add(dept_path)
             roles.add(role)
 
     if "admin" in roles:
@@ -514,6 +533,7 @@ from urllib.parse import urlencode as _urlencode
 from urllib.request import Request as _Request, urlopen as _urlopen
 
 FEISHU_HOST = os.environ.get("FEISHU_HOST", "https://open.feishu.cn").rstrip("/")
+FEISHU_AUTH_HOST = os.environ.get("FEISHU_AUTH_HOST", "https://accounts.feishu.cn").rstrip("/")
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "").strip()
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "").strip()
 FEISHU_OAUTH_REDIRECT_URI = os.environ.get("FEISHU_OAUTH_REDIRECT_URI", "").strip()
@@ -545,7 +565,7 @@ DATA_ROUTES = {
 #  - everything else in DATA_ROUTES is ROW-SCOPED: the handler filters rows
 #    through _scope_rows() / email_in_scope() to the caller's visible set.
 ADMIN_ONLY_ROUTES = {
-    "/v1/governance_metrics", "/v1/raw", "/v1/breakdown",
+    "/v1/governance_metrics", "/v1/raw",
     "/v1/agent_leaderboard", "/v1/agent_owner_summary",
 }
 OWNER_OR_ADMIN_ROUTES = {"/v1/teams"}
@@ -576,11 +596,12 @@ def _oauth_http_json(url, payload=None, headers=None):
 def feishu_authorize_url(state):
     """The Feishu authorize URL the browser is 302'd to at login."""
     q = _urlencode({
-        "app_id": FEISHU_APP_ID,
+        "client_id": FEISHU_APP_ID,
         "redirect_uri": FEISHU_OAUTH_REDIRECT_URI,
+        "response_type": "code",
         "state": state,
     })
-    return FEISHU_HOST + "/open-apis/authen/v1/index?" + q
+    return FEISHU_AUTH_HOST + "/open-apis/authen/v1/authorize?" + q
 
 
 def _safe_next_path(raw):
@@ -605,11 +626,8 @@ def feishu_exchange_code(code):
     """Exchange an OAuth code for the user's profile.
 
     Returns ``{email, name, open_id}`` (email lowercased, may be empty). Network
-    goes through :func:`_oauth_http_json` so tests inject fakes. NOTE: the exact
-    Feishu token/user-info endpoint + field names are DEFERRED-VERIFY against a
-    live round-trip — the bot's OAuth (authen v1 vs v2) must be confirmed once
-    the redirect URI is registered. The state machine around it is endpoint-
-    agnostic and fully tested.
+    goes through :func:`_oauth_http_json` so tests inject fakes. A live round-trip
+    is still required before flipping ``AUTH_ENFORCE=1`` in production.
     """
     tok = _oauth_http_json(
         FEISHU_HOST + "/open-apis/authen/v2/oauth/token",
@@ -618,9 +636,16 @@ def feishu_exchange_code(code):
          "redirect_uri": FEISHU_OAUTH_REDIRECT_URI})
     if tok.get("code") not in (None, 0):
         raise RuntimeError(tok.get("msg") or tok.get("error") or "token exchange failed")
-    user_token = tok.get("access_token") or (tok.get("data") or {}).get("access_token") or ""
+    tdata = tok.get("data") or {}
+    user_token = (
+        tok.get("user_access_token")
+        or tok.get("access_token")
+        or tdata.get("user_access_token")
+        or tdata.get("access_token")
+        or ""
+    )
     if not user_token:
-        raise RuntimeError("token exchange returned empty access_token")
+        raise RuntimeError("token exchange returned empty user_access_token")
     info = _oauth_http_json(
         FEISHU_HOST + "/open-apis/authen/v1/user_info", None,
         {"Authorization": "Bearer " + user_token})
@@ -3049,12 +3074,15 @@ class H(BaseHTTPRequestHandler):
         result.sort(key=lambda x: -x["tokens"])
         self._send(200, {"teams": result})
 
-    def _breakdown(self, conn, qs):
+    def _breakdown(self, conn, qs, auth_user=None):
         """四种维度聚合 lifetime 快照。
         by=client                  → 按 client 聚合
         by=client_model            → 按 client + model 聚合
         by=client_provider_model   → 按 client + provider + model 聚合（默认）
         """
+        if auth_user is not None:
+            self._scope_user = auth_user
+        scope_user = getattr(self, "_scope_user", None)
         by = (qs.get("by") or ["client_provider_model"])[0]
         if by == "client":
             group_cols = "client"
@@ -3071,6 +3099,49 @@ class H(BaseHTTPRequestHandler):
 
         where, params = _range_clause(qs)
         ex_clause, ex_params = _excluded_filter(qs, "")
+        if scope_user and not scope_user.get("is_admin"):
+            usage_cols = _table_columns(conn, "usage")
+            dept_expr = "COALESCE(NULLIF(effective_dept,''), dept)" \
+                if "effective_dept" in usage_cols else "dept"
+            scoped_rows = conn.execute(
+                """
+                SELECT email, {dept_expr}, client, provider, model,
+                       SUM(input), SUM(output), SUM(cache_read), SUM(cache_write),
+                       SUM(reasoning), SUM(total), SUM(cost), SUM(messages)
+                FROM usage
+                WHERE {where} AND source != 'litellm_agent'{ex}
+                GROUP BY email, {dept_expr}, client, provider, model
+                """.format(dept_expr=dept_expr, where=where, ex=ex_clause),
+                params + ex_params,
+            ).fetchall()
+            pdept = dict(conn.execute("SELECT email, dept FROM people").fetchall())
+            agg = {}
+            for r in scoped_rows:
+                email, dept, client, provider, model = r[:5]
+                if not email_in_scope(scope_user, email, _scope_dept(email, dept, pdept, dept)):
+                    continue
+                if by == "client":
+                    key = (client, "", "")
+                elif by == "model":
+                    key = ("", "", model)
+                elif by == "client_model":
+                    key = (client, "", model)
+                else:
+                    key = (client, provider, model)
+                cur = agg.setdefault(key, [0, 0, 0, 0, 0, 0, 0.0, 0])
+                for i, val in enumerate(r[5:13]):
+                    cur[i] += val or 0
+            result = []
+            for key, sums in sorted(agg.items(), key=lambda item: -item[1][5]):
+                result.append({
+                    "client": key[0], "provider": key[1], "model": key[2],
+                    "input": sums[0], "output": sums[1],
+                    "cache_read": sums[2], "cache_write": sums[3],
+                    "reasoning": sums[4], "tokens": sums[5],
+                    "cost": round(sums[6], 4), "messages": sums[7],
+                })
+            return self._send(200, {"by": by, "breakdown": result})
+
         sql = (
             "SELECT {extra}, "
             "SUM(input), SUM(output), SUM(cache_read), SUM(cache_write), "

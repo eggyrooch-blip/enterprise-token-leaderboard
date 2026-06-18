@@ -22,7 +22,7 @@ def _reload(monkeypatch, tmp_path):
     return dc
 
 
-def _usage(dc, conn, email, dept, tokens):
+def _usage(dc, conn, email, dept, tokens, client="Claude Code", model="model-x"):
     conn.execute(
         dc._UPSERT_SQL,
         (
@@ -31,9 +31,9 @@ def _usage(dc, conn, email, dept, tokens):
             "lifetime",
             "all",
             "subscription",
-            "Claude Code",
+            client,
             "",
-            "model-x",
+            model,
             tokens,
             0,
             0,
@@ -131,6 +131,54 @@ def test_owner_teams_returns_owned_subtree_rollup_only(monkeypatch, tmp_path):
     assert teams["Keep"]["tokens"] == 100
     assert "Keep/技术平台部/固件组" in teams
     assert "Keep/运动消费事业部" not in teams
+
+
+def test_member_breakdown_is_filtered_to_self(monkeypatch, tmp_path):
+    dc = _reload(monkeypatch, tmp_path)
+    conn = dc.db()
+    try:
+        _usage(dc, conn, "alice@keep.com", "Keep/技术平台部/固件组", 100, "Claude Code")
+        _usage(dc, conn, "bob@keep.com", "Keep/运动消费事业部/市场营销部", 200, "Cursor")
+        conn.commit()
+        h = _Handler()
+
+        dc.H._breakdown(
+            h,
+            conn,
+            {"by": ["client"]},
+            auth_user=_role("alice@keep.com", ["member"], "self"),
+        )
+    finally:
+        conn.close()
+
+    assert h.code == 200
+    assert [(r["client"], r["tokens"]) for r in h.payload["breakdown"]] == [("Claude Code", 100)]
+
+
+def test_owner_breakdown_is_filtered_to_owned_subtree(monkeypatch, tmp_path):
+    dc = _reload(monkeypatch, tmp_path)
+    conn = dc.db()
+    try:
+        _usage(dc, conn, "alice@keep.com", "Keep/技术平台部/固件组", 100, "Claude Code")
+        _usage(dc, conn, "peer@keep.com", "Keep/技术平台部/固件组", 50, "Cursor")
+        _usage(dc, conn, "bob@keep.com", "Keep/运动消费事业部/市场营销部", 200, "Gemini CLI")
+        conn.commit()
+        h = _Handler()
+
+        dc.H._breakdown(
+            h,
+            conn,
+            {"by": ["client"]},
+            auth_user=_role("lead@keep.com", ["department_owner"], "department", ["Keep/技术平台部"]),
+        )
+    finally:
+        conn.close()
+
+    assert h.code == 200
+    assert [(r["client"], r["tokens"]) for r in h.payload["breakdown"]] == [
+        ("Claude Code", 100),
+        ("Cursor", 50),
+    ]
 
 
 def test_member_cannot_read_other_user_ai_usage(monkeypatch, tmp_path):

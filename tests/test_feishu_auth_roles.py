@@ -94,3 +94,29 @@ def test_department_owner_allow_override_without_role_row_does_not_create_empty_
     assert "department_owner" not in roles["roles"]
     assert roles["owned_departments"] == []
     assert roles["scope"] == "self"
+
+
+def test_department_owner_allow_override_uses_departments_path(monkeypatch):
+    monkeypatch.setenv("AUTH_ADMIN_EMAILS", "")
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    dc.ensure_auth_tables(conn)
+    conn.execute(
+        "CREATE TABLE departments(dept_id TEXT PRIMARY KEY, path TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO departments(dept_id, path) VALUES(?,?)",
+        ("d1", "Keep/A"),
+    )
+    conn.execute(
+        "INSERT INTO role_overrides(email, role, dept_id, action, reason)"
+        " VALUES(?,?,?,?,?)",
+        ("ops@keep.com", "department_owner", "d1", "allow", "temporary owner"),
+    )
+    conn.commit()
+
+    roles = dc._user_roles(conn, "ops@keep.com")
+
+    assert "department_owner" in roles["roles"]
+    assert roles["owned_departments"] == ["Keep/A"]
+    assert roles["scope"] == "department"
