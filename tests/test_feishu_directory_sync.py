@@ -125,6 +125,24 @@ def test_chat_owner_supplier_is_medium_inactive_suggestion():
     assert a["target_dept_path"] == "运动消费事业部/市场营销部"
 
 
+def test_group_owner_user_id_supplier_is_pending_without_lookup():
+    deps, pbi = _paths()
+    for d in deps:
+        if d["dept_id"] == "d_sp_chat":
+            d["group_owner_user_id"] = "ou_owner"
+    users = _users()
+    for u in users:
+        u["dept_path"] = pbi.get(u["dept_id"], "")
+
+    attrs = {a["source_dept_id"]: a for a in fds.derive_department_attributions(deps, users)}
+    a = attrs["d_sp_chat"]
+
+    assert a["rule"] == fds.RULE_CHAT_OWNER
+    assert a["spend_bucket"] == fds.BUCKET_PENDING_BUSINESS
+    assert a["active"] == 0
+    assert a["target_dept_path"] == "运动消费事业部/市场营销部"
+
+
 def test_unreadable_owner_supplier_is_unresolved():
     attrs = {a["source_dept_id"]: a for a in _attributions()}
     a = attrs["d_sp_dark"]
@@ -296,6 +314,36 @@ def test_cli_allows_low_coverage_only_with_explicit_override(monkeypatch, tmp_pa
         assert conn.execute("SELECT COUNT(*) FROM department_attributions").fetchone()[0] > 0
     finally:
         conn.close()
+
+
+def test_cli_snapshot_uses_group_owner_as_pending_candidate(monkeypatch, tmp_path):
+    class Client(_FakeDirectoryClient):
+        def fetch_snapshot(self, root="0"):
+            deps, users = super().fetch_snapshot(root)
+            for d in deps:
+                if d["dept_id"] == "d_sp_chat":
+                    d["group_owner_user_id"] = "ou_owner"
+            return deps, users
+
+    monkeypatch.setattr(fds, "FeishuDirectoryClient", lambda: Client())
+    db_path = tmp_path / "tok.db"
+
+    assert fds.main(["--db", str(db_path), "--allow-low-coverage"]) == 0
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT target_dept_path, spend_bucket, rule, active"
+            " FROM department_attributions WHERE source_dept_id='d_sp_chat'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row == (
+        "运动消费事业部/市场营销部",
+        fds.BUCKET_PENDING_BUSINESS,
+        fds.RULE_CHAT_OWNER,
+        0,
+    )
 
 
 # --------------------------------------------------------------------------- #

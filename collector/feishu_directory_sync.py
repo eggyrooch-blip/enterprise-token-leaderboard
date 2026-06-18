@@ -122,6 +122,7 @@ def _looks_like_supplier_entity(dept, path):
     return bool(
         _SP_RE.search(_sstr(path))
         or _sstr(dept.get("leader_user_id"))
+        or _sstr(dept.get("group_owner_user_id"))
         or _sstr(dept.get("chat_id"))
     )
 
@@ -366,10 +367,10 @@ def derive_department_attributions(
                 resolved = (tdid, tpath, RULE_LEADER, CONF_HIGH, 1)
 
         if resolved is None:
+            owner_open_id = _sstr(d.get("group_owner_user_id"))
             chat_id = _sstr(d.get("chat_id"))
-            owner_open_id = ""
             if chat_id and chat_owner_lookup:
-                owner_open_id = _sstr(chat_owner_lookup(chat_id))
+                owner_open_id = owner_open_id or _sstr(chat_owner_lookup(chat_id))
             if owner_open_id:
                 tdid, tpath = _primary_dept_path_for_open_id(
                     owner_open_id, users_by_open_id, dept_path_by_id)
