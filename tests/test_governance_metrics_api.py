@@ -1,3 +1,4 @@
+import importlib
 import pathlib
 import sys
 
@@ -79,3 +80,36 @@ def test_governance_metrics_api_computes_available_metrics(monkeypatch, tmp_path
     assert payload["summary"]["day"]["max_date"] == "2026-06-08"
     assert payload["summary"]["last7"]["users"] == 3
     assert payload["summary"]["report_log"]["reports"] == 1
+
+
+def test_governance_metrics_respect_configured_excluded_accounts(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEADERBOARD_EXCLUDE_EMAILS", "outlier@example.com")
+    dc = importlib.reload(dev_collector)
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        _insert_usage(conn, "normal@example.com", "Keep/A", "lifetime", "all",
+                      "subscription", "Claude Code", 100, 1.0, 1)
+        _insert_usage(conn, "outlier@example.com", "Keep/A", "lifetime", "all",
+                      "subscription", "Claude Code", 10_000, 100.0, 10)
+        _insert_usage(conn, "normal@example.com", "Keep/A", "day", "2026-06-18",
+                      "subscription", "Claude Code", 10, 0.1, 1)
+        _insert_usage(conn, "outlier@example.com", "Keep/A", "day", "2026-06-18",
+                      "subscription", "Claude Code", 1_000, 10.0, 10)
+        conn.commit()
+
+        default = _DummyHandler()
+        dc.H._governance_metrics(default, conn, {})
+        included = _DummyHandler()
+        dc.H._governance_metrics(included, conn, {"include_excluded": ["1"]})
+    finally:
+        conn.close()
+
+    assert default.payload["summary"]["lifetime"]["tokens"] == 100
+    assert default.payload["summary"]["day"]["tokens"] == 10
+    assert default.payload["summary"]["sources"] == [
+        {"source": "subscription", "users": 1, "tokens": 100, "cost": 1.0}
+    ]
+
+    assert included.payload["summary"]["lifetime"]["tokens"] == 10_100
+    assert included.payload["summary"]["day"]["tokens"] == 1_010

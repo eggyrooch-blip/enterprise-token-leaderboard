@@ -2229,6 +2229,10 @@ class H(BaseHTTPRequestHandler):
             names = [r.get(key) or "unknown" for r in rows[:3]]
             return " / ".join(names) if names else "暂无"
 
+        qs = qs or {}
+        excluded_clause, excluded_params = _excluded_filter(qs)
+        include_excluded = _include_excluded(qs)
+
         lifetime_row = conn.execute("""
             SELECT COUNT(DISTINCT email),
                    COUNT(DISTINCT CASE WHEN dept != '' THEN dept END),
@@ -2237,14 +2241,14 @@ class H(BaseHTTPRequestHandler):
                    COALESCE(SUM(messages),0), COALESCE(SUM(cache_read),0),
                    COALESCE(SUM(cache_write),0), COALESCE(SUM(input),0),
                    COALESCE(SUM(output),0)
-            FROM usage WHERE period_type='lifetime'
-        """).fetchone()
+            FROM usage WHERE period_type='lifetime'%s
+        """ % excluded_clause, excluded_params).fetchone()
         day_row = conn.execute("""
             SELECT MIN(period), MAX(period), COUNT(DISTINCT period),
                    COUNT(DISTINCT email), COUNT(*),
                    COALESCE(SUM(total),0), COALESCE(SUM(cost),0)
-            FROM usage WHERE period_type='day'
-        """).fetchone()
+            FROM usage WHERE period_type='day'%s
+        """ % excluded_clause, excluded_params).fetchone()
         report_row = conn.execute("""
             SELECT COUNT(*), COUNT(DISTINCT serial), COUNT(DISTINCT email),
                    COALESCE(SUM(CASE WHEN via='manual' THEN 1 ELSE 0 END),0),
@@ -2262,20 +2266,21 @@ class H(BaseHTTPRequestHandler):
         # - usage 过滤走 _range_clause(qs)：窗口内有任何用量的人不算闲置；
         # - 席位过滤：席位区间须与窗口重叠 —— 窗口前已删除的席位是「已退订」而非闲置，
         #   不进闲置计数/月费；lifetime 模式取「今天仍在订」。
-        qs = qs or {}
         idle_where, idle_params = _range_clause(qs)
         idle_usage_rows = conn.execute(
             "SELECT DISTINCT email FROM usage "
-            "WHERE %s AND source != 'litellm_agent' AND COALESCE(email, '') != ''" % idle_where,
-            idle_params,
+            "WHERE %s AND source != 'litellm_agent' AND COALESCE(email, '') != ''%s"
+            % (idle_where, excluded_clause),
+            idle_params + excluded_params,
         ).fetchall()
         usage_emails = {r[0] for r in idle_usage_rows if r and r[0]}
         # 飞书 AI 权益点数也算「用量」：纯飞书用户已进个人榜(计订阅费),不能同时再算闲置。
         try:
             frng, fparams = _feishu_range(qs)
             for fr in conn.execute(
-                    "SELECT DISTINCT email FROM feishu_member WHERE credits>0%s" % frng,
-                    fparams).fetchall():
+                    "SELECT DISTINCT email FROM feishu_member WHERE credits>0%s%s"
+                    % (frng, excluded_clause),
+                    fparams + excluded_params).fetchall():
                 if fr and fr[0]:
                     usage_emails.add(fr[0])
         except Exception:
@@ -2285,6 +2290,8 @@ class H(BaseHTTPRequestHandler):
         idle_fee_by = {}
         idle_emails = set()
         for email, subs in subs_by_email.items():
+            if not include_excluded and (email or "").lower() in LEADERBOARD_EXCLUDE_EMAILS:
+                continue
             if email in usage_emails:
                 continue
             for sub in subs:
@@ -2308,25 +2315,25 @@ class H(BaseHTTPRequestHandler):
             last7_row = conn.execute("""
                 SELECT COUNT(DISTINCT email), COALESCE(SUM(total),0), COALESCE(SUM(cost),0)
                 FROM usage
-                WHERE period_type='day' AND period >= date(?, '-6 day')
-            """, (max_date,)).fetchone()
+                WHERE period_type='day' AND period >= date(?, '-6 day')%s
+            """ % excluded_clause, [max_date] + excluded_params).fetchone()
         else:
             last7_row = (0, 0, 0)
 
         source_rows = conn.execute("""
             SELECT source, COUNT(DISTINCT email), COALESCE(SUM(total),0), COALESCE(SUM(cost),0)
             FROM usage
-            WHERE period_type='lifetime'
+            WHERE period_type='lifetime'%s
             GROUP BY source
             ORDER BY COALESCE(SUM(total),0) DESC
-        """).fetchall()
+        """ % excluded_clause, excluded_params).fetchall()
         client_rows = conn.execute("""
             SELECT client, COUNT(DISTINCT email), COALESCE(SUM(total),0), COALESCE(SUM(cost),0)
             FROM usage
-            WHERE period_type='lifetime'
+            WHERE period_type='lifetime'%s
             GROUP BY client
             ORDER BY COALESCE(SUM(total),0) DESC
-        """).fetchall()
+        """ % excluded_clause, excluded_params).fetchall()
 
         sources = [
             {"source": r[0] or "unknown", "users": _num(r[1]),
