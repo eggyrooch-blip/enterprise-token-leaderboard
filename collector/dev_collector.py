@@ -499,6 +499,209 @@ def _user_roles(conn, email):
     }
 
 
+# ===========================================================================
+# Feishu OAuth + session auth (shadow-first; gated by AUTH_ENFORCE)
+# ---------------------------------------------------------------------------
+# Authentication (who you are) is always available: /v1/auth/login, /callback,
+# /logout, /v1/me work regardless of AUTH_ENFORCE. Authorization (what you can
+# see) is gated by AUTH_ENFORCE so production can run in shadow mode (=0) until
+# one real admin login is verified, then flip to enforce (=1). The machine
+# report path (/v1/tokscale/report, /tokreport.*) NEVER uses sessions — it keeps
+# its bearer-token auth.
+# ===========================================================================
+import secrets as _secrets
+from urllib.parse import urlencode as _urlencode
+from urllib.request import Request as _Request, urlopen as _urlopen
+
+FEISHU_HOST = os.environ.get("FEISHU_HOST", "https://open.feishu.cn").rstrip("/")
+FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "").strip()
+FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "").strip()
+FEISHU_OAUTH_REDIRECT_URI = os.environ.get("FEISHU_OAUTH_REDIRECT_URI", "").strip()
+
+SESSION_COOKIE = "tok_auth"
+SESSION_TTL = int(os.environ.get("AUTH_SESSION_TTL", str(7 * 24 * 3600)))
+STATE_TTL = int(os.environ.get("AUTH_STATE_TTL", "600"))
+AUTH_COOKIE_SECURE = os.environ.get("AUTH_COOKIE_SECURE", "0").strip() == "1"
+
+# Data routes guarded by AUTH_ENFORCE. The report/static/auth routes are NOT here.
+DATA_ROUTES = {
+    "/v1/leaderboard", "/v1/agent_leaderboard", "/v1/agent_owner_summary",
+    "/v1/teams", "/v1/cursor", "/v1/breakdown", "/v1/trend", "/v1/ai/usage",
+    "/v1/meta", "/v1/governance_metrics", "/v1/feishu", "/v1/raw",
+}
+# Endpoints that can leak company-wide totals -> admin only when enforcing.
+ADMIN_ONLY_ROUTES = {"/v1/governance_metrics", "/v1/raw"}
+
+
+def auth_enforced():
+    """Read at call-time so tests / ops can toggle AUTH_ENFORCE without reload."""
+    return os.environ.get("AUTH_ENFORCE", "0").strip() == "1"
+
+
+def _oauth_http_json(url, payload=None, headers=None):
+    """Thin JSON HTTP helper for the OAuth dance. Monkeypatched in tests."""
+    req_headers = {"Accept": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        req_headers.setdefault("Content-Type", "application/json; charset=utf-8")
+    req = _Request(url, data=data, headers=req_headers)
+    resp = _urlopen(req, timeout=15)
+    raw = resp.read()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    return json.loads(raw or "{}")
+
+
+def feishu_authorize_url(state):
+    """The Feishu authorize URL the browser is 302'd to at login."""
+    q = _urlencode({
+        "app_id": FEISHU_APP_ID,
+        "redirect_uri": FEISHU_OAUTH_REDIRECT_URI,
+        "state": state,
+    })
+    return FEISHU_HOST + "/open-apis/authen/v1/authorize?" + q
+
+
+def feishu_exchange_code(code):
+    """Exchange an OAuth code for the user's profile.
+
+    Returns ``{email, name, open_id}`` (email lowercased, may be empty). Network
+    goes through :func:`_oauth_http_json` so tests inject fakes. NOTE: the exact
+    Feishu token/user-info endpoint + field names are DEFERRED-VERIFY against a
+    live round-trip — the bot's OAuth (authen v1 vs v2) must be confirmed once
+    the redirect URI is registered. The state machine around it is endpoint-
+    agnostic and fully tested.
+    """
+    tok = _oauth_http_json(
+        FEISHU_HOST + "/open-apis/authen/v2/oauth/token",
+        {"grant_type": "authorization_code", "client_id": FEISHU_APP_ID,
+         "client_secret": FEISHU_APP_SECRET, "code": code,
+         "redirect_uri": FEISHU_OAUTH_REDIRECT_URI})
+    if tok.get("code") not in (None, 0):
+        raise RuntimeError(tok.get("msg") or tok.get("error") or "token exchange failed")
+    user_token = tok.get("access_token") or (tok.get("data") or {}).get("access_token") or ""
+    if not user_token:
+        raise RuntimeError("token exchange returned empty access_token")
+    info = _oauth_http_json(
+        FEISHU_HOST + "/open-apis/authen/v1/user_info", None,
+        {"Authorization": "Bearer " + user_token})
+    d = info.get("data") or info or {}
+    return {
+        "email": (d.get("email") or d.get("enterprise_email") or "").strip().lower(),
+        "name": d.get("name") or "",
+        "open_id": d.get("open_id") or "",
+    }
+
+
+def create_oauth_state(conn, redirect="/", now=None):
+    now = int(now if now is not None else time.time())
+    state = _secrets.token_urlsafe(24)
+    conn.execute("INSERT OR REPLACE INTO auth_states(state,redirect,created_at)"
+                 " VALUES(?,?,?)", (state, redirect or "/", now))
+    conn.commit()
+    return state
+
+
+def consume_oauth_state(conn, state, now=None):
+    """One-time-use + expiry. Returns the stored redirect, or None if invalid."""
+    if not state:
+        return None
+    now = int(now if now is not None else time.time())
+    row = conn.execute(
+        "SELECT redirect, created_at FROM auth_states WHERE state=?", (state,)
+    ).fetchone()
+    if not row:
+        return None
+    conn.execute("DELETE FROM auth_states WHERE state=?", (state,))  # consume once
+    conn.commit()
+    if now - int(row[1] or 0) > STATE_TTL:
+        return None
+    return row[0] or "/"
+
+
+def create_session(conn, email, now=None):
+    now = int(now if now is not None else time.time())
+    sid = _secrets.token_urlsafe(32)
+    conn.execute(
+        "INSERT INTO auth_sessions(sid,email,created_at,expires_at,last_seen_at)"
+        " VALUES(?,?,?,?,?)",
+        (sid, (email or "").strip().lower(), now, now + SESSION_TTL, now))
+    conn.commit()
+    return sid
+
+
+def session_email(conn, sid, now=None):
+    if not sid:
+        return None
+    now = int(now if now is not None else time.time())
+    row = conn.execute(
+        "SELECT email, expires_at FROM auth_sessions WHERE sid=?", (sid,)).fetchone()
+    if not row:
+        return None
+    if row[1] and now > int(row[1]):
+        conn.execute("DELETE FROM auth_sessions WHERE sid=?", (sid,))
+        conn.commit()
+        return None
+    conn.execute("UPDATE auth_sessions SET last_seen_at=? WHERE sid=?", (now, sid))
+    conn.commit()
+    return row[0]
+
+
+def delete_session(conn, sid):
+    if sid:
+        conn.execute("DELETE FROM auth_sessions WHERE sid=?", (sid,))
+        conn.commit()
+
+
+def email_in_scope(roleinfo, row_email, row_dept_path=""):
+    """Pure row-visibility predicate for a (person email, dept path) under a role.
+
+    admin -> everything; member -> only self; department_owner -> own dept
+    subtree (by canonical dept key prefix) plus self.
+    """
+    if not roleinfo:
+        return False
+    if roleinfo.get("is_admin"):
+        return True
+    me = (roleinfo.get("email") or "").strip().lower()
+    if (row_email or "").strip().lower() == me:
+        return True
+    if roleinfo.get("scope") == "department":
+        rp = _canonical_dept_key(row_dept_path)
+        if not rp:
+            return False
+        for owned in roleinfo.get("owned_departments", []):
+            ok = _canonical_dept_key(owned)
+            if ok and (rp == ok or rp.startswith(ok + "/")):
+                return True
+    return False
+
+
+def authorize_request(user, path, enforced):
+    """Pure endpoint-level authorization decision.
+
+    Returns 'allow' | '401' | '403'. Row-level scoping (member self-rows / owner
+    subtree) on the per-person boards is the NEXT increment; until it lands this
+    gate is deny-by-default for non-admins under enforce, which is SAFE (no data
+    leak) — production stays at AUTH_ENFORCE=0 (shadow) until that increment +
+    one verified admin login. `/v1/me` and the auth/report/static routes are
+    never gated here.
+    """
+    if not enforced or path not in DATA_ROUTES:
+        return "allow"
+    if user is None:
+        return "401"
+    if user.get("is_admin"):
+        return "allow"
+    if path in ADMIN_ONLY_ROUTES:
+        return "403"
+    # Non-admin, row-scope not yet wired -> safe deny.
+    return "403"
+
+
 def num(r, *keys):
     """从 dict r 中按 keys 顺序取第一个非 None 整数，失败返回 0。"""
     for k in keys:
@@ -1738,6 +1941,94 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(n) or b"{}")
 
+    # ---- session auth (Feishu OAuth) --------------------------------------
+    def _parse_cookies(self):
+        out = {}
+        for part in (self.headers.get("Cookie", "") or "").split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                out[k.strip()] = v.strip()
+        return out
+
+    def _session_user(self, conn):
+        """Return _user_roles dict for the cookie session, or None."""
+        sid = self._parse_cookies().get(SESSION_COOKIE)
+        email = session_email(conn, sid)
+        if not email:
+            return None
+        return _user_roles(conn, email)
+
+    def _cookie_header(self, sid):
+        parts = ["%s=%s" % (SESSION_COOKIE, sid), "Path=/", "HttpOnly",
+                 "SameSite=Lax", "Max-Age=%d" % SESSION_TTL]
+        if AUTH_COOKIE_SECURE:
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _send_redirect(self, location, set_cookie=None, clear_cookie=False):
+        self.send_response(302)
+        self.send_header("Location", location)
+        if set_cookie is not None:
+            self.send_header("Set-Cookie", self._cookie_header(set_cookie))
+        if clear_cookie:
+            self.send_header(
+                "Set-Cookie",
+                "%s=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" % SESSION_COOKIE)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _auth_login(self, conn, qs):
+        if not FEISHU_APP_ID or not FEISHU_OAUTH_REDIRECT_URI:
+            return self._send(500, {"error": "feishu oauth not configured"})
+        nxt = (qs.get("next") or ["/"])[0] or "/"
+        state = create_oauth_state(conn, nxt)
+        return self._send_redirect(feishu_authorize_url(state))
+
+    def _auth_callback(self, conn, qs):
+        code = (qs.get("code") or [""])[0]
+        state = (qs.get("state") or [""])[0]
+        if not code or not state:
+            return self._send(400, {"error": "missing code or state"})
+        redirect = consume_oauth_state(conn, state)
+        if redirect is None:
+            return self._send(400, {"error": "invalid or expired state"})
+        try:
+            info = feishu_exchange_code(code)
+        except Exception as e:  # noqa: BLE001 - surface upstream failure, never 200
+            return self._send(502, {"error": "feishu code exchange failed",
+                                    "detail": str(e)[:200]})
+        email = (info.get("email") or "").strip().lower()
+        if not email:
+            # No open_id-only / empty-email sessions — hard 403 per security model.
+            return self._send(403, {"error": "feishu profile has no email; access denied"})
+        sid = create_session(conn, email)
+        return self._send_redirect(redirect or "/", set_cookie=sid)
+
+    def _auth_logout(self, conn):
+        delete_session(conn, self._parse_cookies().get(SESSION_COOKIE))
+        return self._send_redirect("/", clear_cookie=True)
+
+    def _me(self, conn):
+        user = self._session_user(conn)
+        if not user:
+            return self._send(401, {"error": "not authenticated"})
+        name, dept = "", ""
+        try:
+            row = conn.execute(
+                "SELECT COALESCE(name,''), COALESCE(effective_dept, dept, '')"
+                " FROM people WHERE lower(email)=?", (user["email"],)).fetchone()
+            if row:
+                name, dept = row[0], row[1]
+        except Exception:
+            pass
+        return self._send(200, {
+            "email": user["email"], "name": name, "dept": dept,
+            "roles": user["roles"], "scope": user["scope"],
+            "is_admin": user["is_admin"],
+            "owned_departments": user["owned_departments"],
+            "auth_enforced": auth_enforced(),
+        })
+
     # ------------------------------------------------------------------
     def _send_local(self, filename, content_type):
         """读取本脚本同目录下的文件原样返回(看板/说明页/补报脚本共用)。"""
@@ -2027,6 +2318,25 @@ class H(BaseHTTPRequestHandler):
 
         conn = db()
         try:
+            # Authentication routes — always available, independent of AUTH_ENFORCE.
+            if path == "/v1/auth/login":
+                return self._auth_login(conn, qs)
+            if path == "/v1/auth/callback":
+                return self._auth_callback(conn, qs)
+            if path == "/v1/auth/logout":
+                return self._auth_logout(conn)
+            if path == "/v1/me":
+                return self._me(conn)
+
+            # Authorization gate — only does work when enforcing (shadow=no-op).
+            if auth_enforced() and path in DATA_ROUTES:
+                decision = authorize_request(self._session_user(conn), path, True)
+                if decision == "401":
+                    return self._send(401, {"error": "login required",
+                                            "login": "/v1/auth/login"})
+                if decision == "403":
+                    return self._send(403, {"error": "forbidden for your role"})
+
             if path == "/v1/leaderboard":
                 return self._leaderboard(conn, qs)
             if path == "/v1/agent_leaderboard":

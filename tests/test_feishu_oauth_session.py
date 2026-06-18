@@ -1,0 +1,245 @@
+# -*- coding: utf-8 -*-
+"""Tests for the Feishu OAuth + session auth layer in dev_collector.py.
+
+Pure/unit level — no sockets, no live network. The HTTP handler is exercised
+via a socket-free fake instance that captures responses.
+"""
+import pathlib
+import sqlite3
+import sys
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "collector"))
+import dev_collector as dc  # noqa: E402
+
+
+@pytest.fixture
+def conn():
+    c = sqlite3.connect(":memory:")
+    dc.ensure_auth_tables(c)
+    c.execute("CREATE TABLE IF NOT EXISTS people(email TEXT PRIMARY KEY, name TEXT,"
+              " avatar TEXT, dept TEXT)")
+    dc._ensure_people_directory_columns(c)
+    return c
+
+
+class _Headers(dict):
+    def get(self, key, default=None):
+        for k, v in self.items():
+            if k.lower() == key.lower():
+                return v
+        return default
+
+
+def _handler(cookie=None):
+    h = dc.H.__new__(dc.H)
+    h.headers = _Headers({"Cookie": cookie} if cookie else {})
+    h.captured = []
+    h._send = lambda code, obj: h.captured.append(("send", code, obj))
+    h._send_redirect = (lambda location, set_cookie=None, clear_cookie=False:
+                        h.captured.append(("redirect", location, set_cookie, clear_cookie)))
+    return h
+
+
+# --------------------------------------------------------------------------- #
+# state: one-time-use + expiry
+# --------------------------------------------------------------------------- #
+def test_state_is_one_time_use(conn):
+    s = dc.create_oauth_state(conn, "/dashboard", now=1000)
+    assert dc.consume_oauth_state(conn, s, now=1001) == "/dashboard"
+    # second use is rejected
+    assert dc.consume_oauth_state(conn, s, now=1002) is None
+
+
+def test_state_expires(conn):
+    s = dc.create_oauth_state(conn, "/", now=1000)
+    assert dc.consume_oauth_state(conn, s, now=1000 + dc.STATE_TTL + 1) is None
+
+
+def test_unknown_state_rejected(conn):
+    assert dc.consume_oauth_state(conn, "nope", now=1) is None
+
+
+# --------------------------------------------------------------------------- #
+# session lifecycle + expiry
+# --------------------------------------------------------------------------- #
+def test_session_roundtrip_and_expiry(conn):
+    sid = dc.create_session(conn, "Leader@Keep.com", now=1000)
+    assert dc.session_email(conn, sid, now=1001) == "leader@keep.com"
+    # expired
+    assert dc.session_email(conn, sid, now=1000 + dc.SESSION_TTL + 1) is None
+    # expired session is deleted
+    assert dc.session_email(conn, sid, now=1002) is None
+
+
+def test_session_unknown_sid(conn):
+    assert dc.session_email(conn, "missing", now=1) is None
+    assert dc.session_email(conn, None) is None
+
+
+# --------------------------------------------------------------------------- #
+# feishu_exchange_code: requires email, parses profile
+# --------------------------------------------------------------------------- #
+def test_exchange_code_returns_profile(monkeypatch):
+    calls = []
+
+    def fake(url, payload=None, headers=None):
+        calls.append(url)
+        if "oauth/token" in url:
+            return {"code": 0, "access_token": "u-tok"}
+        return {"code": 0, "data": {"email": "Emp@Keep.com", "name": "员工",
+                                    "open_id": "ou_emp"}}
+
+    monkeypatch.setattr(dc, "_oauth_http_json", fake)
+    info = dc.feishu_exchange_code("the-code")
+    assert info["email"] == "emp@keep.com"
+    assert info["open_id"] == "ou_emp"
+    assert any("oauth/token" in u for u in calls)
+    assert any("user_info" in u for u in calls)
+
+
+def test_exchange_code_raises_on_token_error(monkeypatch):
+    monkeypatch.setattr(dc, "_oauth_http_json",
+                        lambda *a, **k: {"code": 99, "msg": "bad code"})
+    with pytest.raises(RuntimeError):
+        dc.feishu_exchange_code("x")
+
+
+# --------------------------------------------------------------------------- #
+# /v1/me
+# --------------------------------------------------------------------------- #
+def test_me_401_without_session(conn):
+    h = _handler()
+    h._me(conn)
+    assert h.captured == [("send", 401, {"error": "not authenticated"})]
+
+
+def test_me_returns_identity_with_session(conn):
+    conn.execute("INSERT INTO people(email,name,dept) VALUES('emp@keep.com','员工','技术平台部')")
+    sid = dc.create_session(conn, "emp@keep.com")
+    h = _handler(cookie="%s=%s" % (dc.SESSION_COOKIE, sid))
+    h._me(conn)
+    kind, code, obj = h.captured[0]
+    assert code == 200
+    assert obj["email"] == "emp@keep.com"
+    assert obj["roles"] == ["member"]
+    assert obj["scope"] == "self"
+    assert obj["is_admin"] is False
+
+
+def test_me_reports_admin_for_super_admin(conn):
+    sid = dc.create_session(conn, "sunke@keep.com")
+    h = _handler(cookie="%s=%s" % (dc.SESSION_COOKIE, sid))
+    h._me(conn)
+    _, code, obj = h.captured[0]
+    assert code == 200 and obj["is_admin"] is True and obj["scope"] == "global"
+
+
+# --------------------------------------------------------------------------- #
+# OAuth callback flow
+# --------------------------------------------------------------------------- #
+def test_callback_with_email_creates_session_and_cookie(conn, monkeypatch):
+    monkeypatch.setattr(dc, "feishu_exchange_code",
+                        lambda code: {"email": "emp@keep.com", "name": "员工", "open_id": "o"})
+    state = dc.create_oauth_state(conn, "/dashboard")
+    h = _handler()
+    h._auth_callback(conn, {"code": ["c"], "state": [state]})
+    kind, location, set_cookie, clear = h.captured[0]
+    assert kind == "redirect" and location == "/dashboard"
+    assert set_cookie  # a session id cookie was set
+    assert dc.session_email(conn, set_cookie) == "emp@keep.com"
+
+
+def test_callback_missing_email_is_403_no_session(conn, monkeypatch):
+    monkeypatch.setattr(dc, "feishu_exchange_code",
+                        lambda code: {"email": "", "name": "供应商", "open_id": "ou_x"})
+    state = dc.create_oauth_state(conn, "/")
+    h = _handler()
+    h._auth_callback(conn, {"code": ["c"], "state": [state]})
+    assert h.captured == [("send", 403,
+                           {"error": "feishu profile has no email; access denied"})]
+    # no session rows created
+    assert conn.execute("SELECT COUNT(*) FROM auth_sessions").fetchone()[0] == 0
+
+
+def test_callback_reused_state_is_400(conn, monkeypatch):
+    monkeypatch.setattr(dc, "feishu_exchange_code",
+                        lambda code: {"email": "emp@keep.com"})
+    state = dc.create_oauth_state(conn, "/", now=1000)
+    h1 = _handler()
+    h1._auth_callback(conn, {"code": ["c"], "state": [state]})  # consumes state
+    h2 = _handler()
+    h2._auth_callback(conn, {"code": ["c"], "state": [state]})  # reuse
+    assert h2.captured == [("send", 400, {"error": "invalid or expired state"})]
+
+
+def test_callback_missing_params_is_400(conn):
+    h = _handler()
+    h._auth_callback(conn, {"code": [""], "state": [""]})
+    assert h.captured[0][1] == 400
+
+
+# --------------------------------------------------------------------------- #
+# scope predicate
+# --------------------------------------------------------------------------- #
+def _role(email, roles, scope, owned=()):
+    return {"email": email, "roles": list(roles), "is_admin": "admin" in roles,
+            "scope": scope, "owned_departments": list(owned)}
+
+
+def test_email_in_scope_admin_sees_all():
+    admin = _role("a@keep.com", ["admin"], "global")
+    assert dc.email_in_scope(admin, "anyone@keep.com", "运动消费事业部/市场营销部")
+
+
+def test_email_in_scope_member_sees_only_self():
+    m = _role("emp@keep.com", ["member"], "self")
+    assert dc.email_in_scope(m, "emp@keep.com", "技术平台部")
+    assert not dc.email_in_scope(m, "other@keep.com", "技术平台部")
+
+
+def test_email_in_scope_owner_sees_subtree_and_self():
+    o = _role("lead@keep.com", ["department_owner"], "department",
+              owned=["技术平台部"])
+    assert dc.email_in_scope(o, "x@keep.com", "技术平台部/固件组")  # subtree
+    assert dc.email_in_scope(o, "x@keep.com", "Keep/技术平台部")    # canonical strips Keep/
+    assert not dc.email_in_scope(o, "x@keep.com", "运动消费事业部")  # outside
+    assert dc.email_in_scope(o, "lead@keep.com", "运动消费事业部")   # always self
+
+
+# --------------------------------------------------------------------------- #
+# authorization gate (shadow vs enforce)
+# --------------------------------------------------------------------------- #
+def test_gate_shadow_allows_everything():
+    assert dc.authorize_request(None, "/v1/leaderboard", enforced=False) == "allow"
+
+
+def test_gate_enforce_unauthenticated_is_401():
+    assert dc.authorize_request(None, "/v1/leaderboard", enforced=True) == "401"
+
+
+def test_gate_enforce_admin_allowed_everywhere():
+    admin = _role("a@keep.com", ["admin"], "global")
+    assert dc.authorize_request(admin, "/v1/raw", enforced=True) == "allow"
+    assert dc.authorize_request(admin, "/v1/governance_metrics", enforced=True) == "allow"
+
+
+def test_gate_enforce_member_denied_data_routes():
+    m = _role("emp@keep.com", ["member"], "self")
+    assert dc.authorize_request(m, "/v1/leaderboard", enforced=True) == "403"
+    assert dc.authorize_request(m, "/v1/raw", enforced=True) == "403"
+
+
+def test_gate_never_touches_report_or_auth_routes():
+    # routes not in DATA_ROUTES are always allowed by the gate
+    assert dc.authorize_request(None, "/v1/tokscale/report", enforced=True) == "allow"
+    assert dc.authorize_request(None, "/v1/me", enforced=True) == "allow"
+
+
+def test_auth_enforced_reads_env(monkeypatch):
+    monkeypatch.delenv("AUTH_ENFORCE", raising=False)
+    assert dc.auth_enforced() is False
+    monkeypatch.setenv("AUTH_ENFORCE", "1")
+    assert dc.auth_enforced() is True
