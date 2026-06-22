@@ -450,6 +450,99 @@ def test_cli_snapshot_uses_group_owner_as_pending_candidate(monkeypatch, tmp_pat
     )
 
 
+def test_cli_resolves_leader_and_admin_ids_when_user_listing_is_empty(monkeypatch, tmp_path):
+    class Client(_FakeDirectoryClient):
+        def fetch_snapshot(self, root="0"):
+            deps, _users = super().fetch_snapshot(root)
+            return deps, []
+
+        def get_user(self, user_id, user_id_type="open_id"):
+            users = {
+                ("ou_leader", "open_id"): {
+                    "open_id": "ou_leader", "user_id": "u1",
+                    "email": "leader@keep.com", "name": "组长", "dept_id": "d_fw",
+                    "status": "active",
+                },
+                ("sunke", "user_id"): {
+                    "open_id": "ou_sunke", "user_id": "sunke",
+                    "email": "sunke@keep.com", "name": "孙可", "dept_id": "d_tech",
+                    "status": "active",
+                },
+            }
+            if (user_id, user_id_type) not in users:
+                raise RuntimeError("not found")
+            return dict(users[(user_id, user_id_type)])
+
+    monkeypatch.setattr(fds, "FeishuDirectoryClient", lambda: Client())
+    db_path = tmp_path / "tok.db"
+
+    rc = fds.main([
+        "--db", str(db_path),
+        "--admin-user-ids", "sunke",
+        "--allow-low-coverage",
+        "--allow-partial",
+    ])
+
+    assert rc == 0
+    conn = sqlite3.connect(str(db_path))
+    try:
+        roles = conn.execute(
+            "SELECT email, role, dept_path FROM roles ORDER BY email, role, dept_path"
+        ).fetchall()
+        users = conn.execute(
+            "SELECT open_id, user_id, email, dept_path FROM feishu_users"
+            " WHERE open_id IN ('ou_leader','ou_sunke') ORDER BY open_id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert ("leader@keep.com", "department_owner", "技术平台部/固件组") in roles
+    assert ("sunke@keep.com", "admin", "") in roles
+    assert users == [
+        ("ou_leader", "u1", "leader@keep.com", "技术平台部/固件组"),
+        ("ou_sunke", "sunke", "sunke@keep.com", "技术平台部"),
+    ]
+
+
+def test_cli_records_user_detail_resolution_warnings(monkeypatch, tmp_path, capsys):
+    class Client(_FakeDirectoryClient):
+        def fetch_snapshot(self, root="0"):
+            deps, _users = super().fetch_snapshot(root)
+            deps.append({
+                "dept_id": "d_missing", "parent_id": "d_tech", "name": "缺失负责人组",
+                "leader_user_id": "ou_missing",
+            })
+            pbi = fds.build_department_paths(deps)
+            for d in deps:
+                d["path"] = pbi.get(d["dept_id"], d.get("name", ""))
+            return deps, []
+
+        def get_user(self, user_id, user_id_type="open_id"):
+            if (user_id, user_id_type) == ("ou_leader", "open_id"):
+                return {
+                    "open_id": "ou_leader", "user_id": "u1",
+                    "email": "leader@keep.com", "name": "组长", "dept_id": "d_fw",
+                    "status": "active",
+                }
+            raise RuntimeError("not visible")
+
+    monkeypatch.setattr(fds, "FeishuDirectoryClient", lambda: Client())
+    db_path = tmp_path / "tok.db"
+
+    rc = fds.main(["--db", str(db_path), "--allow-low-coverage", "--allow-partial"])
+
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert any(w["kind"] == "user_detail_unresolved" and w["user_id"] == "ou_missing"
+               for w in out["user_resolution_warnings"])
+    conn = sqlite3.connect(str(db_path))
+    try:
+        roles = conn.execute("SELECT email, role FROM roles").fetchall()
+    finally:
+        conn.close()
+    assert ("leader@keep.com", "department_owner") in roles
+
+
 def test_cli_loads_manual_overrides_file_and_outputs_rule_counts(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(fds, "FeishuDirectoryClient", lambda: _FakeDirectoryClient())
     db_path = tmp_path / "tok.db"

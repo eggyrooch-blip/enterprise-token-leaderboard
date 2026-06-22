@@ -663,6 +663,80 @@ def resolved_business_outsourcing_rate(attributions, spend_by_key=None):
     return resolved / total
 
 
+def _preferred_user_id_type(ident):
+    ident = _sstr(ident).strip()
+    return "open_id" if ident.startswith("ou_") else "user_id"
+
+
+def _fetch_user_detail_with_fallback(client, ident, preferred_type):
+    attempts = [preferred_type]
+    other = "user_id" if preferred_type == "open_id" else "open_id"
+    if other not in attempts:
+        attempts.append(other)
+    last_error = None
+    for user_id_type in attempts:
+        try:
+            user = client.get_user(ident, user_id_type=user_id_type)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if user and user.get("open_id"):
+            return user, user_id_type, None
+    return None, attempts[-1], _sstr(last_error) if last_error else "empty user detail"
+
+
+def enrich_required_users(client, departments, users, admin_user_ids=None):
+    """Resolve leaders/admin ids through user-detail API when list-users is scoped.
+
+    Some production Feishu apps can read department ``leader_user_id`` but cannot
+    list members by department. The department leader id is still sufficient for
+    auth roles if we fetch the specific user detail.
+    """
+    admin_user_ids = [u for u in (admin_user_ids or []) if _sstr(u).strip()]
+    dept_path_by_id = build_department_paths(departments)
+    existing_open = {u.get("open_id") for u in users if u.get("open_id")}
+    existing_user = {u.get("user_id") for u in users if u.get("user_id")}
+    needed = []
+    for d in departments:
+        leader = _sstr(d.get("leader_user_id")).strip()
+        if leader and leader not in existing_open:
+            needed.append((leader, "open_id", "department_leader"))
+    for ident in admin_user_ids:
+        ident = _sstr(ident).strip()
+        if ident and ident not in existing_open and ident not in existing_user:
+            needed.append((ident, _preferred_user_id_type(ident), "admin_user_id"))
+
+    warnings = []
+    seen = set()
+    enriched = list(users)
+    for ident, preferred_type, reason in needed:
+        key = (ident, preferred_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        user, resolved_type, error = _fetch_user_detail_with_fallback(
+            client, ident, preferred_type)
+        if not user:
+            warnings.append({
+                "kind": "user_detail_unresolved",
+                "user_id": ident,
+                "user_id_type": preferred_type,
+                "reason": reason,
+                "error": error or "",
+            })
+            continue
+        dept_id = _sstr(user.get("dept_id"))
+        user["dept_path"] = user.get("dept_path") or dept_path_by_id.get(dept_id, "")
+        open_id = _sstr(user.get("open_id"))
+        user_id = _sstr(user.get("user_id"))
+        if open_id:
+            existing_open.add(open_id)
+        if user_id:
+            existing_user.add(user_id)
+        enriched.append(user)
+    return enriched, warnings
+
+
 # --------------------------------------------------------------------------- #
 # Snapshot writer
 # --------------------------------------------------------------------------- #
@@ -1061,6 +1135,17 @@ class FeishuDirectoryClient(object):
                 break
         return [self._normalize_user(u) for u in items]
 
+    def get_user(self, user_id, user_id_type="open_id"):
+        from urllib.parse import quote
+        data = self._get(
+            "/open-apis/contact/v3/users/%s" % quote(_sstr(user_id), safe=""),
+            {
+                "user_id_type": user_id_type,
+                "department_id_type": "department_id",
+            },
+        )
+        return self._normalize_user(data.get("user") or data)
+
     @staticmethod
     def _normalize_user(u):
         status = u.get("status") or {}
@@ -1147,10 +1232,14 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     manual_overrides = load_manual_overrides(args.manual_overrides)
+    admin_emails = [e for e in re.split(r"[,\s]+", args.admin_emails) if e]
+    admin_user_ids = [u for u in re.split(r"[,\s]+", args.admin_user_ids) if u]
 
     client = FeishuDirectoryClient()
     try:
         departments, users = client.fetch_snapshot(args.root)
+        users, user_resolution_warnings = enrich_required_users(
+            client, departments, users, admin_user_ids=admin_user_ids)
         warnings = client.validate_visibility_coverage(departments, users)
     except Exception as exc:
         conn = sqlite3.connect(args.db)
@@ -1166,8 +1255,6 @@ def main(argv=None):
     attributions = derive_department_attributions(
         departments, users, manual_overrides=manual_overrides)
     rate = resolved_business_outsourcing_rate(attributions)
-    admin_emails = [e for e in re.split(r"[,\s]+", args.admin_emails) if e]
-    admin_user_ids = [u for u in re.split(r"[,\s]+", args.admin_user_ids) if u]
 
     summary = {
         "departments": len(departments),
@@ -1179,6 +1266,7 @@ def main(argv=None):
         "attribution_counts_by_rule": attribution_counts_by_rule(attributions),
         "resolved_business_outsourcing_rate": round(rate, 4),
         "visibility_warnings": warnings,
+        "user_resolution_warnings": user_resolution_warnings,
         "min_required_rate": MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE,
         "production_enablement_blocked": rate < MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE,
     }
@@ -1211,6 +1299,7 @@ def main(argv=None):
         conn.close()
     result.update({
         "visibility_warnings": warnings,
+        "user_resolution_warnings": user_resolution_warnings,
         "min_required_rate": MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE,
         "production_enablement_blocked": summary["production_enablement_blocked"],
         "business_rollup_enabled": business_rollup_enabled,
