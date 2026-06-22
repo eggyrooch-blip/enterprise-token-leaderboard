@@ -2107,6 +2107,20 @@ def _build_dept_headcount(conn=None):
     return _fetch_dept_headcount(), "feilian"
 
 
+def _member_count_available(conn):
+    """departments.member_count 是否已有数据(便宜探测,用于缓存防陈旧)。"""
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(departments)").fetchall()}
+        if "member_count" not in cols:
+            return False
+        row = conn.execute(
+            "SELECT 1 FROM departments WHERE COALESCE(member_count,0)>0 LIMIT 1"
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
 def _dept_headcount_map(conn=None):
     """部门完整路径 → 在职总人数。带 6h 文件缓存(DB 同目录 dept_headcount.json)。
     默认数据源飞书(DEPT_HEADCOUNT_SOURCE)，飞书无数据回退飞连。
@@ -2126,7 +2140,17 @@ def _dept_headcount_map(conn=None):
             ts = float(cached.get("ts") or 0)
             counts = cached.get("counts") or {}
             same_src = cached.get("source", "feilian") == _DEPT_HEADCOUNT_SOURCE
-            if counts and same_src and (now - ts) < _DEPT_HEADCOUNT_TTL:
+            cached_used = cached.get("source_used", _DEPT_HEADCOUNT_SOURCE)
+            # 防陈旧(2026-06-22 codex 评审):配置要 feishu,但缓存是回退源(people/feishu_users/
+            # feilian,非 member_count),而 departments.member_count 现已灌好 → 作废缓存重建,
+            # 否则 6h 内一直返回旧的回退人数(如 624),读不到真值(690/1297)。
+            stale_fallback = (
+                _DEPT_HEADCOUNT_SOURCE in ("feishu", "feishu_only")
+                and cached_used != "feishu_member_count"
+                and conn is not None
+                and _member_count_available(conn)
+            )
+            if counts and same_src and not stale_fallback and (now - ts) < _DEPT_HEADCOUNT_TTL:
                 _dept_headcount_mem = counts
                 # source_used 决定是否 roll-up,必须从缓存恢复(默认按叶子级兼容旧缓存)。
                 _dept_headcount_source_used_mem = cached.get(

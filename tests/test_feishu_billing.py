@@ -69,7 +69,9 @@ def _insert_feishu(conn, email, credits):
     )
 
 
-def test_feishu_credits_add_usd_cost_without_touching_non_feishu_rows(monkeypatch, tmp_path):
+def test_feishu_credits_recorded_separately_not_merged_into_main_board(monkeypatch, tmp_path):
+    # 2026-06-22 去点改造后的契约:飞书「点」(credits)不再并入主榜 token/cost,
+    # 只作附记字段(feishu_credits/feishu_cost);纯飞书用户不出现在主 token 榜(归飞书 tab)。
     dc = _reload_dc(monkeypatch)
     monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
     conn = dc.db()
@@ -88,15 +90,16 @@ def test_feishu_credits_add_usd_cost_without_touching_non_feishu_rows(monkeypatc
 
     rate = dc.FEISHU_USD_PER_POINT
     with_feishu = _row_by_email(rows, "with-feishu@keep.com")
-    assert with_feishu["tokens"] == 1100
+    # token 与 cost 是纯 token 口径,不含 credits 折算
+    assert with_feishu["tokens"] == 100
+    assert with_feishu["cost"] == 1.25
+    # credits 仅作附记字段
     assert with_feishu["feishu_credits"] == 1000
     assert with_feishu["feishu_cost"] == round(1000 * rate, 4)
-    assert with_feishu["cost"] == round(1.25 + 1000 * rate, 4)
 
-    feishu_only = _row_by_email(rows, "feishu-only@keep.com")
-    assert feishu_only["tokens"] == 500
-    assert feishu_only["cost"] == round(500 * rate, 4)
-    assert feishu_only["feishu_cost"] == round(500 * rate, 4)
+    # 纯飞书用户(无 token 用量)不在主榜
+    with pytest.raises(AssertionError):
+        _row_by_email(rows, "feishu-only@keep.com")
 
     plain = _row_by_email(rows, "plain@keep.com")
     assert plain["cost"] == 2.5
@@ -122,7 +125,9 @@ def test_feishu_rate_comes_from_env_and_is_exposed_on_feishu_payload(monkeypatch
         conn.close()
 
     assert dc.FEISHU_USD_PER_POINT == pytest.approx(99000 / 2000000 / 10)
-    assert _row_by_email(rows, "rate@keep.com")["cost"] == 4.95
+    # 纯飞书用户不在主 token 榜;费率改为在飞书 tab 暴露
+    with pytest.raises(AssertionError):
+        _row_by_email(rows, "rate@keep.com")
     assert payload["usd_per_point"] == pytest.approx(0.00495)
     assert payload["package_cny"] == 99000
     assert payload["package_points"] == 2000000
