@@ -1833,11 +1833,50 @@ def _upsert_report_person(conn, identity):
 
 
 # ---------------------------------------------------------------------------
-# 飞连部门总人数缓存（部门榜 headcount / active_rate 用）
+# 部门总人数缓存（部门榜 headcount / active_rate 用）
+#
+# 数据源开关 DEPT_HEADCOUNT_SOURCE：
+#   feishu  (默认) → 飞书组织架构 feishu_users.dept_path 在职人数；飞书无数据时回退飞连
+#   feilian          → 强制走飞连（旧行为）
+#   feishu_only      → 只用飞书，没有就空（不回退飞连）
+# 飞书是组织架构权威源（feishu_directory_sync.py 从 root 全树 fetch_child 拉全员，
+# dept_path 与飞连 department_path 同格式 'Keep/技术平台部/...'），故默认优先飞书。
 # ---------------------------------------------------------------------------
 _DEPT_HEADCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(DB)), "dept_headcount.json")
 _DEPT_HEADCOUNT_TTL = 6 * 3600  # 6 小时
 _dept_headcount_mem = None  # 进程内一次性缓存，避免每请求读盘
+_DEPT_HEADCOUNT_SOURCE = os.environ.get("DEPT_HEADCOUNT_SOURCE", "feishu").strip().lower()
+
+
+def _fetch_dept_headcount_feishu(conn):
+    """飞书组织架构部门总人数：feishu_users 里在职(status='active')用户按 dept_path 精确分组计数。
+    与飞连版同口径：返回 {department_path: 人数}，path 经 _normalize_dept_path 归一(外包折回真实部门)。
+    feishu_users 缺表/为空 → 返回 None（让上层决定是否回退飞连）。任何异常 → 抛出，由上层 graceful。"""
+    if "feishu_users" not in _table_columns_owner(conn):
+        return None
+    rows = conn.execute(
+        "SELECT dept_path FROM feishu_users"
+        " WHERE status='active' AND COALESCE(dept_path,'')<>''"
+    ).fetchall()
+    if not rows:
+        return None
+    counts = {}
+    for (path,) in rows:
+        if not path:
+            continue
+        path = _normalize_dept_path(path)  # 外包归并:合作商路径折回真实部门，与飞连同口径
+        if path:
+            counts[path] = counts.get(path, 0) + 1
+    return counts or None
+
+
+def _table_columns_owner(conn):
+    """库里现有的表名集合（用于 feishu_users 是否存在的探测，避免 PRAGMA 报错）。"""
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    except Exception:
+        return set()
 
 
 def _fetch_dept_headcount():
@@ -1867,40 +1906,64 @@ def _fetch_dept_headcount():
     return counts
 
 
-def _dept_headcount_map():
+def _build_dept_headcount(conn=None):
+    """按 DEPT_HEADCOUNT_SOURCE 选源构建 {部门路径: 在职人数}。
+    feishu(默认): 优先飞书 feishu_users；飞书无数据→回退飞连。
+    feishu_only:  只用飞书；没有就 {}。
+    feilian:      只用飞连(旧行为)。
+    返回 (counts, source_used)。某一源失败按上述策略回退或抛给上层 graceful。"""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    src = _DEPT_HEADCOUNT_SOURCE
+    if src in ("feishu", "feishu_only") and conn is not None:
+        fc = _fetch_dept_headcount_feishu(conn)
+        if fc:
+            return fc, "feishu"
+        if src == "feishu_only":
+            return {}, "feishu_only"
+        # src == "feishu": 飞书没数据 → 回退飞连
+    if src == "feishu_only":
+        return {}, "feishu_only"  # conn 缺失也不回退飞连
+    return _fetch_dept_headcount(), "feilian"
+
+
+def _dept_headcount_map(conn=None):
     """部门完整路径 → 在职总人数。带 6h 文件缓存(DB 同目录 dept_headcount.json)。
-    懒加载、graceful：任何飞连/IO 异常返回空 dict，绝不让 _teams 报错。"""
+    默认数据源飞书(DEPT_HEADCOUNT_SOURCE)，飞书无数据回退飞连。
+    懒加载、graceful：任何数据源/IO 异常返回空 dict(或旧缓存)，绝不让 _teams 报错。
+    缓存按 source 隔离：换源不会吃到旧源的脏缓存。"""
     global _dept_headcount_mem
     if _dept_headcount_mem is not None:
         return _dept_headcount_mem
     now = time.time()
-    # 1) 文件缓存命中且未过期 → 直接用
+    # 1) 文件缓存命中且未过期且同源 → 直接用
     try:
         if os.path.exists(_DEPT_HEADCOUNT_FILE):
             with open(_DEPT_HEADCOUNT_FILE) as f:
                 cached = json.load(f)
             ts = float(cached.get("ts") or 0)
             counts = cached.get("counts") or {}
-            if counts and (now - ts) < _DEPT_HEADCOUNT_TTL:
+            same_src = cached.get("source", "feilian") == _DEPT_HEADCOUNT_SOURCE
+            if counts and same_src and (now - ts) < _DEPT_HEADCOUNT_TTL:
                 _dept_headcount_mem = counts
                 return counts
     except Exception:
         cached = None  # 缓存损坏，往下走重建
     else:
         cached = None
-    # 2) 过期/缺失 → 飞连重建，写盘
+    # 2) 过期/缺失/换源 → 重建，写盘
     try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        counts = _fetch_dept_headcount()
+        counts, source_used = _build_dept_headcount(conn)
         try:
             with open(_DEPT_HEADCOUNT_FILE, "w") as f:
-                json.dump({"ts": now, "counts": counts}, f, ensure_ascii=False)
+                json.dump({"ts": now, "source": _DEPT_HEADCOUNT_SOURCE,
+                           "source_used": source_used, "counts": counts},
+                          f, ensure_ascii=False)
         except Exception:
             pass
         _dept_headcount_mem = counts
         return counts
     except Exception:
-        # 飞连失败：若有旧缓存(即便过期)兜底好过空;否则空 dict
+        # 数据源失败：若有旧缓存(即便过期/异源)兜底好过空;否则空 dict
         try:
             if os.path.exists(_DEPT_HEADCOUNT_FILE):
                 with open(_DEPT_HEADCOUNT_FILE) as f:
@@ -3002,10 +3065,11 @@ class H(BaseHTTPRequestHandler):
                 return max(keeps, key=len)
             return "Keep/未归类"
 
-        # 部门总人数(飞连,缓存,懒加载,graceful)：叶子级 headcount 同样 roll-up 到每级父部门。
+        # 部门总人数(默认飞书组织架构,飞书无数据回退飞连;缓存,懒加载,graceful)：
+        # 叶子级 headcount 同样 roll-up 到每级父部门。
         # 注意:dept_headcount.json 是 6h 文件缓存,旧缓存里仍是未归并的 'Keep/合作商/V/...' 路径,
         # 命中/兜底时不会重算 → 必须在消费点再归一化一次(幂等),否则归并后的真实叶子拿不到 headcount。
-        headcount_map = _dept_headcount_map()
+        headcount_map = _dept_headcount_map(conn)
         node_hc = {}
         for path, cnt in headcount_map.items():
             for anc in _ancestors(_normalize_dept_path(path)):
