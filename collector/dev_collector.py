@@ -3438,12 +3438,12 @@ class H(BaseHTTPRequestHandler):
             hc_staff = node_hc_staff.get(path)
             hc_total = hc_total if (hc_total and hc_total > 0) else None
             hc_staff = hc_staff if (hc_staff and hc_staff > 0) else None
-            # headcount(向后兼容)= 含外包口径;但活跃率分母用员工口径 headcount_staff
-            # (排除外部合作商,2026-06-22 孙可):展示文案是「活跃 X/员工 Y」,分母须与文案一致。
-            # staff 缺失(老库/合作商节点)时回退含外包 total,避免分母为空丢失活跃率。
-            hc = hc_staff if (hc_staff and hc_staff > 0) else hc_total
-            if hc and hc > 0:
-                active_rate = round(people / float(hc) * 100, 1)
+            # 活跃率分母用员工口径 headcount_staff(排除外部合作商,2026-06-22 孙可):
+            # 展示文案是「活跃 X/员工 Y」,分母须与文案一致;staff 缺失(老库/合作商节点)
+            # 时回退含外包 total,避免分母为空丢失活跃率。
+            rate_denom = hc_staff if (hc_staff and hc_staff > 0) else hc_total
+            if rate_denom and rate_denom > 0:
+                active_rate = round(people / float(rate_denom) * 100, 1)
             else:
                 active_rate = None
             result.append({
@@ -3452,7 +3452,9 @@ class H(BaseHTTPRequestHandler):
                 "people": people,             # 活跃人数(token∪aily),供活跃渗透
                 "token_people": token_people,
                 "aily_people": aily_people,
-                "headcount": hc,                  # = headcount_total(含外包),向后兼容
+                # legacy headcount = 含外包 total(与字段注释/历史飞连总数语义一致;
+                # 旧 API 消费方拿到的是总数,不是员工口径)。活跃率分母另用 staff,见上。
+                "headcount": hc_total,            # = headcount_total(含外包),向后兼容
                 "headcount_total": hc_total,      # 含外包(全量 member_count)
                 "headcount_staff": hc_staff,      # 员工(排除外部合作商子树)
                 "active_rate": active_rate,
