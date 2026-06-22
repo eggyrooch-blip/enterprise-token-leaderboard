@@ -236,6 +236,72 @@ def test_owner_trend_no_filter_returns_owned_subtree(dc):
     }]
 
 
+def test_owner_trend_no_filter_allows_business_outsourcing_source_owner(dc):
+    conn = dc.db()
+    source = "Keep/合作商/W/深圳市奋达科技股份有限公司(SP000053)"
+    target = "Keep/运动消费事业部/智能装备及运动电子交付部/软件研发部/固件组"
+    conn.execute(
+        "INSERT OR REPLACE INTO people(email,name,avatar,dept,raw_dept,effective_dept,spend_bucket)"
+        " VALUES(?,?,?,?,?,?,?)",
+        ("wb-chenliling", "陈丽玲", "", target, source, target, "business_outsourcing"),
+    )
+    conn.execute(dc._UPSERT_SQL, (
+        "wb-chenliling", target, "month", "2026-06", "litellm", "Claude Code", "",
+        "model-x", 10, 0, 0, 0, 0, 10, 1.0, 1))
+    conn.execute(
+        "UPDATE usage SET raw_dept=?, effective_dept=?, spend_bucket=? WHERE email=?",
+        (source, target, "business_outsourcing", "wb-chenliling"),
+    )
+    conn.execute(dc._UPSERT_SQL, (
+        "other@keep.com", "Keep/客户服务中心", "month", "2026-06", "litellm",
+        "Claude Code", "", "model-x", 400, 0, 0, 0, 0, 400, 1.0, 1))
+    conn.execute(
+        "INSERT INTO roles(email,role,dept_id,dept_path,source,updated_at)"
+        " VALUES('vendor-owner@keep.com','department_owner','d_vendor',?,'t','t')",
+        (source,),
+    )
+    conn.commit()
+
+    owner = dc._user_roles(conn, "vendor-owner@keep.com")
+    h = _handler(dc, owner)
+    dc.H._trend(h, conn, {})
+
+    assert h.captured["code"] == 200
+    assert h.captured["obj"]["email"] is None
+    assert h.captured["obj"]["trend"][0]["tokens"] == 10
+
+
+def test_owner_trend_explicit_user_allows_business_outsourcing_source_owner(dc):
+    conn = dc.db()
+    source = "Keep/合作商/W/深圳市奋达科技股份有限公司(SP000053)"
+    target = "Keep/运动消费事业部/智能装备及运动电子交付部/软件研发部/固件组"
+    conn.execute(
+        "INSERT OR REPLACE INTO people(email,name,avatar,dept,raw_dept,effective_dept,spend_bucket)"
+        " VALUES(?,?,?,?,?,?,?)",
+        ("wb-chenliling", "陈丽玲", "", target, source, target, "business_outsourcing"),
+    )
+    conn.execute(dc._UPSERT_SQL, (
+        "wb-chenliling", target, "month", "2026-06", "litellm", "Claude Code", "",
+        "model-x", 10, 0, 0, 0, 0, 10, 1.0, 1))
+    conn.execute(
+        "UPDATE usage SET raw_dept=?, effective_dept=?, spend_bucket=? WHERE email=?",
+        (source, target, "business_outsourcing", "wb-chenliling"),
+    )
+    conn.execute(
+        "INSERT INTO roles(email,role,dept_id,dept_path,source,updated_at)"
+        " VALUES('vendor-owner@keep.com','department_owner','d_vendor',?,'t','t')",
+        (source,),
+    )
+    conn.commit()
+
+    owner = dc._user_roles(conn, "vendor-owner@keep.com")
+    h = _handler(dc, owner)
+    dc.H._trend(h, conn, {"email": ["wb-chenliling"]})
+
+    assert h.captured["code"] == 200
+    assert h.captured["obj"]["email"] == "wb-chenliling"
+
+
 def test_owner_trend_outside_scope_is_403(dc):
     conn = dc.db()
     _seed(dc, conn)

@@ -40,5 +40,7 @@ def test_ops_docs_include_feishu_directory_sync_prerequisites():
 
     assert "FEISHU_ROOT_DEPT" in text
     assert "AUTH_ADMIN_EMAILS" in text
+    assert "AUTH_ADMIN_USER_IDS" in text
+    assert "open_id" in text
     assert "contact-read" in text
     assert "feishu-directory-sync.timer" in text

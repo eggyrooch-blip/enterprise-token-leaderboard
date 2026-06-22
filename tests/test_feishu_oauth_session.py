@@ -113,6 +113,26 @@ def test_session_roundtrip_and_expiry(conn):
     assert dc.session_email(conn, sid, now=1002) is None
 
 
+def test_session_prefers_open_id_identity(conn):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS feishu_users(open_id TEXT PRIMARY KEY, user_id TEXT,"
+        " union_id TEXT, email TEXT, name TEXT, dept_id TEXT, dept_path TEXT, status TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO feishu_users(open_id,user_id,union_id,email,name,dept_path,status)"
+        " VALUES('ou_emp','u_emp','on_emp','emp@keep.com','员工','技术平台部','active')"
+    )
+    sid = dc.create_session(
+        conn,
+        {"open_id": "ou_emp", "user_id": "u_emp", "union_id": "on_emp",
+         "email": "", "name": "员工"},
+        now=1000,
+    )
+
+    assert dc.session_identity(conn, sid, now=1001)["open_id"] == "ou_emp"
+    assert dc.session_email(conn, sid, now=1001) == "emp@keep.com"
+
+
 def test_session_unknown_sid(conn):
     assert dc.session_email(conn, "missing", now=1) is None
     assert dc.session_email(conn, None) is None
@@ -143,6 +163,8 @@ def test_exchange_code_returns_profile(monkeypatch):
     info = dc.feishu_exchange_code("the-code")
     assert info["email"] == "emp@keep.com"
     assert info["open_id"] == "ou_emp"
+    assert info["user_id"] == ""
+    assert info["union_id"] == ""
     assert any("oauth/token" in u for u in calls)
     assert any("user_info" in u for u in calls)
 
@@ -176,6 +198,28 @@ def test_me_returns_identity_with_session(conn):
     assert obj["is_admin"] is False
 
 
+def test_me_returns_identity_with_open_id_session(conn):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS feishu_users(open_id TEXT PRIMARY KEY, user_id TEXT,"
+        " union_id TEXT, email TEXT, name TEXT, dept_id TEXT, dept_path TEXT, status TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO feishu_users(open_id,user_id,union_id,email,name,dept_path,status)"
+        " VALUES('ou_emp','u_emp','on_emp','emp@keep.com','员工','技术平台部','active')"
+    )
+    sid = dc.create_session(conn, {"open_id": "ou_emp", "email": "", "name": "员工"})
+    h = _handler(cookie="%s=%s" % (dc.SESSION_COOKIE, sid))
+    h._me(conn)
+
+    _, code, obj = h.captured[0]
+    assert code == 200
+    assert obj["open_id"] == "ou_emp"
+    assert obj["user_id"] == "u_emp"
+    assert obj["union_id"] == "on_emp"
+    assert obj["email"] == "emp@keep.com"
+    assert obj["name"] == "员工"
+
+
 def test_me_reports_admin_for_super_admin(conn):
     sid = dc.create_session(conn, "sunke@keep.com")
     h = _handler(cookie="%s=%s" % (dc.SESSION_COOKIE, sid))
@@ -189,24 +233,51 @@ def test_me_reports_admin_for_super_admin(conn):
 # --------------------------------------------------------------------------- #
 def test_callback_with_email_creates_session_and_cookie(conn, monkeypatch):
     monkeypatch.setattr(dc, "feishu_exchange_code",
-                        lambda code: {"email": "emp@keep.com", "name": "员工", "open_id": "o"})
+                        lambda code: {"email": "emp@keep.com", "name": "员工", "open_id": "ou_emp",
+                                      "user_id": "u_emp", "union_id": "on_emp"})
     state = dc.create_oauth_state(conn, "/dashboard")
     h = _handler()
     h._auth_callback(conn, {"code": ["c"], "state": [state]})
     kind, location, set_cookie, clear = h.captured[0]
     assert kind == "redirect" and location == "/dashboard"
     assert set_cookie  # a session id cookie was set
+    ident = dc.session_identity(conn, set_cookie)
+    assert ident["open_id"] == "ou_emp"
+    assert ident["user_id"] == "u_emp"
+    assert ident["union_id"] == "on_emp"
     assert dc.session_email(conn, set_cookie) == "emp@keep.com"
 
 
-def test_callback_missing_email_is_403_no_session(conn, monkeypatch):
+def test_callback_open_id_only_creates_session_when_directory_can_resolve(conn, monkeypatch):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS feishu_users(open_id TEXT PRIMARY KEY, user_id TEXT,"
+        " union_id TEXT, email TEXT, name TEXT, dept_id TEXT, dept_path TEXT, status TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO feishu_users(open_id,user_id,union_id,email,name,dept_path,status)"
+        " VALUES('ou_x','u_x','on_x','vendor@keep.com','供应商','合作商/W','active')"
+    )
     monkeypatch.setattr(dc, "feishu_exchange_code",
-                        lambda code: {"email": "", "name": "供应商", "open_id": "ou_x"})
+                        lambda code: {"email": "", "name": "供应商", "open_id": "ou_x",
+                                      "user_id": "", "union_id": "on_x"})
+    state = dc.create_oauth_state(conn, "/")
+    h = _handler()
+    h._auth_callback(conn, {"code": ["c"], "state": [state]})
+
+    kind, location, set_cookie, clear = h.captured[0]
+    assert kind == "redirect" and location == "/"
+    assert dc.session_identity(conn, set_cookie)["open_id"] == "ou_x"
+    assert dc.session_email(conn, set_cookie) == "vendor@keep.com"
+
+
+def test_callback_missing_stable_identity_is_403_no_session(conn, monkeypatch):
+    monkeypatch.setattr(dc, "feishu_exchange_code",
+                        lambda code: {"email": "", "name": "供应商", "open_id": ""})
     state = dc.create_oauth_state(conn, "/")
     h = _handler()
     h._auth_callback(conn, {"code": ["c"], "state": [state]})
     assert h.captured == [("send", 403,
-                           {"error": "feishu profile has no email; access denied"})]
+                           {"error": "feishu profile has no stable identity; access denied"})]
     # no session rows created
     assert conn.execute("SELECT COUNT(*) FROM auth_sessions").fetchone()[0] == 0
 

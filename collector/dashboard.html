@@ -69,9 +69,14 @@
   .rglab{font:600 13px var(--font);color:rgba(255,255,255,.9);white-space:nowrap;flex:0 0 auto}
   .rgsep{font:400 12px var(--font);color:rgba(255,255,255,.55);flex:0 0 auto}
   .rgcur{margin-left:auto;font:600 12px var(--font);color:#7CF0C0}
-  .authbar{display:inline-flex;align-items:center;gap:8px;flex:0 0 auto}
-  .authbar .who{max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  .authbar{display:inline-flex;align-items:center;gap:7px;flex:0 1 auto;min-width:0}
+  .auth-main{display:inline-flex;align-items:center;gap:6px;min-width:0}
+  .authbar .who{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
     font:600 12px var(--font);color:rgba(255,255,255,.88)}
+  .scope-pill{height:22px;padding:0 8px;border-radius:999px;background:rgba(36,199,137,.20);
+    color:#7CF0C0;font:700 11px var(--font);display:inline-flex;align-items:center;white-space:nowrap}
+  .auth-role,.scope-hint{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    font:600 11px var(--font);color:rgba(255,255,255,.56)}
   /* list */
   .card{background:#fff;border-radius:14px;padding:6px 24px;box-shadow:var(--shadow)}
   .r{display:flex;align-items:center;gap:14px;padding:15px 0;border-bottom:1px solid var(--div);transition:background .12s ease}
@@ -314,14 +319,35 @@ function fmtHeadcountSub(x){
 }
 function loginHref(){return '/v1/auth/login?next='+encodeURIComponent(location.pathname+location.search);}
 function loginHtml(){return '<a class="rg" href="'+loginHref()+'">登录</a>';}
+function authRoleLabel(r){
+  return ({admin:'超管',department_owner:'负责人',member:'成员'})[r]||r;
+}
+function authScopeLabel(scope){
+  return ({global:'全局',department:'部门',self:'个人'})[scope]||'个人';
+}
+function authScopeHint(me){
+  if(me.scope==='global') return '全公司';
+  if(me.scope==='department'){
+    var owned=(me.owned_departments||[]).map(stripKeep).filter(Boolean);
+    if(!owned.length) return '部门';
+    return owned.slice(0,2).join('、')+(owned.length>2?' 等 '+owned.length+' 个':'');
+  }
+  return me.email||me.open_id||'个人';
+}
 async function fillAuth(){
   var el=$('authbar'); if(!el) return;
   try{
     var r=await fetch('/v1/me',{credentials:'same-origin'});
     if(!r.ok){el.innerHTML=loginHtml();return;}
     var me=await r.json();
-    var label=me.name||me.email||'已登录';
-    el.innerHTML='<span class="who">'+esc(label)+'</span><a class="rg" href="/v1/auth/logout">退出</a>';
+    var label=me.name||me.email||me.open_id||'已登录';
+    var roles=(me.roles||[]).map(authRoleLabel).join(' / ');
+    var hint=authScopeHint(me);
+    var fullHint=(me.owned_departments||[]).map(stripKeep).join('、')||me.email||me.open_id||'';
+    el.innerHTML='<span class="auth-main"><span class="who" title="'+esc(me.email||me.open_id||label)+'">'+esc(label)+'</span><span class="scope-pill">'+esc(authScopeLabel(me.scope))+'</span></span>'
+      +(roles?'<span class="auth-role">'+esc(roles)+'</span>':'')
+      +(hint?'<span class="scope-hint" title="'+esc(fullHint)+'">'+esc(hint)+'</span>':'')
+      +'<a class="rg" href="/v1/auth/logout">退出</a>';
   }catch(e){el.innerHTML=loginHtml();}
 }
 async function j(u){

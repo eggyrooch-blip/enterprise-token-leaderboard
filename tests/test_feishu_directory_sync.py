@@ -162,6 +162,49 @@ def test_non_outsourcing_is_direct_employee_bucket():
     assert a["active"] == 1
 
 
+def test_personnel_outsourcing_v_source_maps_to_internal_department():
+    departments = [
+        {"dept_id": "d_tech", "parent_id": "0", "name": "技术平台部",
+         "leader_user_id": "ou_yuguangcan"},
+        {"dept_id": "d_info", "parent_id": "d_tech", "name": "信息化技术部",
+         "leader_user_id": "ou_hanmeng"},
+        {"dept_id": "d_info_rd", "parent_id": "d_info", "name": "信息化研发组",
+         "leader_user_id": "ou_hudi"},
+        {"dept_id": "d_partner", "parent_id": "0", "name": "合作商"},
+        {"dept_id": "d_v", "parent_id": "d_partner", "name": "V"},
+        {"dept_id": "00045_v", "parent_id": "d_v",
+         "name": "技术平台部-信息化技术部-信息化研发组",
+         "leader_user_id": "ou_hudi"},
+    ]
+    path_by_id = fds.build_department_paths(departments)
+    for d in departments:
+        d["path"] = path_by_id[d["dept_id"]]
+    users = [
+        {"open_id": "ou_yuguangcan", "user_id": "yuguangcan",
+         "email": "yuguangcan@keep.com", "dept_id": "d_tech",
+         "dept_path": path_by_id["d_tech"]},
+        {"open_id": "ou_hanmeng", "user_id": "hanmeng",
+         "email": "hanmeng@keep.com", "dept_id": "d_info",
+         "dept_path": path_by_id["d_info"]},
+        {"open_id": "ou_hudi", "user_id": "hudi",
+         "email": "hudi@keep.com", "dept_id": "d_info_rd",
+         "dept_path": path_by_id["d_info_rd"]},
+        {"open_id": "ou_chenghaichao", "user_id": "chenghaichao_v",
+         "email": "chenghaichao_v@keep.com", "dept_id": "00045_v",
+         "dept_path": path_by_id["00045_v"]},
+    ]
+
+    attrs = {a["source_dept_id"]: a for a in
+             fds.derive_department_attributions(departments, users)}
+
+    a = attrs["00045_v"]
+    assert a["source_dept_path"] == "合作商/V/技术平台部-信息化技术部-信息化研发组"
+    assert a["target_dept_id"] == "d_info_rd"
+    assert a["target_dept_path"] == "技术平台部/信息化技术部/信息化研发组"
+    assert a["spend_bucket"] == fds.BUCKET_EMPLOYEE
+    assert a["active"] == 1
+
+
 def test_key_conflict_marks_both_inactive():
     deps, pbi = _paths()
     # two distinct ids that normalize to the same key
@@ -241,6 +284,19 @@ def test_snapshot_writes_owner_and_admin_roles():
     assert ("leader@keep.com", "department_owner") in roles
     assert ("owner@keep.com", "department_owner") in roles
     assert ("sunke@keep.com", "admin") in roles
+
+
+def test_snapshot_resolves_admin_user_ids_to_email_roles():
+    deps, _ = _paths()
+    conn = sqlite3.connect(":memory:")
+
+    fds.write_directory_snapshot(
+        conn, _users(), deps, admin_user_ids=["u2", "ou_leader"], synced_at=1)
+
+    roles = conn.execute(
+        "SELECT email, role FROM roles ORDER BY email, role").fetchall()
+    assert ("owner@keep.com", "admin") in roles
+    assert ("leader@keep.com", "admin") in roles
 
 
 def test_snapshot_does_not_grant_owner_role_to_inactive_leader():

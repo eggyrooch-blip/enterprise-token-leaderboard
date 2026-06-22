@@ -238,10 +238,15 @@ SQLite 部署为准。
 
 **前置**：`pipeline/.env` 里需含 `FEISHU_APP_ID` + `FEISHU_APP_SECRET`，同一 bot
 必须开启 contact-read 通讯录读取权限，并对所有需要统计/授权的部门有可见范围。
-`FEISHU_ROOT_DEPT` 默认 `0`；`AUTH_ADMIN_EMAILS` 用于补充管理员 allowlist，
-`sunke@keep.com` 仍由代码固定为超管兜底。管理员确认业务外包归并后，可在 `.env`
+`FEISHU_ROOT_DEPT` 默认 `0`；`AUTH_ADMIN_EMAILS` 用于补充管理员邮箱 allowlist，
+`AUTH_ADMIN_USER_IDS` 支持飞书 `user_id`/`open_id`（同步时从 `feishu_users` 解析为邮箱
+写入 `roles`），`sunke@keep.com` 仍由代码固定为超管兜底。管理员确认业务外包归并后，可在 `.env`
 设置 `FEISHU_DEPT_ATTRIBUTION_OVERRIDES=/path/to/department-overrides.json`；JSON 支持
 `{"合作商/W/供应商(SPxxxxxx)": {"target_dept_path": "真实业务部门路径"}}`。
+
+**OAuth 身份口径**：飞书授权码回调只带 `code`；服务端用 code 换 `user_access_token`，
+再调用 `authen/v1/user_info` 获取身份。会话主键保存 `open_id`（飞书定义为应用内唯一标识），
+`email`、`user_id`、`union_id` 只作为展示、目录关联和管理员配置兜底；不要把邮箱当登录主键。
 
 **手动运维**：
 ```bash

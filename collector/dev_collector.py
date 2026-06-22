@@ -402,6 +402,10 @@ def ensure_auth_tables(conn):
         created_at INTEGER,
         expires_at INTEGER,
         last_seen_at INTEGER)""")
+    _add_column_if_missing(conn, "auth_sessions", "open_id", "open_id TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "auth_sessions", "user_id", "user_id TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "auth_sessions", "union_id", "union_id TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "auth_sessions", "name", "name TEXT DEFAULT ''")
 
 
 def _ensure_app_state_table(conn):
@@ -720,6 +724,8 @@ def feishu_exchange_code(code):
         "email": (d.get("email") or d.get("enterprise_email") or "").strip().lower(),
         "name": d.get("name") or "",
         "open_id": d.get("open_id") or "",
+        "user_id": d.get("user_id") or "",
+        "union_id": d.get("union_id") or "",
     }
 
 
@@ -749,23 +755,81 @@ def consume_oauth_state(conn, state, now=None):
     return row[0] or "/"
 
 
-def create_session(conn, email, now=None):
+def _session_profile_from_directory(conn, identity):
+    ident = dict(identity or {})
+    open_id = (ident.get("open_id") or "").strip()
+    if not open_id:
+        return ident
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(email,''), COALESCE(user_id,''), COALESCE(union_id,''),"
+            " COALESCE(name,'') FROM feishu_users WHERE open_id=?",
+            (open_id,),
+        ).fetchone()
+    except Exception:
+        row = None
+    if row:
+        if not ident.get("email") and row[0]:
+            ident["email"] = row[0]
+        if not ident.get("user_id") and row[1]:
+            ident["user_id"] = row[1]
+        if not ident.get("union_id") and row[2]:
+            ident["union_id"] = row[2]
+        if not ident.get("name") and row[3]:
+            ident["name"] = row[3]
+    return ident
+
+
+def _normalize_session_identity(conn, identity):
+    if isinstance(identity, dict):
+        ident = {
+            "email": (identity.get("email") or "").strip().lower(),
+            "open_id": (identity.get("open_id") or "").strip(),
+            "user_id": (identity.get("user_id") or "").strip(),
+            "union_id": (identity.get("union_id") or "").strip(),
+            "name": (identity.get("name") or "").strip(),
+        }
+    else:
+        ident = {
+            "email": (identity or "").strip().lower(),
+            "open_id": "",
+            "user_id": "",
+            "union_id": "",
+            "name": "",
+        }
+    return _session_profile_from_directory(conn, ident)
+
+
+def create_session(conn, identity, now=None):
     now = int(now if now is not None else time.time())
     sid = _secrets.token_urlsafe(32)
+    ident = _normalize_session_identity(conn, identity)
     conn.execute(
-        "INSERT INTO auth_sessions(sid,email,created_at,expires_at,last_seen_at)"
-        " VALUES(?,?,?,?,?)",
-        (sid, (email or "").strip().lower(), now, now + SESSION_TTL, now))
+        "INSERT INTO auth_sessions(sid,email,created_at,expires_at,last_seen_at,"
+        " open_id,user_id,union_id,name) VALUES(?,?,?,?,?,?,?,?,?)",
+        (
+            sid,
+            ident["email"],
+            now,
+            now + SESSION_TTL,
+            now,
+            ident["open_id"],
+            ident["user_id"],
+            ident["union_id"],
+            ident["name"],
+        ))
     conn.commit()
     return sid
 
 
-def session_email(conn, sid, now=None):
+def session_identity(conn, sid, now=None):
     if not sid:
         return None
     now = int(now if now is not None else time.time())
     row = conn.execute(
-        "SELECT email, expires_at FROM auth_sessions WHERE sid=?", (sid,)).fetchone()
+        "SELECT email, expires_at, COALESCE(open_id,''), COALESCE(user_id,''),"
+        " COALESCE(union_id,''), COALESCE(name,'') FROM auth_sessions WHERE sid=?",
+        (sid,)).fetchone()
     if not row:
         return None
     if row[1] and now > int(row[1]):
@@ -774,7 +838,25 @@ def session_email(conn, sid, now=None):
         return None
     conn.execute("UPDATE auth_sessions SET last_seen_at=? WHERE sid=?", (now, sid))
     conn.commit()
-    return row[0]
+    ident = _session_profile_from_directory(conn, {
+        "email": row[0] or "",
+        "open_id": row[2] or "",
+        "user_id": row[3] or "",
+        "union_id": row[4] or "",
+        "name": row[5] or "",
+    })
+    return {
+        "email": (ident.get("email") or "").strip().lower(),
+        "open_id": ident.get("open_id") or "",
+        "user_id": ident.get("user_id") or "",
+        "union_id": ident.get("union_id") or "",
+        "name": ident.get("name") or "",
+    }
+
+
+def session_email(conn, sid, now=None):
+    ident = session_identity(conn, sid, now)
+    return ident["email"] if ident else None
 
 
 def delete_session(conn, sid):
@@ -783,11 +865,30 @@ def delete_session(conn, sid):
         conn.commit()
 
 
-def email_in_scope(roleinfo, row_email, row_dept_path=""):
+def _path_candidates(row_dept_path="", extra_dept_paths=()):
+    paths = []
+    for p in [row_dept_path] + list(extra_dept_paths or []):
+        if not p:
+            continue
+        if isinstance(p, (list, tuple, set)):
+            paths.extend([x for x in p if x])
+        else:
+            paths.append(p)
+    out, seen = [], set()
+    for p in paths:
+        key = _canonical_dept_key(p)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def email_in_scope(roleinfo, row_email, row_dept_path="", extra_dept_paths=()):
     """Pure row-visibility predicate for a (person email, dept path) under a role.
 
     admin -> everything; member -> only self; department_owner -> own dept
-    subtree (by canonical dept key prefix) plus self.
+    subtree (by canonical dept key prefix) plus self. For attributed outsourcing,
+    callers can pass raw source and effective target paths in ``extra_dept_paths``.
     """
     if not roleinfo:
         return False
@@ -797,13 +898,14 @@ def email_in_scope(roleinfo, row_email, row_dept_path=""):
     if (row_email or "").strip().lower() == me:
         return True
     if roleinfo.get("scope") == "department":
-        rp = _canonical_dept_key(row_dept_path)
-        if not rp:
-            return False
-        for owned in roleinfo.get("owned_departments", []):
-            ok = _canonical_dept_key(owned)
-            if ok and (rp == ok or rp.startswith(ok + "/")):
-                return True
+        for path in _path_candidates(row_dept_path, extra_dept_paths):
+            rp = _canonical_dept_key(path)
+            if not rp:
+                continue
+            for owned in roleinfo.get("owned_departments", []):
+                ok = _canonical_dept_key(owned)
+                if ok and (rp == ok or rp.startswith(ok + "/")):
+                    return True
     return False
 
 
@@ -824,7 +926,12 @@ def filter_person_rows_for_auth(rows, auth_user):
         return rows
     return [
         r for r in rows
-        if email_in_scope(auth_user, r.get("email") or r.get("user"), r.get("dept") or "")
+        if email_in_scope(
+            auth_user,
+            r.get("email") or r.get("user"),
+            r.get("effective_dept") or r.get("dept") or "",
+            r.get("visible_dept_paths") or [r.get("raw_dept") or "", r.get("dept") or ""],
+        )
     ]
 
 
@@ -2251,11 +2358,43 @@ def _personal_board_rows(conn, qs, auth_user=None):
         GROUP BY u.email, u.client
     """ % (where, dep_clause, ex_clause), params + ex_params).fetchall():
         comp.setdefault(cr[0], []).append({"client": cr[1], "tokens": cr[2] or 0})
+    usage_cols = _table_columns(conn, "usage")
+    people_cols = _table_columns(conn, "people")
+    u_raw_expr = "COALESCE(NULLIF(u.raw_dept,''), u.dept)" if "raw_dept" in usage_cols else "u.dept"
+    u_eff_expr = "COALESCE(NULLIF(u.effective_dept,''), u.dept)" if "effective_dept" in usage_cols else "u.dept"
+    p_raw_expr = "COALESCE(NULLIF(p.raw_dept,''), '')" if "raw_dept" in people_cols else "''"
+    p_eff_expr = (
+        "COALESCE(NULLIF(p.effective_dept,''), NULLIF(p.dept,''), '')"
+        if "effective_dept" in people_cols else
+        "COALESCE(NULLIF(p.dept,''), '')"
+    )
+    visible_paths = {}
+    for pr in conn.execute("""
+        SELECT u.email,
+               {u_raw_expr},
+               {u_eff_expr},
+               {p_raw_expr},
+               {p_eff_expr}
+        FROM usage u LEFT JOIN people p ON p.email = u.email
+        WHERE %s AND u.source != 'litellm_agent'
+          AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s
+        GROUP BY 1,2,3,4,5
+    """.format(
+        u_raw_expr=u_raw_expr,
+        u_eff_expr=u_eff_expr,
+        p_raw_expr=p_raw_expr,
+        p_eff_expr=p_eff_expr,
+    ) % (where, dep_clause, ex_clause), params + ex_params).fetchall():
+        paths = visible_paths.setdefault(pr[0], [])
+        for p in pr[1:]:
+            if p and p not in paths:
+                paths.append(p)
     result = []
     by_email = {}
     for r in rows:
         row = {
             "email": r[0], "dept": _to_keep(r[13]) or _normalize_dept_path(r[1]),
+            "visible_dept_paths": visible_paths.get(r[0], []),
             "input": r[2] or 0, "output": r[3] or 0,
             "cache_read": r[4] or 0, "cache_write": r[5] or 0,
             "reasoning": r[6] or 0, "tokens": r[7] or 0,
@@ -2345,6 +2484,9 @@ def _personal_board_rows(conn, qs, auth_user=None):
         m["cost"] = round(float(m["cost"] or 0) + float(row["cost"] or 0), 4)
         m["messages"] = (m.get("messages") or 0) + (row.get("messages") or 0)
         m["composition"].extend(row["composition"])
+        for path in row.get("visible_dept_paths") or []:
+            if path and path not in m.setdefault("visible_dept_paths", []):
+                m["visible_dept_paths"].append(path)
         if row.get("feishu_credits"):
             m["feishu_credits"] = (m.get("feishu_credits") or 0) + row["feishu_credits"]
     result = filter_person_rows_for_auth(list(merged.values()), auth_user)
@@ -2354,6 +2496,7 @@ def _personal_board_rows(conn, qs, auth_user=None):
         for x in row["composition"]:
             x["pct"] = round(x["tokens"] / tot * 100, 1) if tot else 0
         row["composition"].sort(key=lambda x: x["tokens"], reverse=True)
+        row.pop("visible_dept_paths", None)
     result.sort(key=lambda x: x["tokens"] or 0, reverse=True)
     return result
 
@@ -2392,10 +2535,18 @@ class H(BaseHTTPRequestHandler):
     def _session_user(self, conn):
         """Return _user_roles dict for the cookie session, or None."""
         sid = self._parse_cookies().get(SESSION_COOKIE)
-        email = session_email(conn, sid)
-        if not email:
+        ident = session_identity(conn, sid)
+        if not ident or not (ident.get("email") or ident.get("open_id")):
             return None
-        return _user_roles(conn, email)
+        user = _user_roles(conn, ident.get("email") or ident.get("open_id") or "")
+        user.update({
+            "email": ident.get("email") or user.get("email") or "",
+            "open_id": ident.get("open_id") or "",
+            "user_id": ident.get("user_id") or "",
+            "union_id": ident.get("union_id") or "",
+            "name": ident.get("name") or "",
+        })
+        return user
 
     def _scope_rows(self, rows):
         """Filter per-person / per-dept row dicts to the caller's visible scope.
@@ -2409,7 +2560,11 @@ class H(BaseHTTPRequestHandler):
         return [r for r in rows
                 if isinstance(r, dict) and email_in_scope(
                     user, r.get("email", ""),
-                    r.get("effective_dept") or r.get("dept", ""))]
+                    r.get("effective_dept") or r.get("dept", ""),
+                    r.get("visible_dept_paths") or [
+                        r.get("raw_dept") or "",
+                        r.get("dept") or "",
+                    ])]
 
     def _set_scope_arg(self, auth_user):
         if auth_user is not None:
@@ -2455,11 +2610,9 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001 - surface upstream failure, never 200
             return self._send(502, {"error": "feishu code exchange failed",
                                     "detail": str(e)[:200]})
-        email = (info.get("email") or "").strip().lower()
-        if not email:
-            # No open_id-only / empty-email sessions — hard 403 per security model.
-            return self._send(403, {"error": "feishu profile has no email; access denied"})
-        sid = create_session(conn, email)
+        if not ((info.get("open_id") or "").strip() or (info.get("email") or "").strip()):
+            return self._send(403, {"error": "feishu profile has no stable identity; access denied"})
+        sid = create_session(conn, info)
         return self._send_redirect(redirect or "/", set_cookie=sid)
 
     def _auth_logout(self, conn):
@@ -2470,17 +2623,26 @@ class H(BaseHTTPRequestHandler):
         user = self._session_user(conn)
         if not user:
             return self._send(401, {"error": "not authenticated"})
-        name, dept = "", ""
+        name, dept = user.get("name") or "", ""
         try:
-            row = conn.execute(
-                "SELECT COALESCE(name,''), COALESCE(effective_dept, dept, '')"
-                " FROM people WHERE lower(email)=?", (user["email"],)).fetchone()
+            row = None
+            if user.get("email"):
+                row = conn.execute(
+                    "SELECT COALESCE(name,''), COALESCE(effective_dept, dept, '')"
+                    " FROM people WHERE lower(email)=?", (user["email"],)).fetchone()
+            if not row and user.get("open_id"):
+                row = conn.execute(
+                    "SELECT COALESCE(name,''), COALESCE(dept_path,'')"
+                    " FROM feishu_users WHERE open_id=?", (user["open_id"],)).fetchone()
             if row:
-                name, dept = row[0], row[1]
+                name = row[0] or name
+                dept = row[1]
         except Exception:
             pass
         return self._send(200, {
-            "email": user["email"], "name": name, "dept": dept,
+            "email": user["email"], "open_id": user.get("open_id") or "",
+            "user_id": user.get("user_id") or "", "union_id": user.get("union_id") or "",
+            "name": name, "dept": dept,
             "roles": user["roles"], "scope": user["scope"],
             "is_admin": user["is_admin"],
             "owned_departments": user["owned_departments"],
@@ -2946,8 +3108,8 @@ class H(BaseHTTPRequestHandler):
             self._scope_user = auth_user
         cli = (qs.get("client") or [None])[0]
         if not cli:
-            return self._send(200, {"leaderboard": filter_person_rows_for_auth(
-                _personal_board_rows(conn, qs), getattr(self, "_scope_user", None))})
+            return self._send(200, {"leaderboard": _personal_board_rows(
+                conn, qs, auth_user=getattr(self, "_scope_user", None))})
         where, params = _range_clause(qs, "u.")
         sd = _show_departed(qs)
         dep_clause = _departed_filter(sd, "u.")
@@ -2989,6 +3151,33 @@ class H(BaseHTTPRequestHandler):
             GROUP BY u.email, u.client
         """ % (where, dep_clause, ex_clause, cli_clause), params2).fetchall():
             comp.setdefault(cr[0], []).append({"client": cr[1], "tokens": cr[2] or 0})
+        usage_cols = _table_columns(conn, "usage")
+        people_cols = _table_columns(conn, "people")
+        u_raw_expr = "COALESCE(NULLIF(u.raw_dept,''), u.dept)" if "raw_dept" in usage_cols else "u.dept"
+        u_eff_expr = "COALESCE(NULLIF(u.effective_dept,''), u.dept)" if "effective_dept" in usage_cols else "u.dept"
+        p_raw_expr = "COALESCE(NULLIF(p.raw_dept,''), '')" if "raw_dept" in people_cols else "''"
+        p_eff_expr = (
+            "COALESCE(NULLIF(p.effective_dept,''), NULLIF(p.dept,''), '')"
+            if "effective_dept" in people_cols else
+            "COALESCE(NULLIF(p.dept,''), '')"
+        )
+        visible_paths = {}
+        for pr in conn.execute("""
+            SELECT u.email, {u_raw_expr}, {u_eff_expr}, {p_raw_expr}, {p_eff_expr}
+            FROM usage u LEFT JOIN people p ON p.email = u.email
+            WHERE %s AND u.source != 'litellm_agent'
+              AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s%s
+            GROUP BY 1,2,3,4,5
+        """.format(
+            u_raw_expr=u_raw_expr,
+            u_eff_expr=u_eff_expr,
+            p_raw_expr=p_raw_expr,
+            p_eff_expr=p_eff_expr,
+        ) % (where, dep_clause, ex_clause, cli_clause), params2).fetchall():
+            paths = visible_paths.setdefault(pr[0], [])
+            for p in pr[1:]:
+                if p and p not in paths:
+                    paths.append(p)
         result = []
         by_email = {}
         for r in rows:
@@ -2996,6 +3185,7 @@ class H(BaseHTTPRequestHandler):
             # 否则 LiteLLM 团队别名(裸"技术平台部")会被 MAX 误选盖掉飞连全路径(中文排在 'K' 之后)。
             row = {
                 "email": r[0], "dept": _to_keep(r[13]) or _normalize_dept_path(r[1]),
+                "visible_dept_paths": visible_paths.get(r[0], []),
                 "input": r[2] or 0, "output": r[3] or 0,
                 "cache_read": r[4] or 0, "cache_write": r[5] or 0,
                 "reasoning": r[6] or 0, "tokens": r[7] or 0,
@@ -3095,8 +3285,10 @@ class H(BaseHTTPRequestHandler):
                 x["pct"] = round(x["tokens"] / tot * 100, 1) if tot else 0
             row["composition"].sort(key=lambda x: x["tokens"], reverse=True)
         result.sort(key=lambda x: x["tokens"] or 0, reverse=True)
-        self._send(200, {"leaderboard": filter_person_rows_for_auth(
-            result, getattr(self, "_scope_user", None))})
+        result = filter_person_rows_for_auth(result, getattr(self, "_scope_user", None))
+        for row in result:
+            row.pop("visible_dept_paths", None)
+        self._send(200, {"leaderboard": result})
 
     def _agent_leaderboard(self, conn, qs):
         """Agent 专属榜:只看 source='litellm_agent', 按 key_alias(email='agent:<alias>')聚合.
@@ -3249,7 +3441,12 @@ class H(BaseHTTPRequestHandler):
         if scope_user and not scope_user.get("is_admin"):
             rows = [
                 r for r in rows
-                if email_in_scope(scope_user, r[0], _scope_dept(r[0], r[2] or r[1], pdept, r[1]))
+                if email_in_scope(
+                    scope_user,
+                    r[0],
+                    _scope_dept(r[0], r[2] or r[1], pdept, r[1]),
+                    [r[2] or "", r[1] or ""],
+                )
             ]
         if "spend_bucket" in people_cols:
             pbucket = dict(conn.execute(
@@ -3501,22 +3698,40 @@ class H(BaseHTTPRequestHandler):
             usage_cols = _table_columns(conn, "usage")
             dept_expr = "COALESCE(NULLIF(effective_dept,''), dept)" \
                 if "effective_dept" in usage_cols else "dept"
+            raw_dept_expr = "COALESCE(NULLIF(raw_dept,''), dept)" \
+                if "raw_dept" in usage_cols else "dept"
             scoped_rows = conn.execute(
                 """
-                SELECT email, {dept_expr}, client, provider, model,
+                SELECT email, {dept_expr}, {raw_dept_expr}, client, provider, model,
                        SUM(input), SUM(output), SUM(cache_read), SUM(cache_write),
                        SUM(reasoning), SUM(total), SUM(cost), SUM(messages)
                 FROM usage
                 WHERE {where} AND source != 'litellm_agent'{ex}
-                GROUP BY email, {dept_expr}, client, provider, model
-                """.format(dept_expr=dept_expr, where=where, ex=ex_clause),
+                GROUP BY email, {dept_expr}, {raw_dept_expr}, client, provider, model
+                """.format(
+                    dept_expr=dept_expr,
+                    raw_dept_expr=raw_dept_expr,
+                    where=where,
+                    ex=ex_clause,
+                ),
                 params + ex_params,
             ).fetchall()
-            pdept = dict(conn.execute("SELECT email, dept FROM people").fetchall())
+            people_cols = _table_columns(conn, "people")
+            if "effective_dept" in people_cols:
+                pdept = dict(conn.execute(
+                    "SELECT email, COALESCE(NULLIF(effective_dept,''), dept) FROM people"
+                ).fetchall())
+            else:
+                pdept = dict(conn.execute("SELECT email, dept FROM people").fetchall())
             agg = {}
             for r in scoped_rows:
-                email, dept, client, provider, model = r[:5]
-                if not email_in_scope(scope_user, email, _scope_dept(email, dept, pdept, dept)):
+                email, dept, raw_dept, client, provider, model = r[:6]
+                if not email_in_scope(
+                    scope_user,
+                    email,
+                    _scope_dept(email, raw_dept or dept, pdept, dept),
+                    [raw_dept or "", dept or ""],
+                ):
                     continue
                 if by == "client":
                     key = (client, "", "")
@@ -3527,7 +3742,7 @@ class H(BaseHTTPRequestHandler):
                 else:
                     key = (client, provider, model)
                 cur = agg.setdefault(key, [0, 0, 0, 0, 0, 0, 0.0, 0])
-                for i, val in enumerate(r[5:13]):
+                for i, val in enumerate(r[6:14]):
                     cur[i] += val or 0
             result = []
             for key, sums in sorted(agg.items(), key=lambda item: -item[1][5]):
@@ -3581,14 +3796,21 @@ class H(BaseHTTPRequestHandler):
                     email_filter = su["email"]
             else:
                 _r = conn.execute(
-                    "SELECT COALESCE(effective_dept, dept, '') FROM people"
+                    "SELECT COALESCE(effective_dept, dept, ''), COALESCE(raw_dept, '') FROM people"
                     " WHERE lower(email)=?", ((email_filter or "").lower(),)).fetchone()
-                if not email_in_scope(su, email_filter, _r[0] if _r else ""):
+                if not email_in_scope(
+                    su,
+                    email_filter,
+                    _r[0] if _r else "",
+                    [(_r[1] if _r else "") or ""],
+                ):
                     return self._send(403, {"error": "forbidden for your role"})
         if scoped_department_default:
             usage_cols = _table_columns(conn, "usage")
             dept_expr = "COALESCE(NULLIF(effective_dept,''), dept)" \
                 if "effective_dept" in usage_cols else "dept"
+            raw_dept_expr = "COALESCE(NULLIF(raw_dept,''), dept)" \
+                if "raw_dept" in usage_cols else "dept"
             people_cols = _table_columns(conn, "people")
             if "effective_dept" in people_cols:
                 pdept = dict(conn.execute(
@@ -3597,17 +3819,27 @@ class H(BaseHTTPRequestHandler):
             else:
                 pdept = dict(conn.execute("SELECT email, dept FROM people").fetchall())
             scoped_rows = conn.execute("""
-                SELECT email, {dept_expr}, period, SUM(input), SUM(output),
+                SELECT email, {dept_expr}, {raw_dept_expr}, period, SUM(input), SUM(output),
                        SUM(cache_read), SUM(cache_write), SUM(reasoning),
                        SUM(total), SUM(cost), SUM(messages)
                 FROM usage
                 WHERE period_type='month'{ex}{dep}
-                GROUP BY email, {dept_expr}, period
-            """.format(dept_expr=dept_expr, ex=ex_clause, dep=departed_clause),
+                GROUP BY email, {dept_expr}, {raw_dept_expr}, period
+            """.format(
+                dept_expr=dept_expr,
+                raw_dept_expr=raw_dept_expr,
+                ex=ex_clause,
+                dep=departed_clause,
+            ),
                 ex_params).fetchall()
             agg = {}
-            for email, dept, period, *vals in scoped_rows:
-                if not email_in_scope(su, email, _scope_dept(email, dept, pdept, dept)):
+            for email, dept, raw_dept, period, *vals in scoped_rows:
+                if not email_in_scope(
+                    su,
+                    email,
+                    _scope_dept(email, raw_dept or dept, pdept, dept),
+                    [raw_dept or "", dept or ""],
+                ):
                     continue
                 cur = agg.setdefault(period, [0, 0, 0, 0, 0, 0, 0.0, 0])
                 for i, val in enumerate(vals):
@@ -3691,16 +3923,26 @@ class H(BaseHTTPRequestHandler):
         if user and user.strip():
             email = user.strip().lower()
             if "@" not in email:
-                email = "%s@%s" % (email, AI_EMAIL_DOMAIN)
+                existing = conn.execute(
+                    "SELECT email FROM people WHERE lower(email)=?",
+                    (email,),
+                ).fetchone()
+                email = (existing[0] if existing else "%s@%s" % (email, AI_EMAIL_DOMAIN)).lower()
             if scope_user and not scope_user.get("is_admin"):
                 prof = conn.execute(
-                    "SELECT COALESCE(MAX(effective_dept), ''), COALESCE(MAX(dept), '')"
+                    "SELECT COALESCE(MAX(effective_dept), ''), COALESCE(MAX(dept), ''),"
+                    " COALESCE(MAX(raw_dept), '')"
                     " FROM people WHERE lower(email)=?",
                     (email,),
                 ).fetchone()
                 scope_dept = _scope_dept(email, (prof[1] if prof else "") or "", None,
                                          (prof[0] if prof else "") or "")
-                if not email_in_scope(scope_user, email, scope_dept):
+                if not email_in_scope(
+                    scope_user,
+                    email,
+                    scope_dept,
+                    [(prof[2] if prof else "") or "", (prof[1] if prof else "") or ""],
+                ):
                     return self._send(403, {"error": "forbidden for requested user"})
             is_departed = email in departed_lower
             # 大小写不敏感聚合: 防 DB 里同一人有大小写不同的 email 行 → total 与 daily 分裂(评审 #4)。

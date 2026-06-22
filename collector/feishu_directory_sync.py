@@ -49,6 +49,7 @@ BUCKET_UNRESOLVED = "unresolved"
 RULE_DIRECT = "direct_feishu_dept"
 RULE_LEADER = "leader_department"
 RULE_CHAT_OWNER = "chat_owner_department"
+RULE_PERSONNEL = "personnel_outsourcing_department"
 RULE_MANUAL = "manual_override"
 RULE_UNRESOLVED = "unresolved"
 
@@ -57,7 +58,7 @@ CONF_MEDIUM = "medium"
 CONF_REVIEW = "needs_review"
 
 # Active, non-admin-visible attributions come only from these rules by default.
-ACTIVE_RULES = {RULE_DIRECT, RULE_LEADER, RULE_MANUAL}
+ACTIVE_RULES = {RULE_DIRECT, RULE_LEADER, RULE_PERSONNEL, RULE_MANUAL}
 
 MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE = float(
     os.environ.get("MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE", "0.8")
@@ -110,6 +111,30 @@ def is_outsourcing_department(path):
         if len(parts) > i + 1 and parts[i + 1] == "W":
             return True
     return bool(_SP_RE.search(_sstr(path)))
+
+
+def _is_personnel_outsourcing_department(path):
+    key = canonical_dept_key(path)
+    parts = key.split("/") if key else []
+    if "合作商" not in parts:
+        return False
+    i = parts.index("合作商")
+    return len(parts) > i + 2 and parts[i + 1] == "V"
+
+
+def _personnel_outsourcing_target(path, dept_id_by_path):
+    """Map 合作商/V/<internal-path-with-dashes> back to an internal dept path."""
+    key = canonical_dept_key(path)
+    prefix = "合作商/V/"
+    if not key.startswith(prefix):
+        return None, None
+    tail = key[len(prefix):].strip("/")
+    if not tail:
+        return None, None
+    target = "/".join(part.strip() for part in tail.split("-") if part.strip())
+    if not target:
+        return None, None
+    return dept_id_by_path.get(canonical_dept_key(target), ""), target
 
 
 def _looks_like_supplier_entity(dept, path):
@@ -374,6 +399,11 @@ def derive_department_attributions(
     """
     manual_overrides = manual_overrides or {}
     dept_path_by_id = build_department_paths(departments)
+    dept_id_by_path = {
+        canonical_dept_key(d.get("path") or dept_path_by_id.get(d.get("dept_id"), "")): d.get("dept_id")
+        for d in departments
+        if d.get("dept_id")
+    }
     users_by_open_id = {u["open_id"]: u for u in users if u.get("open_id")}
 
     rows = []
@@ -401,6 +431,17 @@ def derive_department_attributions(
                              rule=RULE_MANUAL, confidence=CONF_HIGH,
                              active=1, reason="manual_override"))
             continue
+
+        # 2. Personnel outsourcing under 合作商/V encodes the real internal dept
+        # in the source node name, e.g. 技术平台部-信息化技术部-信息化研发组.
+        if _is_personnel_outsourcing_department(path):
+            tdid, tpath = _personnel_outsourcing_target(path, dept_id_by_path)
+            if tpath:
+                rows.append(dict(base,
+                                 target_dept_id=tdid, target_dept_path=tpath,
+                                 spend_bucket=BUCKET_EMPLOYEE, rule=RULE_PERSONNEL,
+                                 confidence=CONF_HIGH, active=1, reason=""))
+                continue
 
         # 2/3. Non-outsourcing -> direct.
         if not is_outsourcing_department(path):
@@ -533,6 +574,7 @@ def attribution_counts_by_rule(attributions):
         RULE_DIRECT: 0,
         RULE_LEADER: 0,
         RULE_CHAT_OWNER: 0,
+        RULE_PERSONNEL: 0,
         RULE_MANUAL: 0,
         RULE_UNRESOLVED: 0,
     }
@@ -629,6 +671,7 @@ def write_directory_snapshot(
     users,
     departments,
     admin_emails=None,
+    admin_user_ids=None,
     synced_at=None,
     chat_owner_lookup=None,
     manual_overrides=None,
@@ -648,14 +691,22 @@ def write_directory_snapshot(
     """
     ensure_tables(conn)
     admin_emails = {e.strip().lower() for e in (admin_emails or []) if e and e.strip()}
+    admin_user_ids = {u.strip() for u in (admin_user_ids or []) if u and u.strip()}
     stamp = _now_iso(synced_at if isinstance(synced_at, (int, float)) else None)
     if isinstance(synced_at, str) and synced_at:
         stamp = synced_at
 
+    alerts = []
     dept_path_by_id = build_department_paths(departments)
     users_by_open_id = {u["open_id"]: u for u in users if u.get("open_id")}
-
-    alerts = []
+    users_by_user_id = {u.get("user_id"): u for u in users if u.get("user_id")}
+    for ident in sorted(admin_user_ids):
+        u = users_by_user_id.get(ident) or users_by_open_id.get(ident)
+        email = _sstr((u or {}).get("email")).strip().lower()
+        if email:
+            admin_emails.add(email)
+        elif ident:
+            alerts.append({"kind": "admin_user_id_unresolved", "user_id": ident})
 
     # --- feishu_users + people mirror ---
     for u in users:
@@ -1071,6 +1122,11 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--admin-emails", default=os.environ.get("AUTH_ADMIN_EMAILS", ""))
     parser.add_argument(
+        "--admin-user-ids",
+        default=os.environ.get("AUTH_ADMIN_USER_IDS", ""),
+        help="comma/space separated Feishu user_id/open_id values to resolve as admins",
+    )
+    parser.add_argument(
         "--manual-overrides",
         default=os.environ.get("FEISHU_DEPT_ATTRIBUTION_OVERRIDES", ""),
         help="JSON file mapping supplier departments to approved target departments",
@@ -1111,6 +1167,7 @@ def main(argv=None):
         departments, users, manual_overrides=manual_overrides)
     rate = resolved_business_outsourcing_rate(attributions)
     admin_emails = [e for e in re.split(r"[,\s]+", args.admin_emails) if e]
+    admin_user_ids = [u for u in re.split(r"[,\s]+", args.admin_user_ids) if u]
 
     summary = {
         "departments": len(departments),
@@ -1136,6 +1193,7 @@ def main(argv=None):
     try:
         result = write_directory_snapshot(
             conn, users, departments, admin_emails=admin_emails,
+            admin_user_ids=admin_user_ids,
             manual_overrides=manual_overrides,
             business_rollup_enabled=business_rollup_enabled,
             allow_partial=args.allow_partial)

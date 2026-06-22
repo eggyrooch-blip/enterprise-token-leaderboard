@@ -59,6 +59,10 @@ def test_dashboard_has_feishu_auth_controls():
     assert "fetch('/v1/me'" in html
     assert "/v1/auth/login?next=" in html
     assert "/v1/auth/logout" in html
+    assert "scope-pill" in html
+    assert "owned_departments" in html
+    assert "me.roles" in html
+    assert "me.open_id" in html
 
 
 def test_public_pages_use_generic_company_logo_path():
