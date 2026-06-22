@@ -84,6 +84,21 @@ class _FakeDirectoryClient:
         return []
 
 
+class _LegacySqliteConnection:
+    """Test wrapper that simulates production SQLite without UPSERT syntax."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=()):
+        if "ON CONFLICT" in sql.upper():
+            raise sqlite3.OperationalError('near "ON": syntax error')
+        return self._conn.execute(sql, params)
+
+    def commit(self):
+        return self._conn.commit()
+
+
 # --------------------------------------------------------------------------- #
 # canonical_dept_key
 # --------------------------------------------------------------------------- #
@@ -329,6 +344,34 @@ def test_snapshot_is_idempotent():
     assert snap1 == snap2
     # row counts stable
     assert conn.execute("SELECT COUNT(*) FROM feishu_users").fetchone()[0] == 5
+
+
+def test_snapshot_writer_does_not_require_sqlite_upsert_syntax():
+    deps, _ = _paths()
+    conn = sqlite3.connect(":memory:")
+    legacy_conn = _LegacySqliteConnection(conn)
+
+    fds.write_directory_snapshot(
+        legacy_conn, _users(), deps, admin_emails=["sunke@keep.com"],
+        synced_at=1, allow_partial=True)
+    users2 = _users()
+    for u in users2:
+        if u["open_id"] == "ou_leader":
+            u["name"] = "新组长"
+    fds.write_directory_snapshot(
+        legacy_conn, users2, deps, admin_emails=["sunke@keep.com"],
+        synced_at=2, allow_partial=True)
+
+    assert conn.execute("SELECT COUNT(*) FROM feishu_users").fetchone()[0] == 5
+    assert conn.execute(
+        "SELECT name FROM feishu_users WHERE open_id='ou_leader'"
+    ).fetchone()[0] == "新组长"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM roles WHERE source='feishu_sync'"
+    ).fetchone()[0] == 4
+    assert conn.execute(
+        "SELECT COUNT(*) FROM department_attributions"
+    ).fetchone()[0] == len(deps)
 
 
 def test_role_override_deny_blocks_feishu_owner():

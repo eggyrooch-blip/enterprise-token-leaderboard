@@ -740,6 +740,37 @@ def enrich_required_users(client, departments, users, admin_user_ids=None):
 # --------------------------------------------------------------------------- #
 # Snapshot writer
 # --------------------------------------------------------------------------- #
+def _sqlite_upsert_compat(conn, table, columns, values, key_columns, update_columns=None):
+    """SQLite upsert without `ON CONFLICT`, for production's old SQLite."""
+    row = dict(zip(columns, values))
+    where = " AND ".join("%s=?" % c for c in key_columns)
+    key_values = [row[c] for c in key_columns]
+    exists = conn.execute(
+        "SELECT 1 FROM %s WHERE %s LIMIT 1" % (table, where),
+        key_values,
+    ).fetchone()
+    if exists:
+        updates = list(update_columns or [c for c in columns if c not in key_columns])
+        if updates:
+            conn.execute(
+                "UPDATE %s SET %s WHERE %s" % (
+                    table,
+                    ", ".join("%s=?" % c for c in updates),
+                    where,
+                ),
+                [row[c] for c in updates] + key_values,
+            )
+        return
+    conn.execute(
+        "INSERT INTO %s(%s) VALUES(%s)" % (
+            table,
+            ",".join(columns),
+            ",".join("?" for _ in columns),
+        ),
+        values,
+    )
+
+
 def write_directory_snapshot(
     conn,
     users,
@@ -791,18 +822,15 @@ def write_directory_snapshot(
         dept_path = u.get("dept_path") or dept_path_by_id.get(dept_id, "")
         email = _sstr(u.get("email")).strip().lower()
         status = _sstr(u.get("status") or "active")
-        conn.execute(
-            """INSERT INTO feishu_users(open_id,user_id,union_id,email,name,
-                   dept_id,dept_path,status,employee_type,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(open_id) DO UPDATE SET
-                   user_id=excluded.user_id, union_id=excluded.union_id,
-                   email=excluded.email, name=excluded.name, dept_id=excluded.dept_id,
-                   dept_path=excluded.dept_path, status=excluded.status,
-                   employee_type=excluded.employee_type, updated_at=excluded.updated_at""",
+        _sqlite_upsert_compat(
+            conn,
+            "feishu_users",
+            ["open_id", "user_id", "union_id", "email", "name",
+             "dept_id", "dept_path", "status", "employee_type", "updated_at"],
             (open_id, _sstr(u.get("user_id")), _sstr(u.get("union_id")), email,
              _sstr(u.get("name")), dept_id, dept_path, status,
              _sstr(u.get("employee_type")), stamp),
+            ["open_id"],
         )
 
     # --- departments ---
@@ -817,21 +845,17 @@ def write_directory_snapshot(
             member_count = int(d.get("member_count") or 0)
         except (TypeError, ValueError):
             member_count = 0
-        conn.execute(
-            """INSERT INTO departments(dept_id,open_dept_id,parent_id,name,path,
-                   leader_user_id,chat_id,group_owner_user_id,member_count,status,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(dept_id) DO UPDATE SET
-                   open_dept_id=excluded.open_dept_id, parent_id=excluded.parent_id,
-                   name=excluded.name, path=excluded.path,
-                   leader_user_id=excluded.leader_user_id, chat_id=excluded.chat_id,
-                   group_owner_user_id=excluded.group_owner_user_id,
-                   member_count=excluded.member_count,
-                   status=excluded.status, updated_at=excluded.updated_at""",
+        _sqlite_upsert_compat(
+            conn,
+            "departments",
+            ["dept_id", "open_dept_id", "parent_id", "name", "path",
+             "leader_user_id", "chat_id", "group_owner_user_id", "member_count",
+             "status", "updated_at"],
             (dept_id, _sstr(d.get("open_dept_id")), _sstr(d.get("parent_id")),
              _sstr(d.get("name")), path, _sstr(d.get("leader_user_id")),
              _sstr(d.get("chat_id")), _sstr(d.get("group_owner_user_id")),
              member_count, _sstr(d.get("status") or "active"), stamp),
+            ["dept_id"],
         )
 
     # --- department_attributions (with downgrade protection) ---
@@ -864,21 +888,15 @@ def write_directory_snapshot(
             confidence = prev[3] or confidence
             bucket = prev[4] or bucket
             reason = (reason + ";downgrade_blocked").strip(";")
-        conn.execute(
-            """INSERT INTO department_attributions(source_dept_id,source_dept_key,
-                   source_dept_path,target_dept_id,target_dept_path,spend_bucket,
-                   rule,confidence,active,reason,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(source_dept_id) DO UPDATE SET
-                   source_dept_key=excluded.source_dept_key,
-                   source_dept_path=excluded.source_dept_path,
-                   target_dept_id=excluded.target_dept_id,
-                   target_dept_path=excluded.target_dept_path,
-                   spend_bucket=excluded.spend_bucket, rule=excluded.rule,
-                   confidence=excluded.confidence, active=excluded.active,
-                   reason=excluded.reason, updated_at=excluded.updated_at""",
+        _sqlite_upsert_compat(
+            conn,
+            "department_attributions",
+            ["source_dept_id", "source_dept_key", "source_dept_path",
+             "target_dept_id", "target_dept_path", "spend_bucket", "rule",
+             "confidence", "active", "reason", "updated_at"],
             (sid, r["source_dept_key"], r["source_dept_path"], target_id,
              target_path, bucket, rule, confidence, active, reason, stamp),
+            ["source_dept_id"],
         )
 
     # --- roles: department_owner from leaders, admin from admin_emails ---
@@ -925,25 +943,25 @@ def write_directory_snapshot(
         path = d.get("path") or dept_path_by_id.get(dept_id, "")
         if _denied(email, "department_owner", dept_id):
             continue
-        conn.execute(
-            """INSERT INTO roles(email,role,dept_id,dept_path,source,updated_at)
-               VALUES(?,?,?,?, 'feishu_sync', ?)
-               ON CONFLICT(email,role,dept_id) DO UPDATE SET
-                   dept_path=excluded.dept_path, source='feishu_sync',
-                   updated_at=excluded.updated_at""",
-            (email, "department_owner", dept_id, path, stamp),
+        _sqlite_upsert_compat(
+            conn,
+            "roles",
+            ["email", "role", "dept_id", "dept_path", "source", "updated_at"],
+            (email, "department_owner", dept_id, path, "feishu_sync", stamp),
+            ["email", "role", "dept_id"],
         )
         written_roles += 1
 
     for email in sorted(admin_emails):
         if _denied(email, "admin"):
             continue
-        conn.execute(
-            """INSERT INTO roles(email,role,dept_id,dept_path,source,updated_at)
-               VALUES(?, 'admin', '', '', 'feishu_sync', ?)
-               ON CONFLICT(email,role,dept_id) DO UPDATE SET
-                   source='feishu_sync', updated_at=excluded.updated_at""",
-            (email, stamp),
+        _sqlite_upsert_compat(
+            conn,
+            "roles",
+            ["email", "role", "dept_id", "dept_path", "source", "updated_at"],
+            (email, "admin", "", "", "feishu_sync", stamp),
+            ["email", "role", "dept_id"],
+            update_columns=["source", "updated_at"],
         )
         written_roles += 1
 
@@ -955,22 +973,16 @@ def write_directory_snapshot(
         dept_id = _sstr(u.get("dept_id"))
         raw_path = u.get("dept_path") or dept_path_by_id.get(dept_id, "")
         eff_path, bucket, attr_src = effective_dept_for_person(raw_path, new_rows)
-        conn.execute(
-            """INSERT INTO people(email,name,dept,feishu_user_id,feishu_open_id,
-                   status,source,raw_dept,effective_dept,attribution_source,
-                   spend_bucket,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(email) DO UPDATE SET
-                   name=excluded.name, dept=excluded.dept,
-                   feishu_user_id=excluded.feishu_user_id,
-                   feishu_open_id=excluded.feishu_open_id, status=excluded.status,
-                   source='feishu', raw_dept=excluded.raw_dept,
-                   effective_dept=excluded.effective_dept,
-                   attribution_source=excluded.attribution_source,
-                   spend_bucket=excluded.spend_bucket, updated_at=excluded.updated_at""",
+        _sqlite_upsert_compat(
+            conn,
+            "people",
+            ["email", "name", "dept", "feishu_user_id", "feishu_open_id",
+             "status", "source", "raw_dept", "effective_dept",
+             "attribution_source", "spend_bucket", "updated_at"],
             (email, _sstr(u.get("name")), eff_path, _sstr(u.get("user_id")),
              _sstr(u.get("open_id")), _sstr(u.get("status") or "active"), "feishu",
              raw_path, eff_path, attr_src, bucket, stamp),
+            ["email"],
         )
 
     conn.commit()
