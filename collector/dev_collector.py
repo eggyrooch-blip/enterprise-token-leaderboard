@@ -1836,11 +1836,12 @@ def _upsert_report_person(conn, identity):
 # 部门总人数缓存（部门榜 headcount / active_rate 用）
 #
 # 数据源开关 DEPT_HEADCOUNT_SOURCE：
-#   feishu  (默认) → 飞书组织架构 feishu_users.dept_path 在职人数；飞书无数据时回退飞连
+#   feishu  (默认) → 飞书目录 people 表在职(status='active')人数,按 dept 分组；飞书无数据时回退飞连
 #   feilian          → 强制走飞连（旧行为）
 #   feishu_only      → 只用飞书，没有就空（不回退飞连）
-# 飞书是组织架构权威源（feishu_directory_sync.py 从 root 全树 fetch_child 拉全员，
-# dept_path 与飞连 department_path 同格式 'Keep/技术平台部/...'），故默认优先飞书。
+# 飞书是组织架构权威源（people 由 feishu_directory_sync.py 同步，dept 与飞连 department_path
+# 同格式 'Keep/技术平台部/...'）。people 是真实员工口径,飞连含大量外部合作商/外包(Keep 飞连=1420
+# vs people≈624)，故默认优先飞书。
 # ---------------------------------------------------------------------------
 _DEPT_HEADCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(DB)), "dept_headcount.json")
 _DEPT_HEADCOUNT_TTL = 6 * 3600  # 6 小时
@@ -1849,14 +1850,18 @@ _DEPT_HEADCOUNT_SOURCE = os.environ.get("DEPT_HEADCOUNT_SOURCE", "feishu").strip
 
 
 def _fetch_dept_headcount_feishu(conn):
-    """飞书组织架构部门总人数：feishu_users 里在职(status='active')用户按 dept_path 精确分组计数。
+    """飞书组织架构部门总人数：people 表(飞书目录同步)里在职(status='active')用户按 dept 精确分组计数。
     与飞连版同口径：返回 {department_path: 人数}，path 经 _normalize_dept_path 归一(外包折回真实部门)。
-    feishu_users 缺表/为空 → 返回 None（让上层决定是否回退飞连）。任何异常 → 抛出，由上层 graceful。"""
-    if "feishu_users" not in _table_columns_owner(conn):
+    people 缺表/为空 → 返回 None（让上层决定是否回退飞连）。任何异常 → 抛出，由上层 graceful。
+
+    口径说明(2026-06-22)：people 是飞书目录(feishu_directory_sync 写入)，是真实员工口径；
+    飞连 headcount 含大量外部合作商/非驻场外包(故顶级 Keep 飞连=1420，people≈624)。
+    部门字段优先 effective_dept(外包/归属已折算)，缺则用 dept。"""
+    if "people" not in _table_columns_owner(conn):
         return None
     rows = conn.execute(
-        "SELECT dept_path FROM feishu_users"
-        " WHERE status='active' AND COALESCE(dept_path,'')<>''"
+        "SELECT COALESCE(NULLIF(effective_dept,''), dept) AS d FROM people"
+        " WHERE status='active' AND COALESCE(COALESCE(NULLIF(effective_dept,''), dept),'')<>''"
     ).fetchall()
     if not rows:
         return None
@@ -1871,7 +1876,7 @@ def _fetch_dept_headcount_feishu(conn):
 
 
 def _table_columns_owner(conn):
-    """库里现有的表名集合（用于 feishu_users 是否存在的探测，避免 PRAGMA 报错）。"""
+    """库里现有的表名集合（用于 people 是否存在的探测，避免 PRAGMA 报错）。"""
     try:
         return {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
