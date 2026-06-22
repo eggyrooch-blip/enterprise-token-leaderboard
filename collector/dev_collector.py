@@ -1997,9 +1997,14 @@ def _fetch_headcount_feishu_member_count(conn):
         return None
     if "member_count" not in dept_cols:
         return None  # 老库未加列 → 回退 feishu_users
+    # 只数在用部门(status='active'):忽略飞书已停用/陈旧部门行, 避免虚增分母(2026-06-22 孙可)。
+    # 老库无 status 列时不加该过滤(向后兼容)。
+    status_filter = (" AND COALESCE(status,'active')='active'"
+                     if "status" in dept_cols else "")
     rows = conn.execute(
         "SELECT path, member_count FROM departments"
         " WHERE COALESCE(path,'')<>'' AND COALESCE(member_count,0)>0"
+        + status_filter
     ).fetchall()
     if not rows:
         return None  # 生产库副本尚无 member_count 数据 → 优雅回退
@@ -3433,8 +3438,10 @@ class H(BaseHTTPRequestHandler):
             hc_staff = node_hc_staff.get(path)
             hc_total = hc_total if (hc_total and hc_total > 0) else None
             hc_staff = hc_staff if (hc_staff and hc_staff > 0) else None
-            # headcount(向后兼容)= 含外包口径;活跃率分母用含外包(全量真实人数)。
-            hc = hc_total
+            # headcount(向后兼容)= 含外包口径;但活跃率分母用员工口径 headcount_staff
+            # (排除外部合作商,2026-06-22 孙可):展示文案是「活跃 X/员工 Y」,分母须与文案一致。
+            # staff 缺失(老库/合作商节点)时回退含外包 total,避免分母为空丢失活跃率。
+            hc = hc_staff if (hc_staff and hc_staff > 0) else hc_total
             if hc and hc > 0:
                 active_rate = round(people / float(hc) * 100, 1)
             else:
@@ -3709,7 +3716,9 @@ class H(BaseHTTPRequestHandler):
                 cost_usd = round(sum(float(r["cost"] or 0) for r in matches), 4)
                 name = matches[0].get("name") or None
                 dept = matches[0].get("dept") or None
-                # 每日明细(token 维度: 当天 SUM(total) + 飞书点, 和 == total_tokens 自洽; 同窗口子句)。
+                # 每日明细(纯 token 维度: 当天 SUM(total); 和 == total_tokens 自洽; 同窗口子句)。
+                # 飞书「点」(credits)是另一种口径, 不并入 daily/total(2026-06-22 孙可去点改造):
+                # 加总会让 daily 加总 != total_tokens。「点」只在「飞书 AI 权益」tab(/v1/feishu)体现。
                 # cost 含订阅月费摊销, 不可按天拆, 故 daily 只给 token。
                 day_map = {}
                 for p, tot in conn.execute(
@@ -3717,12 +3726,6 @@ class H(BaseHTTPRequestHandler):
                         "GROUP BY period" % (dwhere, PERSON_FILTER),
                         dparams + [email]).fetchall():
                     day_map[p] = day_map.get(p, 0) + (tot or 0)
-                for ud, cr in conn.execute(
-                        "SELECT usage_date, SUM(credits) FROM feishu_member "
-                        "WHERE 1=1%s AND lower(email)=? GROUP BY usage_date" % frng,
-                        fparams + [email]).fetchall():
-                    if cr:
-                        day_map[ud] = day_map.get(ud, 0) + cr
                 daily = [{"date": d, "total_tokens": day_map[d]} for d in sorted(day_map)]
             return self._send(200, {
                 "user": email, "name": name, "dept": dept,

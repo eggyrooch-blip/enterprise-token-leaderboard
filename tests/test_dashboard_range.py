@@ -33,11 +33,13 @@ def test_meta_default_range_becomes_request_state():
 def test_dashboard_explains_cost_and_agent_scope():
     html = DASHBOARD.read_text(encoding="utf-8")
 
-    assert "个人榜公司实付 = 网关实销 + 订阅席位摊销 + 飞书点数折算" in html
-    assert "部门榜金额标为估算" in html
+    # 去点改造后的新 footer(2026-06-22):两种 $ 口径 + token 一律以纯 token 为准, 「点」独立不并入。
+    assert "估算 = 网关实销（litellm/api 计量）+ 订阅席位摊销" in html
+    assert "Token 一律以纯 token 为准" in html
+    assert "「点」是另一口径，不并入 token 与 cost" in html
     assert "个人榜默认不含归属 Agent 消耗" in html
     assert "/v1/agent_owner_summary" in html
-    assert "估算 $" in html
+    assert "估算" in html
 
 
 def test_no_duplicate_outer_range_buttons():

@@ -49,7 +49,7 @@ def _seed(conn):
             "input,output,cache_read,cache_write,reasoning,total,cost,messages) "
             "VALUES(?,?,?,?,?,?,?,?,0,0,0,0,0,?,?,0)",
             (email, dept, pt, period, src, client, prov, model, total, cost))
-    # 飞书权益点(1点=1token, 点成本并入 cost) —— alice 当天 12 点
+    # 飞书权益点(credits/「点」, 去点后不并入 token/cost, 只在飞书 AI 权益 tab) —— alice 当天 12 点
     conn.execute(
         "INSERT OR REPLACE INTO feishu_member(email,name,dept,feature_key,credits,usage_date,avatar,entity_id) "
         "VALUES('alice@keep.com','爱丽丝','Keep/IT/规范部门','AI_credits',12.0,?,'','')", (D(0),))
@@ -93,9 +93,9 @@ def test_parity_single_user_matches_leaderboard_row(tmp_path, monkeypatch):
     finally:
         server.shutdown(); thread.join(timeout=3)
     alice = next(r for r in lb["leaderboard"] if r["email"] == "alice@keep.com")
-    # token 含飞书点: 300+100+50 + 12 = 462
-    assert ai["total_tokens"] == alice["tokens"] == 462
-    # cost = 网关实销(3.5) + 飞书点成本 + 订阅费窗口摊销 —— 必须与前端那一行分毫一致
+    # 纯 token, 不含飞书点(2026-06-22 去点改造): 300+100+50 = 450
+    assert ai["total_tokens"] == alice["tokens"] == 450
+    # cost = 网关实销(3.5) + 订阅费窗口摊销(飞书点成本不并入 cost) —— 必须与前端那一行分毫一致
     assert abs(ai["cost_usd"] - alice["cost"]) < 0.001
     assert ai["cost_usd"] < 100   # 含 $25 订阅摊销但远小于订阅牌价 999, 证明牌价没被算进去
 
@@ -128,7 +128,7 @@ def test_email_and_loginname_are_equivalent(tmp_path, monkeypatch):
         b = _get(server, "/v1/ai/usage?user=ALICE@keep.com&days=30")
     finally:
         server.shutdown(); thread.join(timeout=3)
-    assert a["total_tokens"] == b["total_tokens"] == 462
+    assert a["total_tokens"] == b["total_tokens"] == 450
     assert a["user"] == b["user"] == "alice@keep.com"
     assert a["dept"] == "Keep/IT/规范部门"
 
@@ -155,7 +155,7 @@ def test_board_excludes_departed_synthetic_agent_and_cost_not_inflated(tmp_path,
     assert not any(e.startswith("agent:") for e in emails)
     assert not any(e.startswith("litellm-key:") or e.startswith("litellm-user:") for e in emails)
     alice = next(r for r in board["ranking"] if r["user"] == "alice@keep.com")
-    assert alice["total_tokens"] == 462
+    assert alice["total_tokens"] == 450      # 纯 token, 不含飞书点(去点改造)
     assert alice["cost_usd"] < 100       # 含订阅摊销但牌价 999 没被算进 board
     assert any(r["user"] == "bob@keep.com" for r in with_dep["ranking"])
 

@@ -280,7 +280,7 @@ function Invoke-TokscaleJson {
             }
             $json = Read-CleanJson -Path $out
             if ($json -and $json.Contains($Needle)) {
-                Log "$Display: ok (valid json, $($json.Length) chars)"
+                Log "${Display}: ok (valid json, $($json.Length) chars)"
                 return $json
             }
             # 没拿到含 Needle 的 JSON:把 stderr 头部记下来,直说为啥(命令找不到/tokscale 报错等)
@@ -290,7 +290,7 @@ function Invoke-TokscaleJson {
             }
             if ($errHead) { $errHead = ($errHead -replace "\s+", " ").Trim() }
             if ($errHead.Length -gt 200) { $errHead = $errHead.Substring(0, 200) }
-            Log "$Display: no valid json on try $try (stderr: $errHead)"
+            Log "${Display}: no valid json on try $try (stderr: $errHead)"
         } catch {
             Log "$Display failed on try $($try): $($_.Exception.Message)"
         }

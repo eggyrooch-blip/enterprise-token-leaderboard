@@ -61,7 +61,7 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     script = BOOTSTRAP.read_text(encoding="utf-8")
 
     assert "$env:ProgramData" in script
-    assert "[int]$Version = 4" in script
+    assert "[int]$Version = 5" in script
     assert "tokreport.ps1" in script
     assert "/tokreport.ps1" in script
     assert "Register-ScheduledTask" in script
