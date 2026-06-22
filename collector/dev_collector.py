@@ -1142,7 +1142,8 @@ def _upsert_lifetime(conn, email, dept, entries, identity=None):
     up = 0
     identity = identity or _attribution_for_raw_dept(conn, dept)
     for e in entries:
-        client = _client_label(e.get("client", "unknown"))
+        # 新版 tokscale 字段叫 'source',旧版叫 'client',两种都认(否则全落 'unknown' 把真实数据翻倍)。
+        client = _client_label(e.get("source") or e.get("client") or "unknown")
         provider = _sstr(e.get("provider"))
         model = _sstr(e.get("model")) or "unknown"
         inp = num(e, "input")
@@ -1208,9 +1209,11 @@ def _upsert_daily(conn, email, dept, graph, identity=None):
         day = _sstr(d.get("date"))
         if not day:
             continue
-        for c in d.get("clients") or []:
+        # 新版 tokscale 每天明细数组叫 'sources'(项里字段 'source'),旧版叫 'clients'(字段 'client');
+        # 两种都兼容,否则格式一变 daily 静默落 0(线上重度用户当天数据上不来就是这个坑)。
+        for c in (d.get("sources") or d.get("clients") or []):
             tk = c.get("tokens") or {}
-            client = _client_label(c.get("client", "unknown"))
+            client = _client_label(c.get("source") or c.get("client") or "unknown")
             inp = num(tk, "input"); out = num(tk, "output")
             cr = num(tk, "cacheRead"); cw = num(tk, "cacheWrite"); rs = num(tk, "reasoning")
             total = inp + out + cr + cw + rs

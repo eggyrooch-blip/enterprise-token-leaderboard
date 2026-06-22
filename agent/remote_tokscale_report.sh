@@ -85,8 +85,10 @@ trap 'kill -9 "$WATCHDOG_PID" 2>/dev/null; rm -rf "$TMPD" 2>/dev/null' EXIT
 fetch_json() {  # $1=子命令(models|monthly) $2=输出文件
   local out="" _t
   for _t in 1 2 3; do
-    run_as_user "$TOKSCALE_CMD $1 --json --no-spinner > '$2' 2>/dev/null"
-    # 登录 shell 可能在 JSON 前打印 banner，从第一个 '{' 起截取，剔除污染
+    # >/dev/null 2>&1 丢掉 run_as_user 自身 stdout —— bash -lc 登录 shell 的 profile 横幅会经
+    # 函数 stdout 泄进 $(fetch_json) 捕获结果(污染 "models":<这里>);真数据已落文件 $2,横幅必须丢。
+    run_as_user "$TOKSCALE_CMD $1 --json --no-spinner > '$2' 2>/dev/null" >/dev/null 2>&1
+    # 文件里仍可能有 banner 前缀,从第一个 '{' 起截取
     out=$(sed -n '/{/,$p' "$2" 2>/dev/null)
     if [ -n "$out" ] && case "$out" in *'"entries"'*) true;; *) false;; esac; then
       printf '%s' "$out"
@@ -108,7 +110,7 @@ MONTHLY=$(fetch_json monthly "$TMPD/monthly")
 SINCE=$(date -v-100d +%Y-%m-%d 2>/dev/null || date -d '100 days ago' +%Y-%m-%d 2>/dev/null)
 GRAPH='{"contributions":[]}'
 for _t in 1 2 3; do
-  run_as_user "$TOKSCALE_CMD graph --since $SINCE > '$TMPD/graph' 2>/dev/null"
+  run_as_user "$TOKSCALE_CMD graph --since $SINCE > '$TMPD/graph' 2>/dev/null" >/dev/null 2>&1
   _g=$(sed -n '/{/,$p' "$TMPD/graph" 2>/dev/null)
   if [ -n "$_g" ] && case "$_g" in *'"contributions"'*) true;; *) false;; esac; then GRAPH="$_g"; break; fi
   sleep 2
