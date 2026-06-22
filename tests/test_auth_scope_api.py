@@ -387,7 +387,7 @@ def test_owner_breakdown_allows_business_outsourcing_source_owner(monkeypatch, t
     assert [(r["client"], r["tokens"]) for r in h.payload["breakdown"]] == [("Claude Code", 100)]
 
 
-def test_owner_client_leaderboard_allows_business_outsourcing_source_owner(monkeypatch, tmp_path):
+def test_owner_client_leaderboard_is_public_to_logged_in_users(monkeypatch, tmp_path):
     dc = _reload(monkeypatch, tmp_path)
     source = "Keep/合作商/W/深圳市奋达科技股份有限公司(SP000053)"
     target = "Keep/运动消费事业部/智能装备及运动电子交付部/软件研发部/固件组"
@@ -418,7 +418,58 @@ def test_owner_client_leaderboard_allows_business_outsourcing_source_owner(monke
         conn.close()
 
     assert h.code == 200
-    assert [r["email"] for r in h.payload["leaderboard"]] == ["wb-chenliling"]
+    assert [r["email"] for r in h.payload["leaderboard"]] == [
+        "other@keep.com",
+        "wb-chenliling",
+    ]
+
+
+def test_member_client_leaderboard_is_public_to_logged_in_users(monkeypatch, tmp_path):
+    dc = _reload(monkeypatch, tmp_path)
+    conn = dc.db()
+    try:
+        _usage(dc, conn, "alice@keep.com", "Keep/技术平台部/固件组", 100, "Claude Code")
+        _usage(dc, conn, "bob@keep.com", "Keep/运动消费事业部/市场营销部", 200, "Claude Code")
+        _usage(dc, conn, "carol@keep.com", "Keep/客户服务中心", 300, "Cursor")
+        conn.commit()
+        h = _Handler()
+
+        dc.H._leaderboard(
+            h,
+            conn,
+            {"client": ["Claude Code"]},
+            auth_user=_role("alice@keep.com", ["member"], "self"),
+        )
+    finally:
+        conn.close()
+
+    assert h.code == 200
+    assert [r["email"] for r in h.payload["leaderboard"]] == [
+        "bob@keep.com",
+        "alice@keep.com",
+    ]
+
+
+def test_member_total_leaderboard_stays_scoped_to_self(monkeypatch, tmp_path):
+    dc = _reload(monkeypatch, tmp_path)
+    conn = dc.db()
+    try:
+        _usage(dc, conn, "alice@keep.com", "Keep/技术平台部/固件组", 100, "Claude Code")
+        _usage(dc, conn, "bob@keep.com", "Keep/运动消费事业部/市场营销部", 200, "Claude Code")
+        conn.commit()
+        h = _Handler()
+
+        dc.H._leaderboard(
+            h,
+            conn,
+            {},
+            auth_user=_role("alice@keep.com", ["member"], "self"),
+        )
+    finally:
+        conn.close()
+
+    assert h.code == 200
+    assert [r["email"] for r in h.payload["leaderboard"]] == ["alice@keep.com"]
 
 
 def test_member_cannot_read_other_user_ai_usage(monkeypatch, tmp_path):
@@ -459,6 +510,10 @@ def test_owner_ai_usage_allows_supplier_identity_without_keep_email(monkeypatch,
             effective_dept=target,
             spend_bucket="business_outsourcing",
         )
+        conn.execute(
+            "UPDATE usage SET period_type='day', period='2026-06-01'"
+            " WHERE email='wb-chenliling'"
+        )
         conn.commit()
         h = _Handler()
 
@@ -473,6 +528,8 @@ def test_owner_ai_usage_allows_supplier_identity_without_keep_email(monkeypatch,
 
     assert h.code == 200
     assert h.payload["user"] == "wb-chenliling"
+    assert h.payload["total_tokens"] == 100
+    assert h.payload["daily"] == [{"date": "2026-06-01", "total_tokens": 100}]
 
 
 def test_member_ai_usage_board_is_filtered_to_self(monkeypatch, tmp_path):

@@ -636,7 +636,6 @@ DATA_ROUTES = {
 #    through _scope_rows() / email_in_scope() to the caller's visible set.
 ADMIN_ONLY_ROUTES = {
     "/v1/governance_metrics", "/v1/raw",
-    "/v1/agent_leaderboard", "/v1/agent_owner_summary",
 }
 OWNER_OR_ADMIN_ROUTES = {"/v1/teams"}
 
@@ -3285,7 +3284,8 @@ class H(BaseHTTPRequestHandler):
                 x["pct"] = round(x["tokens"] / tot * 100, 1) if tot else 0
             row["composition"].sort(key=lambda x: x["tokens"], reverse=True)
         result.sort(key=lambda x: x["tokens"] or 0, reverse=True)
-        result = filter_person_rows_for_auth(result, getattr(self, "_scope_user", None))
+        # 工具榜是聚合展示面：登录后全员可见，不按组织权限截断。
+        # 无 client 的个人总榜已在上方直接走 _personal_board_rows 并保留行级过滤。
         for row in result:
             row.pop("visible_dept_paths", None)
         self._send(200, {"leaderboard": result})

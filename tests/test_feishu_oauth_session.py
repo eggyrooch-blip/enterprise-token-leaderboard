@@ -336,6 +336,7 @@ def test_gate_shadow_allows_everything():
 
 def test_gate_enforce_unauthenticated_is_401():
     assert dc.authorize_request(None, "/v1/leaderboard", enforced=True) == "401"
+    assert dc.authorize_request(None, "/v1/agent_leaderboard", enforced=True) == "401"
 
 
 def test_gate_enforce_admin_allowed_everywhere():
@@ -347,6 +348,8 @@ def test_gate_enforce_admin_allowed_everywhere():
 def test_gate_enforce_member_allowed_scoped_self_routes_but_not_admin_routes():
     m = _role("emp@keep.com", ["member"], "self")
     assert dc.authorize_request(m, "/v1/leaderboard", enforced=True) == "allow"
+    assert dc.authorize_request(m, "/v1/agent_leaderboard", enforced=True) == "allow"
+    assert dc.authorize_request(m, "/v1/agent_owner_summary", enforced=True) == "allow"
     assert dc.authorize_request(m, "/v1/ai/usage", enforced=True) == "allow"
     assert dc.authorize_request(m, "/v1/breakdown", enforced=True) == "allow"
     assert dc.authorize_request(m, "/v1/teams", enforced=True) == "403"
