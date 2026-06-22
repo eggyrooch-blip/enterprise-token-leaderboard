@@ -1081,6 +1081,14 @@ def main(argv=None):
         default=os.environ.get("ALLOW_LOW_FEISHU_ATTRIBUTION_COVERAGE", "").strip() == "1",
         help="write even when resolved business-outsourcing coverage is below threshold",
     )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        default=os.environ.get("ALLOW_PARTIAL_FEISHU_SNAPSHOT", "").strip() == "1",
+        help="tolerate department leaders not joinable to a visible user "
+             "(happens when 通讯录用户可见范围 is limited); dept member_count "
+             "(headcount) still written. Required when full user scope isn't granted.",
+    )
     args = parser.parse_args(argv)
     manual_overrides = load_manual_overrides(args.manual_overrides)
 
@@ -1129,7 +1137,8 @@ def main(argv=None):
         result = write_directory_snapshot(
             conn, users, departments, admin_emails=admin_emails,
             manual_overrides=manual_overrides,
-            business_rollup_enabled=business_rollup_enabled)
+            business_rollup_enabled=business_rollup_enabled,
+            allow_partial=args.allow_partial)
         _record_sync_success(
             conn,
             result,
