@@ -1836,12 +1836,25 @@ def _upsert_report_person(conn, identity):
 # 部门总人数缓存（部门榜 headcount / active_rate 用）
 #
 # 数据源开关 DEPT_HEADCOUNT_SOURCE：
-#   feishu  (默认) → 飞书目录 people 表在职(status='active')人数,按 dept 分组；飞书无数据时回退飞连
+#   feishu  (默认) → 飞书组织架构在职人数,按部门路径分组；优先级:
+#                      feishu_users(全员表,主) → people(子集,兜底) → 飞连(最后兜底)
 #   feilian          → 强制走飞连（旧行为）
-#   feishu_only      → 只用飞书，没有就空（不回退飞连）
-# 飞书是组织架构权威源（people 由 feishu_directory_sync.py 同步，dept 与飞连 department_path
-# 同格式 'Keep/技术平台部/...'）。people 是真实员工口径,飞连含大量外部合作商/外包(Keep 飞连=1420
-# vs people≈624)，故默认优先飞书。
+#   feishu_only      → 只用飞书(feishu_users→people)，都没有就空（不回退飞连）
+# 飞书是组织架构权威源(feishu_directory_sync.py 调 contact v3 全员同步)：
+#   * feishu_users 才是【全员表】(open_id 主键,含无邮箱供应商行),dept_path 与飞连 department_path
+#     同格式 'Keep/技术平台部/...'；这是 headcount 的主源。
+#   * people 仅是 feishu_users 里【有稳定邮箱】用户的镜像子集(当前库≈624/781)，作兜底。
+# 放行门:feishu_directory_sync 写入 feishu_directory_sync_production_enablement_blocked
+#   (覆盖率 < MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE=0.8 时为 '1')。headcount 检测到飞书侧
+#   覆盖不足/空表时 graceful 回退,绝不显示残缺人数。
+#
+# RUNBOOK — 飞书 bot "读用户" 权限开通后,用全员通讯录填 feishu_users(凭证走 env,绝不落文件):
+#   FEISHU_APP_ID=<bot app_id> FEISHU_APP_SECRET=<bot app_secret> \
+#       python3 collector/feishu_directory_sync.py --db <prod tok.db>
+#   跑完核对:sqlite3 <prod tok.db> "SELECT COUNT(*) FROM feishu_users WHERE status='active';"
+#   (应≈全员数,远多于 people 的子集);覆盖率达标后 production_enablement_blocked 会写 '0',
+#   本模块即自动以 feishu_users 为 headcount 主源。覆盖率不足时 sync 默认不写脏数据
+#   (除非显式 --allow-low-coverage),本模块也会因放行门挡住而回退飞连。
 # ---------------------------------------------------------------------------
 _DEPT_HEADCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(DB)), "dept_headcount.json")
 _DEPT_HEADCOUNT_TTL = 6 * 3600  # 6 小时
@@ -1849,14 +1862,52 @@ _dept_headcount_mem = None  # 进程内一次性缓存，避免每请求读盘
 _DEPT_HEADCOUNT_SOURCE = os.environ.get("DEPT_HEADCOUNT_SOURCE", "feishu").strip().lower()
 
 
-def _fetch_dept_headcount_feishu(conn):
-    """飞书组织架构部门总人数：people 表(飞书目录同步)里在职(status='active')用户按 dept 精确分组计数。
-    与飞连版同口径：返回 {department_path: 人数}，path 经 _normalize_dept_path 归一(外包折回真实部门)。
-    people 缺表/为空 → 返回 None（让上层决定是否回退飞连）。任何异常 → 抛出，由上层 graceful。
+def _feishu_headcount_blocked(conn):
+    """飞书侧放行门：feishu_directory_sync 在覆盖率 < min_required_rate(0.8) 时把
+    feishu_directory_sync_production_enablement_blocked 置 '1'。被门挡住 → 飞书数据
+    覆盖不足,headcount 不该用它(避免显示残缺人数)。无该状态(老库/未跑过 sync)→ 不阻断
+    (False),让调用方按表是否为空自行判定。"""
+    return _state_bool(
+        _state_get(conn, "feishu_directory_sync_production_enablement_blocked", "0"))
 
-    口径说明(2026-06-22)：people 是飞书目录(feishu_directory_sync 写入)，是真实员工口径；
-    飞连 headcount 含大量外部合作商/非驻场外包(故顶级 Keep 飞连=1420，people≈624)。
-    部门字段优先 effective_dept(外包/归属已折算)，缺则用 dept。"""
+
+def _count_by_dept_path(rows):
+    """[(dept_path,), ...] → {归一化部门路径: 人数}(叶子级,不 roll-up)。
+    path 经 _normalize_dept_path 归一(外包折回真实部门,与飞连同口径)。roll-up 到父部门
+    由消费点(_ancestors)统一做,这里只出叶子计数。空 → None。"""
+    counts = {}
+    for (path,) in rows:
+        if not path:
+            continue
+        path = _normalize_dept_path(path)
+        if path:
+            counts[path] = counts.get(path, 0) + 1
+    return counts or None
+
+
+def _fetch_headcount_feishu_users(conn):
+    """【主源】feishu_users 全员表(飞书目录同步,open_id 主键)里在职(status='active')
+    用户按 dept_path 精确分组计数。返回 {department_path: 人数}(叶子级);缺表/无在职行
+    → None(让上层兜底 people / 飞连)。任何异常 → 抛出,由上层 graceful。
+
+    口径说明(2026-06-22)：feishu_users 是 contact v3 全员同步,含无邮箱供应商行,是真实
+    全员口径(people 只是有邮箱用户的子集)。dept_path 与飞连 department_path 同格式
+    'Keep/技术平台部/...'。"""
+    if "feishu_users" not in _table_columns_owner(conn):
+        return None
+    rows = conn.execute(
+        "SELECT dept_path FROM feishu_users"
+        " WHERE status='active' AND COALESCE(dept_path,'')<>''"
+    ).fetchall()
+    if not rows:
+        return None
+    return _count_by_dept_path(rows)
+
+
+def _fetch_headcount_people(conn):
+    """【兜底源】people 表(feishu_users 里有稳定邮箱用户的镜像子集)按 effective_dept→dept
+    在职分组计数。仅在 feishu_users 缺表/为空时使用。返回 {department_path: 人数}(叶子级);
+    缺表/无行 → None。"""
     if "people" not in _table_columns_owner(conn):
         return None
     rows = conn.execute(
@@ -1865,14 +1916,18 @@ def _fetch_dept_headcount_feishu(conn):
     ).fetchall()
     if not rows:
         return None
-    counts = {}
-    for (path,) in rows:
-        if not path:
-            continue
-        path = _normalize_dept_path(path)  # 外包归并:合作商路径折回真实部门，与飞连同口径
-        if path:
-            counts[path] = counts.get(path, 0) + 1
-    return counts or None
+    return _count_by_dept_path(rows)
+
+
+def _fetch_dept_headcount_feishu(conn):
+    """飞书组织架构部门总人数(叶子级 {department_path: 人数})。数据源优先级：
+        feishu_users(全员表,主) → people(子集,兜底)
+    放行门：feishu_directory_sync 标记 production_enablement_blocked=1(覆盖率<0.8)时,
+    飞书侧数据残缺 → 直接返回 None,让上层回退飞连,绝不显示残缺人数。
+    两个飞书源都缺表/为空 → 返回 None(让上层决定是否回退飞连)。异常 → 抛出,上层 graceful。"""
+    if _feishu_headcount_blocked(conn):
+        return None  # 覆盖率不足,飞书数据不可信 → 交给上层回退飞连
+    return _fetch_headcount_feishu_users(conn) or _fetch_headcount_people(conn)
 
 
 def _table_columns_owner(conn):
@@ -1912,9 +1967,9 @@ def _fetch_dept_headcount():
 
 
 def _build_dept_headcount(conn=None):
-    """按 DEPT_HEADCOUNT_SOURCE 选源构建 {部门路径: 在职人数}。
-    feishu(默认): 优先飞书 feishu_users；飞书无数据→回退飞连。
-    feishu_only:  只用飞书；没有就 {}。
+    """按 DEPT_HEADCOUNT_SOURCE 选源构建 {部门路径: 在职人数}(叶子级,roll-up 在消费点做)。
+    feishu(默认): 飞书(feishu_users 全员→people 子集兜底)；飞书无数据/被放行门挡→回退飞连。
+    feishu_only:  只用飞书(feishu_users→people)；都没有就 {}(不回退飞连)。
     feilian:      只用飞连(旧行为)。
     返回 (counts, source_used)。某一源失败按上述策略回退或抛给上层 graceful。"""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
