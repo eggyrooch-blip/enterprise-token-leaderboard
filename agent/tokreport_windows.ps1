@@ -124,21 +124,76 @@ function Get-OSLabel {
     }
 }
 
+function Ensure-Bun {
+    # 没有任何 JS 运行时(node/npx/bun)时,静默安装 Bun 到用户目录后返回 bun.exe 路径;
+    # 装不上返回 $null。设计要点(对齐"员工无感知"):
+    #   - 用户级安装,装进 %USERPROFILE%\.bun,【不需要管理员】(计划任务就是普通用户身份跑)
+    #   - 无弹窗:子 powershell -WindowStyle Hidden -NonInteractive 跑官方安装脚本
+    #   - 幂等:bun.exe 已存在直接复用,绝不重复下载
+    #   - 硬超时 + 全程 try/catch:装不上(如公司网络挡了 bun.sh)就返回 $null,
+    #     调用方退回发空数据,绝不让安装失败把上报打挂
+    $bunBin = Join-Path $env:USERPROFILE ".bun\bin"
+    $bunExe = Join-Path $bunBin "bun.exe"
+    if (Test-Path -LiteralPath $bunExe) {
+        return $bunExe
+    }
+    # 预算保护:安装可能要拉几十 MB,留足时间,时间不够这轮就不装(下轮再来)
+    if (((Get-Date) - $StartedAt).TotalSeconds -gt ($ScriptTimeoutSeconds - 200)) {
+        Log "skip bun install (insufficient time budget this run)"
+        return $null
+    }
+    Log "no JS runtime found; installing Bun silently to user profile"
+    try {
+        $installer = Join-Path $TmpDir "bun-install.ps1"
+        Invoke-WebRequest -UseBasicParsing -Uri "https://bun.sh/install.ps1" `
+            -OutFile $installer -TimeoutSec 30
+        $p = Start-Process -FilePath "powershell.exe" `
+            -ArgumentList @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $installer) `
+            -WindowStyle Hidden -PassThru
+        if (-not $p.WaitForExit(180000)) {
+            try { $p.Kill() } catch {}
+            Log "bun install timed out"
+            return $null
+        }
+    } catch {
+        Log "bun install failed: $($_.Exception.Message)"
+        return $null
+    }
+    if (Test-Path -LiteralPath $bunExe) {
+        Log "Bun installed to $bunBin"
+        return $bunExe
+    }
+    Log "bun install ran but bun.exe not found"
+    return $null
+}
+
 function Get-TokscaleCommand {
     $local = Get-Command "tokscale" -ErrorAction SilentlyContinue
     if ($local) {
+        Log "runtime: local tokscale found at $($local.Source)"
         return @{ File = $local.Source; Prefix = @() }
     }
     $npx = Get-Command "npx" -ErrorAction SilentlyContinue
     if ($npx) {
+        Log "runtime: no tokscale, using npx ($($npx.Source)) -> tokscale@latest"
         # Fallback command equivalent: npx -y tokscale@latest ...
         return @{ File = $npx.Source; Prefix = @("-y", "tokscale@latest") }
     }
     $bunx = Get-Command "bunx" -ErrorAction SilentlyContinue
     if ($bunx) {
+        Log "runtime: no tokscale, using bunx ($($bunx.Source)) -> tokscale@latest"
         # Fallback command equivalent: bunx tokscale@latest ...
         return @{ File = $bunx.Source; Prefix = @("tokscale@latest") }
     }
+    # 三者皆无(典型财务/非开发 Windows):静默装 Bun,再用 `bun x` 跑 tokscale。
+    Log "runtime: none of tokscale/npx/bunx present -> will auto-install Bun"
+    $bunExe = Ensure-Bun
+    if ($bunExe) {
+        Log "runtime: using freshly-handled bun ($bunExe) x tokscale@latest"
+        # `bun x tokscale@latest ...` 等价于 bunx;用显式 bun.exe 路径,免依赖 PATH 刷新。
+        return @{ File = $bunExe; Prefix = @("x", "tokscale@latest") }
+    }
+    Log "runtime: NO usable runtime and Bun install failed -> will send empty data"
     return $null
 }
 
@@ -225,8 +280,17 @@ function Invoke-TokscaleJson {
             }
             $json = Read-CleanJson -Path $out
             if ($json -and $json.Contains($Needle)) {
+                Log "$Display: ok (valid json, $($json.Length) chars)"
                 return $json
             }
+            # 没拿到含 Needle 的 JSON:把 stderr 头部记下来,直说为啥(命令找不到/tokscale 报错等)
+            $errHead = ""
+            if (Test-Path -LiteralPath $err) {
+                $errHead = (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue)
+            }
+            if ($errHead) { $errHead = ($errHead -replace "\s+", " ").Trim() }
+            if ($errHead.Length -gt 200) { $errHead = $errHead.Substring(0, 200) }
+            Log "$Display: no valid json on try $try (stderr: $errHead)"
         } catch {
             Log "$Display failed on try $($try): $($_.Exception.Message)"
         }
