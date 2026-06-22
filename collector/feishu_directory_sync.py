@@ -226,9 +226,14 @@ def ensure_tables(conn):
             leader_user_id TEXT DEFAULT '',
             chat_id TEXT DEFAULT '',
             group_owner_user_id TEXT DEFAULT '',
+            member_count INTEGER DEFAULT 0,
             status TEXT DEFAULT 'active',
             updated_at TEXT)"""
     )
+    # ``member_count`` was added later — backfill the column on pre-existing DBs so
+    # the headcount source can read the Feishu recursive department total.
+    _add_column_if_missing(conn, "departments", "member_count",
+                           "member_count INTEGER DEFAULT 0")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS department_attributions(
             source_dept_id TEXT PRIMARY KEY,
@@ -681,20 +686,27 @@ def write_directory_snapshot(
         if not dept_id:
             continue
         path = d.get("path") or dept_path_by_id.get(dept_id, "") or _sstr(d.get("name"))
+        # member_count = Feishu's recursive department total (incl. all sub-depts),
+        # NOT subject to contact visibility scoping — the authoritative headcount.
+        try:
+            member_count = int(d.get("member_count") or 0)
+        except (TypeError, ValueError):
+            member_count = 0
         conn.execute(
             """INSERT INTO departments(dept_id,open_dept_id,parent_id,name,path,
-                   leader_user_id,chat_id,group_owner_user_id,status,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?)
+                   leader_user_id,chat_id,group_owner_user_id,member_count,status,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(dept_id) DO UPDATE SET
                    open_dept_id=excluded.open_dept_id, parent_id=excluded.parent_id,
                    name=excluded.name, path=excluded.path,
                    leader_user_id=excluded.leader_user_id, chat_id=excluded.chat_id,
                    group_owner_user_id=excluded.group_owner_user_id,
+                   member_count=excluded.member_count,
                    status=excluded.status, updated_at=excluded.updated_at""",
             (dept_id, _sstr(d.get("open_dept_id")), _sstr(d.get("parent_id")),
              _sstr(d.get("name")), path, _sstr(d.get("leader_user_id")),
              _sstr(d.get("chat_id")), _sstr(d.get("group_owner_user_id")),
-             _sstr(d.get("status") or "active"), stamp),
+             member_count, _sstr(d.get("status") or "active"), stamp),
         )
 
     # --- department_attributions (with downgrade protection) ---

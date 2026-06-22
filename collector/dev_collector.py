@@ -1859,7 +1859,23 @@ def _upsert_report_person(conn, identity):
 _DEPT_HEADCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(DB)), "dept_headcount.json")
 _DEPT_HEADCOUNT_TTL = 6 * 3600  # 6 小时
 _dept_headcount_mem = None  # 进程内一次性缓存，避免每请求读盘
+_dept_headcount_source_used_mem = None  # 同上,记录本次 map 实际用的口径(决定是否 roll-up)
 _DEPT_HEADCOUNT_SOURCE = os.environ.get("DEPT_HEADCOUNT_SOURCE", "feishu").strip().lower()
+
+# member_count 口径:值已含子部门(递归),消费点必须直接查表,绝不 _ancestors 求和。
+_HEADCOUNT_SOURCE_PRECOUNTED = "feishu_member_count"
+
+
+def _dept_headcount_is_precounted(source_used):
+    """True ⇒ counts 已是【每节点最终递归值】(member_count),消费点直接 lookup,不 roll-up。
+    False ⇒ 叶子级计数(feishu_users/people/飞连),消费点照常 _ancestors roll-up。"""
+    return source_used == _HEADCOUNT_SOURCE_PRECOUNTED
+
+
+def _dept_headcount_source_used():
+    """返回最近一次 _dept_headcount_map 实际使用的口径标记(供消费点决定是否 roll-up)。
+    None ⇒ 尚未构建(调用方应先调 _dept_headcount_map)。"""
+    return _dept_headcount_source_used_mem
 
 
 def _feishu_headcount_blocked(conn):
@@ -1919,15 +1935,72 @@ def _fetch_headcount_people(conn):
     return _count_by_dept_path(rows)
 
 
+def _fetch_headcount_feishu_member_count(conn):
+    """【主源】departments.member_count = 飞书 contact v3 每个部门的【递归含所有子部门】
+    真实人数,且【不受"通讯录用户可见范围"限制】(即使只能看到 2 个用户,member_count 仍是
+    真实总数)。这是 headcount 的权威源。
+
+    ⚠️口径关键:member_count 已经是递归值(含子部门),所以这里返回的是【每个部门的最终人数】,
+    消费点【绝不能】再走 _ancestors roll-up 求和(会重复计数)。本函数返回
+    {归一化部门路径: member_count} 的【直接查值表】,消费点必须按 dept_path 直接 lookup。
+
+    缺表/无 member_count 列/全为 0(老库未回填)→ None,让上层回退 feishu_users。
+    异常 → 抛出,由上层 graceful。"""
+    cols = _table_columns_owner(conn)
+    if "departments" not in cols:
+        return None
+    try:
+        dept_cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(departments)").fetchall()}
+    except Exception:
+        return None
+    if "member_count" not in dept_cols:
+        return None  # 老库未加列 → 回退 feishu_users
+    rows = conn.execute(
+        "SELECT path, member_count FROM departments"
+        " WHERE COALESCE(path,'')<>'' AND COALESCE(member_count,0)>0"
+    ).fetchall()
+    if not rows:
+        return None  # 生产库副本尚无 member_count 数据 → 优雅回退
+    counts = {}
+    for path, mc in rows:
+        npath = _normalize_dept_path(path)
+        if not npath:
+            continue
+        try:
+            mc = int(mc or 0)
+        except (TypeError, ValueError):
+            mc = 0
+        if mc <= 0:
+            continue
+        # 同一归一化路径若有多条(理论上少见),取最大值(更完整的递归口径),不求和。
+        counts[npath] = max(counts.get(npath, 0), mc)
+    return counts or None
+
+
 def _fetch_dept_headcount_feishu(conn):
-    """飞书组织架构部门总人数(叶子级 {department_path: 人数})。数据源优先级：
-        feishu_users(全员表,主) → people(子集,兜底)
+    """飞书组织架构部门总人数。返回 (counts, source_used) 或 None。数据源优先级：
+        departments.member_count(递归含子部门,直接查值,主)
+          → feishu_users(全员表,叶子计数需 roll-up,兜底)
+          → people(子集,兜底)
+    source_used 标记口径,供消费点决定是否 roll-up：
+        'feishu_member_count' → 已是递归值,消费点【直接查表,不 roll-up】
+        'feishu'              → 叶子级计数,消费点照常 _ancestors roll-up
     放行门：feishu_directory_sync 标记 production_enablement_blocked=1(覆盖率<0.8)时,
-    飞书侧数据残缺 → 直接返回 None,让上层回退飞连,绝不显示残缺人数。
-    两个飞书源都缺表/为空 → 返回 None(让上层决定是否回退飞连)。异常 → 抛出,上层 graceful。"""
+    feishu_users/people 侧数据残缺 → 不用它们;但 member_count 不受可见范围限制,
+    放行门【不影响 member_count】(放行门只挡用户级残缺,不挡部门递归总数)。
+    全部为空 → None(让上层回退飞连)。异常 → 抛出,上层 graceful。"""
+    # member_count 不受通讯录可见范围限制,放行门不挡它(放行门只针对用户级残缺)。
+    mc = _fetch_headcount_feishu_member_count(conn)
+    if mc:
+        return mc, "feishu_member_count"
+    # 回退到用户级计数源(受放行门约束:覆盖率不足时不可信)。
     if _feishu_headcount_blocked(conn):
-        return None  # 覆盖率不足,飞书数据不可信 → 交给上层回退飞连
-    return _fetch_headcount_feishu_users(conn) or _fetch_headcount_people(conn)
+        return None  # 覆盖率不足,用户级飞书数据不可信 → 交给上层回退飞连
+    users = _fetch_headcount_feishu_users(conn) or _fetch_headcount_people(conn)
+    if users:
+        return users, "feishu"
+    return None
 
 
 def _table_columns_owner(conn):
@@ -1977,7 +2050,8 @@ def _build_dept_headcount(conn=None):
     if src in ("feishu", "feishu_only") and conn is not None:
         fc = _fetch_dept_headcount_feishu(conn)
         if fc:
-            return fc, "feishu"
+            counts, source_used = fc  # source_used: feishu_member_count | feishu
+            return counts, source_used
         if src == "feishu_only":
             return {}, "feishu_only"
         # src == "feishu": 飞书没数据 → 回退飞连
@@ -1990,8 +2064,10 @@ def _dept_headcount_map(conn=None):
     """部门完整路径 → 在职总人数。带 6h 文件缓存(DB 同目录 dept_headcount.json)。
     默认数据源飞书(DEPT_HEADCOUNT_SOURCE)，飞书无数据回退飞连。
     懒加载、graceful：任何数据源/IO 异常返回空 dict(或旧缓存)，绝不让 _teams 报错。
-    缓存按 source 隔离：换源不会吃到旧源的脏缓存。"""
-    global _dept_headcount_mem
+    缓存按 source 隔离：换源不会吃到旧源的脏缓存。
+    同时记录本次实际口径(_dept_headcount_source_used_mem),消费点据此决定是否 roll-up：
+    member_count 口径已是递归值 → 直接查表;其余叶子级 → _ancestors roll-up。"""
+    global _dept_headcount_mem, _dept_headcount_source_used_mem
     if _dept_headcount_mem is not None:
         return _dept_headcount_mem
     now = time.time()
@@ -2005,6 +2081,9 @@ def _dept_headcount_map(conn=None):
             same_src = cached.get("source", "feilian") == _DEPT_HEADCOUNT_SOURCE
             if counts and same_src and (now - ts) < _DEPT_HEADCOUNT_TTL:
                 _dept_headcount_mem = counts
+                # source_used 决定是否 roll-up,必须从缓存恢复(默认按叶子级兼容旧缓存)。
+                _dept_headcount_source_used_mem = cached.get(
+                    "source_used", _DEPT_HEADCOUNT_SOURCE)
                 return counts
     except Exception:
         cached = None  # 缓存损坏，往下走重建
@@ -2021,15 +2100,19 @@ def _dept_headcount_map(conn=None):
         except Exception:
             pass
         _dept_headcount_mem = counts
+        _dept_headcount_source_used_mem = source_used
         return counts
     except Exception:
         # 数据源失败：若有旧缓存(即便过期/异源)兜底好过空;否则空 dict
         try:
             if os.path.exists(_DEPT_HEADCOUNT_FILE):
                 with open(_DEPT_HEADCOUNT_FILE) as f:
-                    stale = (json.load(f) or {}).get("counts") or {}
+                    stale_blob = json.load(f) or {}
+                stale = stale_blob.get("counts") or {}
                 if stale:
                     _dept_headcount_mem = stale
+                    _dept_headcount_source_used_mem = stale_blob.get(
+                        "source_used", _DEPT_HEADCOUNT_SOURCE)
                     return stale
         except Exception:
             pass
@@ -3131,9 +3214,26 @@ class H(BaseHTTPRequestHandler):
         # 命中/兜底时不会重算 → 必须在消费点再归一化一次(幂等),否则归并后的真实叶子拿不到 headcount。
         headcount_map = _dept_headcount_map(conn)
         node_hc = {}
-        for path, cnt in headcount_map.items():
-            for anc in _ancestors(_normalize_dept_path(path)):
-                node_hc[anc] = node_hc.get(anc, 0) + (cnt or 0)
+        if _dept_headcount_is_precounted(_dept_headcount_source_used()):
+            # member_count 口径:每个值已是【递归含子部门】的真实总数 → 直接按 dept_path
+            # 查值,【绝不】_ancestors 求和(那会把已含子部门的父值再叠加子值,重复计数翻倍)。
+            for path, cnt in headcount_map.items():
+                node_hc[_normalize_dept_path(path)] = (cnt or 0)
+            # 唯一例外:合成的 'Keep' 顶级根不是真实飞书部门,没有自己的 member_count。
+            # 它的总数 = 各顶层部门(depth==1, 'Keep/<部门>')member_count 之和 —— 只加最顶一层,
+            # 不是递归 roll-up(顶层之间互不包含,不会重复)。结果 ≈1297。
+            keep_total = sum(
+                cnt for npath, cnt in node_hc.items()
+                if npath != "Keep" and npath.startswith("Keep/")
+                and npath.count("/") == 1)
+            if keep_total > 0:
+                node_hc["Keep"] = keep_total
+        else:
+            # 叶子级计数(feishu_users/people/飞连):每个值是该叶子组的人数 →
+            # _ancestors roll-up,累加到每一级父部门。
+            for path, cnt in headcount_map.items():
+                for anc in _ancestors(_normalize_dept_path(path)):
+                    node_hc[anc] = node_hc.get(anc, 0) + (cnt or 0)
 
         def _bucket_metric():
             return {"tokens": 0, "cost": 0.0, "messages": 0, "credits": 0.0,

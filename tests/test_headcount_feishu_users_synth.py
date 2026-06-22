@@ -83,10 +83,19 @@ def main():
         if not ok:
             failures.append(name)
 
-    # --- 场景1:feishu_users 为主源,叶子级计数 ---
+    def _counts(ret):
+        """_fetch_dept_headcount_feishu 现返回 (counts, source_used)；None 表示无源。"""
+        if ret is None:
+            return None
+        counts, _src = ret
+        return counts
+
+    # --- 场景1:无 member_count 列时 feishu_users 为兜底主源,叶子级计数 ---
     c1 = sqlite3.connect(":memory:")
     _mk_feishu_users(c1)
-    leaf = dc._fetch_dept_headcount_feishu(c1)
+    ret1 = dc._fetch_dept_headcount_feishu(c1)
+    check("无 member_count→口径=feishu", ret1[1], "feishu")
+    leaf = _counts(ret1)
     check("leaf 安全组=2", leaf.get("Keep/技术平台部/基础技术部/安全组"), 2)
     check("leaf 固件组=3", leaf.get("Keep/技术平台部/基础技术部/固件组"), 3)
     check("leaf 技术平台部(直属)=1", leaf.get("Keep/技术平台部"), 1)
@@ -102,7 +111,7 @@ def main():
     # --- 场景3:无 feishu_users → 回退 people 子集 ---
     c2 = sqlite3.connect(":memory:")
     _mk_people(c2)
-    leaf_p = dc._fetch_dept_headcount_feishu(c2)
+    leaf_p = _counts(dc._fetch_dept_headcount_feishu(c2))
     check("people 兜底 产品部叶子=2", leaf_p.get("Keep/产品部"), 2)
     check("people 兜底 增长组叶子=1", leaf_p.get("Keep/产品部/增长组"), 1)
     rolled_p = _rollup(leaf_p)
@@ -115,12 +124,12 @@ def main():
     c3.execute("INSERT INTO app_state VALUES('feishu_directory_sync_production_enablement_blocked','1')")
     c3.commit()
     blocked = dc._fetch_dept_headcount_feishu(c3)
-    check("放行门挡住→None", blocked, None)
+    check("放行门挡住 feishu_users→None", blocked, None)
 
     # 放行门=0 时不挡(用同库验证)
     c3.execute("UPDATE app_state SET value='0' WHERE key='feishu_directory_sync_production_enablement_blocked'")
     c3.commit()
-    unblocked = dc._fetch_dept_headcount_feishu(c3)
+    unblocked = _counts(dc._fetch_dept_headcount_feishu(c3))
     check("放行门=0→正常出数(安全组=2)", unblocked.get("Keep/技术平台部/基础技术部/安全组"), 2)
 
     print()
