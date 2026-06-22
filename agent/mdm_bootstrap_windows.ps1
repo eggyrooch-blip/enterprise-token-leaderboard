@@ -1,7 +1,7 @@
 param(
     [string]$Collector = $env:COLLECTOR,
     [string]$Token = $env:TOKEN,
-    [int]$Version = 5,
+    [int]$Version = 6,
     [string]$InstallDir = (Join-Path $env:ProgramData "TokReport"),
     [string]$TaskName = "TokReport"
 )
@@ -87,9 +87,17 @@ try {
         Invoke-WebRequest -UseBasicParsing -Uri $downloadUrl -OutFile $tmp -TimeoutSec 30
         $downloaded = Get-Content -LiteralPath $tmp -Raw -Encoding UTF8
         if ($downloaded -match "v1/tokscale/report" -and $downloaded -match "param\s*\(") {
-            Move-Item -LiteralPath $tmp -Destination $scriptPath -Force
-            $fresh = $true
-            Log "downloaded $downloadUrl"
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseInput($downloaded, [ref]$null, [ref]$parseErrors)
+            if ($parseErrors -and $parseErrors.Count -gt 0) {
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                $first = $parseErrors[0]
+                Log "download rejected: $($parseErrors.Count) parse error(s); first @ line $($first.Extent.StartLineNumber): $($first.Message)"
+            } else {
+                Move-Item -LiteralPath $tmp -Destination $scriptPath -Force
+                $fresh = $true
+                Log "downloaded $downloadUrl (content + syntax validated)"
+            }
         } else {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
             Log "download validation failed: $downloadUrl"

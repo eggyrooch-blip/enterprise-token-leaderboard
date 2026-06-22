@@ -27,6 +27,9 @@ def test_windows_reporter_collects_serial_and_posts_existing_tokscale_payload():
     assert "monthly --json --no-spinner" in script
     assert "graph --since" in script
     assert "npx -y tokscale@latest" in script
+    assert "[System.IO.Path]::ChangeExtension($npxFile, 'cmd')" in script
+    assert "if (Test-Path -LiteralPath $cmd) { $npxFile = $cmd }" in script
+    assert 'return @{ File = $npxFile; Prefix = @("-y", "tokscale@latest") }' in script
     assert "bunx tokscale@latest" in script
     assert ".cmd" in script
     assert ".ps1" in script
@@ -34,6 +37,7 @@ def test_windows_reporter_collects_serial_and_posts_existing_tokscale_payload():
     assert '@("/d", "/c", $cmdLine)' in script
     assert '"/s"' not in script
     assert "powershell.exe" in script
+    assert '"-File", (\'"\' + $File + \'"\')' in script
     assert "Rename-Computer" not in script
 
 
@@ -61,7 +65,8 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     script = BOOTSTRAP.read_text(encoding="utf-8")
 
     assert "$env:ProgramData" in script
-    assert "[int]$Version = 5" in script
+    assert "[int]$Version = 6" in script
+    assert "tok_" not in script
     assert "tokreport.ps1" in script
     assert "/tokreport.ps1" in script
     assert "Register-ScheduledTask" in script
@@ -78,6 +83,9 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     assert "-WindowStyle Hidden" in script
     assert ".version" in script
     assert "v1/tokscale/report" in script
+    assert "[System.Management.Automation.Language.Parser]::ParseInput" in script
+    assert "download rejected:" in script
+    assert "syntax validated" in script
     assert "LaunchAgent" not in script
 
 

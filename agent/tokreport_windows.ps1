@@ -175,9 +175,17 @@ function Get-TokscaleCommand {
     }
     $npx = Get-Command "npx" -ErrorAction SilentlyContinue
     if ($npx) {
-        Log "runtime: no tokscale, using npx ($($npx.Source)) -> tokscale@latest"
+        # Get-Command often resolves to npx.ps1. If the path lives under
+        # C:\Program Files, powershell -File can split the unquoted path.
+        # Prefer the sibling npx.cmd and route through the cmd branch.
+        $npxFile = $npx.Source
+        if ($npxFile -like '*.ps1') {
+            $cmd = [System.IO.Path]::ChangeExtension($npxFile, 'cmd')
+            if (Test-Path -LiteralPath $cmd) { $npxFile = $cmd }
+        }
+        Log "runtime: no tokscale, using npx ($npxFile) -> tokscale@latest"
         # Fallback command equivalent: npx -y tokscale@latest ...
-        return @{ File = $npx.Source; Prefix = @("-y", "tokscale@latest") }
+        return @{ File = $npxFile; Prefix = @("-y", "tokscale@latest") }
     }
     $bunx = Get-Command "bunx" -ErrorAction SilentlyContinue
     if ($bunx) {
@@ -239,7 +247,7 @@ function Start-CapturedProcess {
         if ($found) {
             $psExe = $found.Source
         }
-        $psArgs = @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $File) + $Arguments
+        $psArgs = @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ('"' + $File + '"')) + $Arguments
         return Start-Process -FilePath $psExe -ArgumentList $psArgs `
             -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath `
             -NoNewWindow -PassThru
