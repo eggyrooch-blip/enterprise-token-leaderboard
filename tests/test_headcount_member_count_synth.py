@@ -236,8 +236,13 @@ def main():
     print()
     if failures:
         print("RESULT: FAIL ->", failures)
-        sys.exit(1)
+        raise AssertionError("headcount member_count synth failures: %s" % failures)
     print("RESULT: ALL PASS")
+
+
+def test_headcount_member_count_synth():
+    """pytest 入口:让 TEST 门(pytest)也能收集并跑核心 SPEC 契约,而非仅脚本。"""
+    main()
 
 
 if __name__ == "__main__":

@@ -135,8 +135,13 @@ def main():
     print()
     if failures:
         print("RESULT: FAIL ->", failures)
-        sys.exit(1)
+        raise AssertionError("headcount feishu_users synth failures: %s" % failures)
     print("RESULT: ALL PASS")
+
+
+def test_headcount_feishu_users_synth():
+    """pytest 入口:让 TEST 门也能收集并跑此契约。"""
+    main()
 
 
 if __name__ == "__main__":

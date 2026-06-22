@@ -2130,7 +2130,17 @@ def _dept_headcount_map(conn=None):
     member_count 口径已是递归值 → 直接查表;其余叶子级 → _ancestors roll-up。"""
     global _dept_headcount_mem, _dept_headcount_source_used_mem
     if _dept_headcount_mem is not None:
-        return _dept_headcount_mem
+        # 进程内缓存也要防陈旧(2026-06-22 codex 评审):长跑服务启动时若无 member_count
+        # 而预热了回退值,等定时 sync 灌好 member_count 后,不重启进程也要能升级到真值。
+        mem_stale = (
+            _DEPT_HEADCOUNT_SOURCE in ("feishu", "feishu_only")
+            and _dept_headcount_source_used_mem != "feishu_member_count"
+            and conn is not None
+            and _member_count_available(conn)
+        )
+        if not mem_stale:
+            return _dept_headcount_mem
+        # member_count 现已就绪 → 作废内存缓存,往下重建
     now = time.time()
     # 1) 文件缓存命中且未过期且同源 → 直接用
     try:
