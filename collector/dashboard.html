@@ -217,8 +217,8 @@
 
   <div class="wrap">
     <div class="kpis">
-      <div class="kpi hero"><div class="v num" id="k-tok">—</div><div class="k">亿 Tokens · 累计</div></div>
-      <div class="kpi"><div class="v num" id="k-cost">—</div><div class="k">公司实付（美元）</div></div>
+      <div class="kpi hero" title="纯 token 累计（网关 litellm/api 计量）。飞书 AI 权益「点」是另一口径，不并入此处，见「飞书 AI 权益」tab"><div class="v num" id="k-tok">—</div><div class="k">亿 Tokens · 累计</div></div>
+      <div class="kpi" title="估算合计 = 网关实销（litellm/api 计量）+ 订阅席位摊销。含摊销，比纯网关实付大；榜内各行 $ 同为此估算口径"><div class="v num" id="k-cost">—</div><div class="k">公司实付·估算（含订阅摊销）</div></div>
       <div class="kpi"><div class="v num" id="k-msg">—</div><div class="k">总消息</div></div>
       <div class="kpi"><div class="v num" id="k-ppl">—</div><div class="k">已接入人数</div></div>
     </div>
@@ -247,7 +247,7 @@
     </div>
     <div class="card" id="list"><div class="empty">加载中…</div></div>
 
-    <div class="foot" id="foot">个人榜公司实付 = 网关实销 + 订阅席位摊销 + 飞书点数折算；部门榜金额标为估算，仅作参考。个人榜默认不含归属 Agent 消耗，Agent 榜与 /v1/agent_owner_summary 单独统计。公开默认只使用聚合计数，不采集 prompt 或代码内容。</div>
+    <div class="foot" id="foot">两种 $ 口径：顶部「公司实付·估算」与个人榜/部门榜各行 $ 均为「估算 = 网关实销（litellm/api 计量）+ 订阅席位摊销」，含摊销故比纯网关实付大，仅作参考。Token 一律以纯 token 为准（网关计量）；飞书 AI 权益「点」是另一口径，不并入 token 与 cost，单独见「飞书 AI 权益」tab。个人榜默认不含归属 Agent 消耗，Agent 榜与 /v1/agent_owner_summary 单独统计。公开默认只使用聚合计数，不采集 prompt 或代码内容。</div>
   </div>
 
 <script>
@@ -455,7 +455,7 @@ function renderFeishu(){
   var pkgUsd=(+d.package_usd)||0;
   var pkgPoints=(+d.package_points)||0;
   var pkgUsdTxt=usdPerPoint?('<div class="fs-q-pkg">套餐总价 ≈$'+(pkgUsd||pkgPoints*usdPerPoint).toLocaleString(undefined,{maximumFractionDigits:0})+'</div>'):'';
-  // 口径说明:点数→千点美元单价 + 汇率(均可配,后端下发);点数成本计入个人榜公司实付。
+  // 口径说明:点数→千点美元单价 + 汇率(均可配,后端下发);「点」独立统计,不并入个人榜 token/cost。
   var cny=(+d.package_cny)||0, cnyPerUsd=(+d.cny_per_usd)||0;
   var per1k=(usdPerPoint*1000).toFixed(2);
   var cnyTxt=cny?('¥'+cny.toLocaleString(undefined,{maximumFractionDigits:0})):'¥99,000';
@@ -463,8 +463,8 @@ function renderFeishu(){
   var fxTxt=cnyPerUsd?cnyPerUsd.toString():'7.15';
   var cnyPerPt=(pkgPoints&&cny)?(cny/pkgPoints).toFixed(4):'0.0495';
   var caption=usdPerPoint
-    ? ('计费:'+cnyTxt+'/'+ptsTxt+' = ¥'+cnyPerPt+'/点 ≈ $'+per1k+'/千点(汇率 '+fxTxt+',可配);点数成本计入个人榜公司实付（点数仍按 1点=1token 并入 token 总量）')
-    : '单位：点（飞书 AI 权益消耗，与上方 token 为不同口径，不加总）';
+    ? ('计费:'+cnyTxt+'/'+ptsTxt+' = ¥'+cnyPerPt+'/点 ≈ $'+per1k+'/千点(汇率 '+fxTxt+',可配)。「点」与 token 是两种口径,不加总;此盘独立统计,不并入个人榜/部门榜的 token 与 $。')
+    : '单位：点（飞书 AI 权益消耗，与 token 为不同口径，不加总，此盘独立统计）';
   $('list').innerHTML='<div class="fs-unit">'+caption+'</div>'+pkgUsdTxt+
     '<div class="fs-quota">'+quotaHTML+'</div>'+
     '<div class="fs-sec-t">个人消耗榜<span class="fs-per">'+(d.period_start||'—')+' ~ '+(d.period_end||'—')+'</span></div>'+body;
@@ -527,9 +527,9 @@ function renderTeamTree(){
       } else { sub='使用 '+(x.people||0)+' 人'; }
       var pct=Math.max(2,mv(x)/max*100), share=tot?(mv(x)/tot*100):0;
       var big=compact(mv(x))+'/人';
-      // 人均点数(飞书 aily,单位「点」)与 token 分列,不加总;只在该部门有 aily 用量时显示
-      var creditTag=(x.per_capita_credits>0)?(' · 人均 '+compact(x.per_capita_credits)+' 点'):'';
-      var small='总 '+compact(metricTok(x.tokens||0))+' · 估算 $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%'+creditTag;
+      // 飞书 AI 权益「点」不在主榜展示(2026-06-22 孙可:与 token 不同口径,统一以 token 为准);
+      // 「点」只保留在「飞书 AI 权益」tab。此处 $ 为估算(含订阅席位摊销)。
+      var small='总 '+compact(metricTok(x.tokens||0))+' · 估算$(含订阅摊销) '+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%';
       var pad=depth*18;                                 // 每级缩进 18px,层级靠缩进体现
       // 有子节点的行:整行可点(data-path + 手型光标),点哪都展开/收起,不必精准点三角
       var rowAttr=hasKids?(' data-path="'+encodeURIComponent(x.dept)+'" style="cursor:pointer"'):'';
@@ -621,7 +621,8 @@ function render(){
         var segs=x.composition.map(function(s){return '<span class="seg" style="width:'+s.pct+'%;background:'+toolColor(s.client)+'" title="'+s.client+' '+s.pct+'%"></span>';}).join('');
         fillHTML='<div class="fill stacked" style="width:'+pct+'%">'+segs+'</div>';
         big=compact(mv(x));                              // 日均模式自动除天数
-        small='主力 '+shortTool(top.client)+' '+top.pct+'% · $'+grp(Math.round(metricCost(x.cost||0)));
+        // 个人榜 $ = 估算(网关实销 + 订阅席位摊销), 比顶部「网关实付」大; 标清口径
+        small='主力 '+shortTool(top.client)+' '+top.pct+'% · 估算$ '+grp(Math.round(metricCost(x.cost||0)));
       }
     } else if(isCur){
       fillHTML='<div class="fill" style="width:'+pct+'%;background:'+toolColor("Cursor")+'"></div>';
@@ -635,14 +636,15 @@ function render(){
       // 部门榜:主指标=人均(已含日均口径);副标题给总量做参考
       fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
       big=compact(mv(x))+'/人';
-      small='总 '+compact(metricTok(x.tokens||0))+' · 估算 $'+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%';
+      small='总 '+compact(metricTok(x.tokens||0))+' · 估算$(含订阅摊销) '+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%';
     } else if(isPersonCost){
       fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
       big='$'+grp(Math.round(mv(x)));
       small='总 '+compact(metricTok(x.tokens||0))+' · '+share.toFixed(1)+'%';
     } else {
       fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
-      big=compact(mv(x)); small='$'+grp(Math.round(CUR==='person'?metricCost(x.cost||0):(x.cost||0)))+(x.messages?(' · '+grp(x.messages)+' 条'):'')+' · '+share.toFixed(1)+'%';
+      var __cd=(CUR==='person'?'估算$ ':'$')+grp(Math.round(CUR==='person'?metricCost(x.cost||0):(x.cost||0)));
+      big=compact(mv(x)); small=__cd+(x.messages?(' · '+grp(x.messages)+' 条'):'')+' · '+share.toFixed(1)+'%';
     }
     return '<div class="r"><span class="rk num '+(i===0?'first':'')+'">'+(i+1)+'</span>'+av+
       '<div class="nm">'+name+(sub?'<div class="sub">'+sub+'</div>':'')+'</div>'+

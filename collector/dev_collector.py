@@ -1919,11 +1919,11 @@ def _dept_headcount_map():
 def _personal_board_rows(conn, qs, auth_user=None):
     """个人榜「按人」计算 —— 唯一口径, /v1/leaderboard 与 /v1/ai/usage 共用(2026-06-16)。
 
-    token = SUM(total) + 飞书权益点(1点=1token);
-    cost  = 公司实付 = 网关实销 SUM(CASE source IN('litellm','api') THEN cost)
-                      + 飞书点成本(credits×USD_PER_POINT)
-                      + 订阅费按「窗口∩席位区间」摊销(_interval_fraction)。
-    过滤 litellm_agent + 合成身份 + 离职(默认)。已并入飞书(含纯飞书行)并按 tokens 降序。
+    token = SUM(total)  —— 纯 token, 不含飞书权益「点」(2026-06-22: 点与 token 是两种口径,
+                          不加总; 飞书 credits 见 feishu_credits 字段与「飞书 AI 权益」tab);
+    cost  = 估算 = 网关实销 SUM(CASE source IN('litellm','api') THEN cost)
+                  + 订阅费按「窗口∩席位区间」摊销(_interval_fraction)。  ← 含订阅摊销, 标为「估算」。
+    过滤 litellm_agent + 合成身份 + 离职(默认)。飞书 credits 仅附记到已有 token 行, 按 tokens 降序。
     不接受 ?client(那是工具榜, 仍在 _leaderboard 内)。
     """
     where, params = _range_clause(qs, "u.")
@@ -1980,7 +1980,9 @@ def _personal_board_rows(conn, qs, auth_user=None):
 
     subs_by_email = load_subscriptions(conn)
 
-    # 飞书 AI 权益并入(1 点 = 1 token; 纯飞书用户也建行)。
+    # 飞书 AI 权益(credits/「点」)单独记录, 不并入主榜 token/cost(2026-06-22 孙可):
+    # 「点」与 token 是两种口径, 加总会让个人榜大数与详情「点」对不上。credits 只保留在
+    # row["feishu_credits"]/["feishu_cost"] 供飞书 AI 权益 tab 用; 纯飞书用户仍建行(token=0)。
     frng, fparams = _feishu_range(qs)
     fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
     fex, fex_params = _excluded_filter(qs, "")
@@ -1994,25 +1996,12 @@ def _personal_board_rows(conn, qs, auth_user=None):
             continue
         row = by_email.get(fem)
         if row is None:
-            pr = conn.execute("SELECT dept,name,avatar FROM people WHERE email=?",
-                              (fem,)).fetchone()
-            dept = (_to_keep(pr[0]) if pr and pr[0] else None) \
-                or _to_keep(fdept) or _normalize_dept_path(fdept) or "unknown"
-            row = {"email": fem, "dept": dept,
-                   "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
-                   "reasoning": 0, "tokens": 0, "cost": 0, "messages": 0,
-                   "name": (pr[1] if pr and pr[1] else None) or fname or fem.split("@")[0],
-                   "avatar": (pr[2] if pr and pr[2] else None) or favatar or "",
-                   "via": "", "departed": fem in departed, "composition": [],
-                   "subs": []}
-            result.append(row)
-            by_email[fem] = row
-        row["tokens"] = (row["tokens"] or 0) + credits
+            # 纯飞书用户(无 token 用量)不再在主 token 榜建零行 —— 他们归属「飞书 AI 权益」
+            # tab(独立 /v1/feishu 查询, 不依赖此处)。主榜只保留有真实 token 的人。
+            continue
+        # 仅在已有 token 行上附记 credits/「点」, 不并入 row["tokens"] 与 row["cost"]。
         row["feishu_credits"] = credits
-        fc = round(credits * FEISHU_USD_PER_POINT, 4)
-        row["feishu_cost"] = fc
-        row["cost"] = round(float(row["cost"] or 0) + credits * FEISHU_USD_PER_POINT, 4)
-        row["composition"].append({"client": "飞书AI权益", "tokens": credits})
+        row["feishu_cost"] = round(credits * FEISHU_USD_PER_POINT, 4)
 
     # 订阅费按窗口摊销并入个人榜 cost。
     usage_window_start = {}
