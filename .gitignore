@@ -37,3 +37,5 @@ collector/feishu/_login_profile/
 collector/feishu/feishu_probe_*.py
 *feishu_state.json
 .feishu/
+*.db
+dept_headcount.json

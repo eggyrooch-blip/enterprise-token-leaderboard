@@ -1513,6 +1513,43 @@ def _normalize_dept_path(path):
     return "/".join(out) if out else path
 
 
+# 外部合作商在部门榜里收口成的单一父节点路径(与 _normalize_dept_path 的口径一致)。
+_CONTRACTOR_NODE = "Keep/外部合作商"
+
+
+def _member_count_dept_key(raw_path):
+    """departments.path(飞书 contact v3 原始路径,通常【裸】无 Keep 前缀,如 '技术平台部'
+    /'合作商'/'合作商/W/...'/'合作商/V/技术平台部-...')→ 与 _teams 人员归并后【同命名空间】
+    的部门键 + 是否合作商(外包)标记。返回 (dept_key, is_contractor) 或 (None, _)。
+
+    关键修复(2026-06-22):
+      * 命名空间错配:裸路径 '技术平台部' 必须补 'Keep/' 前缀 → 'Keep/技术平台部',
+        否则与人员侧 _canon_dept 产出的 'Keep/技术平台部' 对不上,lookup 全 miss。
+      * 合作商错映射:'合作商'(及其整棵子树 W/V)绝不能折进真实 Keep 部门或顶成 Keep 根。
+        整棵 合作商 子树统一收口到单一 _CONTRACTOR_NODE='Keep/外部合作商',
+        其 member_count 只进【含外包】口径,绝不进【员工】口径,也绝不污染真实部门。
+    member_count 是递归值:本函数只做命名空间映射,不 roll-up、不拆短横折回真实树
+    (那会与真实部门的 member_count 双重计数)。"""
+    if not raw_path:
+        return None, False
+    segs = [s for s in str(raw_path).split("/") if s]
+    if not segs:
+        return None, False
+    # 已带 Keep 前缀的先剥掉,统一按裸路径处理(幂等)。
+    if segs[0] == "Keep":
+        segs = segs[1:]
+        if not segs:
+            return None, False
+    # 合作商子树(整棵 W/V/裸):全部是外包 → 单一外部合作商节点,只计含外包。
+    if segs[0] == "合作商":
+        return _CONTRACTOR_NODE, True
+    # 任一段带 (SP数字) 的供应商公司 → 同样归外部合作商。
+    if any(_SP_RE.search(s) for s in segs):
+        return _CONTRACTOR_NODE, True
+    # 真实部门:补 Keep 前缀,命名空间与人员侧一致。
+    return "Keep/" + "/".join(segs), False
+
+
 def _to_keep(raw):
     """任意 dept 字符串 → 归一化后的 Keep 路径；归不到 Keep 树(裸非 SP 组名/空/unknown)→ None。
     裸供应商公司名(带 SP 码)经 _normalize_dept_path 会变 'Keep/外部合作商/...'，故能被收口；
@@ -1942,7 +1979,11 @@ def _fetch_headcount_feishu_member_count(conn):
 
     ⚠️口径关键:member_count 已经是递归值(含子部门),所以这里返回的是【每个部门的最终人数】,
     消费点【绝不能】再走 _ancestors roll-up 求和(会重复计数)。本函数返回
-    {归一化部门路径: member_count} 的【直接查值表】,消费点必须按 dept_path 直接 lookup。
+    {部门键: [total, staff]} 的【直接查值表】,消费点必须按 dept_path 直接 lookup。
+      * total(含外包)= 该部门递归 member_count;
+      * staff(员工) = 排除外部合作商子树后的 member_count。
+    部门键经 _member_count_dept_key 映射到与人员侧【同命名空间】(裸 '技术平台部' → 补
+    'Keep/技术平台部';整棵 合作商 子树收口到单一 'Keep/外部合作商',只计 total 不计 staff)。
 
     缺表/无 member_count 列/全为 0(老库未回填)→ None,让上层回退 feishu_users。
     异常 → 抛出,由上层 graceful。"""
@@ -1962,10 +2003,10 @@ def _fetch_headcount_feishu_member_count(conn):
     ).fetchall()
     if not rows:
         return None  # 生产库副本尚无 member_count 数据 → 优雅回退
-    counts = {}
+    counts = {}  # dept_key -> [total, staff]
     for path, mc in rows:
-        npath = _normalize_dept_path(path)
-        if not npath:
+        dept_key, is_contractor = _member_count_dept_key(path)
+        if not dept_key:
             continue
         try:
             mc = int(mc or 0)
@@ -1973,8 +2014,14 @@ def _fetch_headcount_feishu_member_count(conn):
             mc = 0
         if mc <= 0:
             continue
-        # 同一归一化路径若有多条(理论上少见),取最大值(更完整的递归口径),不求和。
-        counts[npath] = max(counts.get(npath, 0), mc)
+        slot = counts.get(dept_key)
+        if slot is None:
+            slot = [0, 0]
+            counts[dept_key] = slot
+        # 同一部门键若有多条(理论上少见),取最大值(更完整的递归口径),不求和。
+        slot[0] = max(slot[0], mc)              # total(含外包)
+        if not is_contractor:
+            slot[1] = max(slot[1], mc)          # staff(员工);合作商节点 staff 恒为 0
     return counts or None
 
 
@@ -3208,32 +3255,44 @@ class H(BaseHTTPRequestHandler):
                 return max(keeps, key=len)
             return "Keep/未归类"
 
-        # 部门总人数(默认飞书组织架构,飞书无数据回退飞连;缓存,懒加载,graceful)：
-        # 叶子级 headcount 同样 roll-up 到每级父部门。
-        # 注意:dept_headcount.json 是 6h 文件缓存,旧缓存里仍是未归并的 'Keep/合作商/V/...' 路径,
-        # 命中/兜底时不会重算 → 必须在消费点再归一化一次(幂等),否则归并后的真实叶子拿不到 headcount。
+        # 部门总人数(默认飞书组织架构,飞书无数据回退飞连;缓存,懒加载,graceful)。
+        # 双口径:node_hc_total(含外包)+ node_hc_staff(员工=排除外部合作商子树)。
         headcount_map = _dept_headcount_map(conn)
-        node_hc = {}
+        node_hc_total = {}   # dept_path -> 含外包人数
+        node_hc_staff = {}   # dept_path -> 员工(不含外包)人数
         if _dept_headcount_is_precounted(_dept_headcount_source_used()):
             # member_count 口径:每个值已是【递归含子部门】的真实总数 → 直接按 dept_path
             # 查值,【绝不】_ancestors 求和(那会把已含子部门的父值再叠加子值,重复计数翻倍)。
-            for path, cnt in headcount_map.items():
-                node_hc[_normalize_dept_path(path)] = (cnt or 0)
-            # 唯一例外:合成的 'Keep' 顶级根不是真实飞书部门,没有自己的 member_count。
-            # 它的总数 = 各顶层部门(depth==1, 'Keep/<部门>')member_count 之和 —— 只加最顶一层,
-            # 不是递归 roll-up(顶层之间互不包含,不会重复)。结果 ≈1297。
-            keep_total = sum(
-                cnt for npath, cnt in node_hc.items()
-                if npath != "Keep" and npath.startswith("Keep/")
-                and npath.count("/") == 1)
-            if keep_total > 0:
-                node_hc["Keep"] = keep_total
+            # 值形如 [total, staff](合作商节点 staff=0)。兼容旧缓存(标量=同时当 total/staff)。
+            for path, val in headcount_map.items():
+                npath = _member_count_dept_key(path)[0] or _normalize_dept_path(path)
+                if isinstance(val, (list, tuple)):
+                    total = int(val[0] or 0)
+                    staff = int(val[1] or 0) if len(val) > 1 else total
+                else:
+                    total = staff = int(val or 0)
+                node_hc_total[npath] = max(node_hc_total.get(npath, 0), total)
+                node_hc_staff[npath] = max(node_hc_staff.get(npath, 0), staff)
+            # 合成的 'Keep' 顶级根不是真实飞书部门,没有自己的 member_count。
+            # 它的人数 = 各顶层节点(depth==1)之和 —— 只加最顶一层,顶层互不包含不会重复。
+            # total 含 'Keep/外部合作商'(607)→ ≈1297;staff 因合作商节点 staff=0 自然排除 → ≈690。
+            def _keep_root_sum(m):
+                return sum(c for p, c in m.items()
+                           if p != "Keep" and p.startswith("Keep/")
+                           and p.count("/") == 1)
+            kt, ks = _keep_root_sum(node_hc_total), _keep_root_sum(node_hc_staff)
+            if kt > 0:
+                node_hc_total["Keep"] = kt
+            if ks > 0:
+                node_hc_staff["Keep"] = ks
         else:
             # 叶子级计数(feishu_users/people/飞连):每个值是该叶子组的人数 →
-            # _ancestors roll-up,累加到每一级父部门。
+            # _ancestors roll-up,累加到每一级父部门。叶子源无外包细分 → staff 等同 total。
             for path, cnt in headcount_map.items():
+                cnt = int(cnt or 0) if not isinstance(cnt, (list, tuple)) else int((cnt or [0])[0] or 0)
                 for anc in _ancestors(_normalize_dept_path(path)):
-                    node_hc[anc] = node_hc.get(anc, 0) + (cnt or 0)
+                    node_hc_total[anc] = node_hc_total.get(anc, 0) + cnt
+                    node_hc_staff[anc] = node_hc_staff.get(anc, 0) + cnt
 
         def _bucket_metric():
             return {"tokens": 0, "cost": 0.0, "messages": 0, "credits": 0.0,
@@ -3336,11 +3395,15 @@ class H(BaseHTTPRequestHandler):
             token_people = len(n["token_users"])
             aily_people = len(n["aily_users"])
             people = len(n["token_users"] | n["aily_users"])   # 活跃 = token ∪ aily(去重)
-            hc = node_hc.get(path)
+            hc_total = node_hc_total.get(path)
+            hc_staff = node_hc_staff.get(path)
+            hc_total = hc_total if (hc_total and hc_total > 0) else None
+            hc_staff = hc_staff if (hc_staff and hc_staff > 0) else None
+            # headcount(向后兼容)= 含外包口径;活跃率分母用含外包(全量真实人数)。
+            hc = hc_total
             if hc and hc > 0:
                 active_rate = round(people / float(hc) * 100, 1)
             else:
-                hc = None
                 active_rate = None
             result.append({
                 "dept": path,
@@ -3348,7 +3411,9 @@ class H(BaseHTTPRequestHandler):
                 "people": people,             # 活跃人数(token∪aily),供活跃渗透
                 "token_people": token_people,
                 "aily_people": aily_people,
-                "headcount": hc,
+                "headcount": hc,                  # = headcount_total(含外包),向后兼容
+                "headcount_total": hc_total,      # 含外包(全量 member_count)
+                "headcount_staff": hc_staff,      # 员工(排除外部合作商子树)
                 "active_rate": active_rate,
                 "tokens": n["tokens"], "cost": round(n["cost"], 4),
                 "messages": n["messages"],

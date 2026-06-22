@@ -76,7 +76,7 @@ def _aily(conn, email, dept, credits, day=None, feature="aily_credits"):
 
 def _teams(dc, conn, monkeypatch, headcount=None, qs=None):
     """直接调用 H._teams，捕获 payload。headcount 注入避免触网。qs 默认空(token=lifetime)。"""
-    monkeypatch.setattr(dc, "_dept_headcount_map", lambda: dict(headcount or {}))
+    monkeypatch.setattr(dc, "_dept_headcount_map", lambda *_a, **_k: dict(headcount or {}))
     captured = {}
 
     class Fake:

@@ -300,6 +300,18 @@ function subLogoHtml(s){
 }
 // 部门路径去掉最前面的 "Keep/" 前缀(以及单独 "Keep")
 function stripKeep(p){p=p||''; if(p==='Keep')return p; return p.replace(/^Keep\//,'');}
+// 部门行副标题:双口径 headcount。员工=正式员工(不含外包),含外包=全量。
+// 员工==含外包(普通部门)→ 简洁 "活跃 X/Y · 率%";两者不同(Keep 根/外部合作商)→ "活跃 X/员工Y · 含外包Z"。
+function fmtHeadcountSub(x){
+  var staff=(x.headcount_staff!=null)?x.headcount_staff:null;
+  var total=(x.headcount_total!=null)?x.headcount_total:(x.headcount!=null?x.headcount:null);
+  var people=x.people||0;
+  if(total==null && staff==null) return '使用 '+people+' 人';
+  var ar=(x.active_rate!=null)?(' · '+x.active_rate+'%'):'';
+  if(staff!=null && total!=null && staff!==total) return '活跃 '+people+'/员工'+staff+' · 含外包'+total+ar;
+  var denom=(total!=null)?total:staff;
+  return '活跃 '+people+'/'+denom+ar;
+}
 function loginHref(){return '/v1/auth/login?next='+encodeURIComponent(location.pathname+location.search);}
 function loginHtml(){return '<a class="rg" href="'+loginHref()+'">登录</a>';}
 async function fillAuth(){
@@ -521,10 +533,7 @@ function renderTeamTree(){
       var twCls='tw'+(hasKids?'':' leaf');
       var name=lastSeg(x.dept)||'—';
       var sub;
-      if(x.headcount!=null){
-        var ar=(x.active_rate!=null)?(' · '+x.active_rate+'%'):'';
-        sub='活跃 '+(x.people||0)+'/'+x.headcount+ar;
-      } else { sub='使用 '+(x.people||0)+' 人'; }
+      sub=fmtHeadcountSub(x);
       var pct=Math.max(2,mv(x)/max*100), share=tot?(mv(x)/tot*100):0;
       var big=compact(mv(x))+'/人';
       // 飞书 AI 权益「点」不在主榜展示(2026-06-22 孙可:与 token 不同口径,统一以 token 为准);
@@ -590,13 +599,7 @@ function render(){
     }
     else if(CUR==='team'){
       name=stripKeep(x.dept||'')||'—';                 // 去 Keep/ 前缀后的部门路径
-      // 活跃率:有 headcount 显示 "活跃 使用/总 · 率%";否则退回 "使用 N 人"
-      if(x.headcount!=null){
-        var ar=(x.active_rate!=null)?(' · '+x.active_rate+'%'):'';
-        sub='活跃 '+(x.people||0)+'/'+x.headcount+ar;
-      } else {
-        sub='使用 '+(x.people||0)+' 人';
-      }
+      sub=fmtHeadcountSub(x);   // 双口径:活跃 X/员工Y · 含外包Z
     }
     else if(CUR==='tool'){name=x.client||'—';sub='';}
     else if(CUR==='agent'){

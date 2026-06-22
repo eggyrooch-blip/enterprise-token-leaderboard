@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """合成自测 — headcount 接飞书部门 member_count(递归含子部门,无需真数据/凭证)。
 
-当前生产库副本没有 member_count 数据(bot 读用户权限/sync 未跑),无法跑真数据验证。
-本脚本用临时 sqlite 造 departments 表(member_count 是【父含子的递归值】),验证本次改动:
+本脚本用临时 sqlite 造 departments 表(member_count 是【父含子的递归值】),验证:
 
   1) member_count 为 headcount 主源,口径标记 = 'feishu_member_count';
   2) ⚠️核心:member_count 已是递归值 → 消费点【按 dept_path 直接查值】,绝不 _ancestors
      求和。证明父部门人数 = 飞书 member_count 原值,不会因 roll-up 把子部门再叠加而翻倍;
-  3) 合成 'Keep' 顶级根 = 各顶层部门 member_count 之和 ≈ 造的总数(本例 1297),不是数千;
-  4) 优先级:有 member_count 时压过 feishu_users(同库同时存在,仍取 member_count);
-  5) 老库无 member_count 列/全 0 → 优雅回退 feishu_users(不崩)。
+  3) ⚠️命名空间修复:真实飞书 departments.path 是【裸】路径(无 Keep 前缀,如 '技术平台部'),
+     消费点必须补 'Keep/' 前缀才能与人员侧('Keep/技术平台部')对上,否则 lookup 全 miss;
+  4) ⚠️合作商修复:'合作商' 子树(整棵 W/V)是外部合作商,绝不能折进真实部门或顶成 Keep 根;
+     统一收口到单一 'Keep/外部合作商' 节点,只计【含外包】不计【员工】;
+  5) 双口径:每部门 [total, staff];Keep 根 total=全量、staff=排除合作商;
+  6) 合成 'Keep' 顶级根 = 各顶层节点之和;
+  7) 优先级:有 member_count 时压过 feishu_users;老库无列/全 0 → 优雅回退 feishu_users。
 
 运行: python3 tests/test_headcount_member_count_synth.py
 """
@@ -25,30 +28,24 @@ os.environ.setdefault("DEV_DB", os.path.join(HERE, "_synth_unused_mc.db"))
 import dev_collector as dc  # noqa: E402
 
 
-# 13 个顶层根部门 member_count(递归含各自所有子部门),合计 = 1297(对齐真实公司口径)。
-# 实测真值参考:市场与内容中心=21、客户商业化中心=74。
-_TOP_DEPTS = [
+# 顶层根部门 member_count(递归含各自所有子部门)。员工侧(不含合作商)合计 = 690;
+# 加上 外部合作商(合作商,607)→ 含外包合计 = 1297(对齐真实公司口径)。
+# 真实飞书 departments.path 是【裸】路径(无 Keep 前缀)—— 这里故意用裸路径覆盖命名空间修复。
+_STAFF_DEPTS = [
     ("市场与内容中心", 21),
     ("客户商业化中心", 74),
     ("技术平台部", 300),
     ("产品部", 180),
-    ("用户增长中心", 160),
-    ("运营中心", 150),
-    ("供应链中心", 120),
-    ("人力资源部", 90),
-    ("财务部", 60),
-    ("法务部", 40),
-    ("行政部", 50),
-    ("数据中心", 32),
-    ("战略投资部", 20),
+    ("用户增长中心", 95),
+    ("运营中心", 20),
 ]
-# 21+74+300+180+160+150+120+90+60+40+50+32+20 = 1297
-_TOTAL = sum(c for _, c in _TOP_DEPTS)  # 1297
+_STAFF_TOTAL = sum(c for _, c in _STAFF_DEPTS)  # 690
+_CONTRACTOR_TOTAL = 607                          # 合作商(含外包,不计员工)
+_GRAND_TOTAL = _STAFF_TOTAL + _CONTRACTOR_TOTAL  # 1297
 
 
 def _mk_departments(conn, with_member_count=True):
-    """造 departments 表:13 个顶层根 + 技术平台部下两层子部门(子的 member_count 已递归,
-    且 < 父值,证明直接查值时父不会把子再加进去)。"""
+    """造 departments 表:裸路径顶层根 + 技术平台部子树 + 合作商(W/V)外包子树。"""
     mc_col = "member_count INTEGER DEFAULT 0," if with_member_count else ""
     conn.execute(
         """CREATE TABLE departments(
@@ -58,14 +55,22 @@ def _mk_departments(conn, with_member_count=True):
             group_owner_user_id TEXT DEFAULT '', %s
             status TEXT DEFAULT 'active', updated_at TEXT)""" % mc_col
     )
-    # path 用 build_department_paths 同口径 'Keep/<部门>/...'(_normalize_dept_path 幂等)。
     rows = []  # (dept_id, parent, name, path, member_count)
-    for i, (name, cnt) in enumerate(_TOP_DEPTS, start=1):
-        rows.append(("d%d" % i, "0", name, "Keep/" + name, cnt))
-    # 技术平台部(300) 下:基础技术部(120,递归) → 安全组(30)、固件组(40)。
-    rows.append(("d_jc", "d3", "基础技术部", "Keep/技术平台部/基础技术部", 120))
-    rows.append(("d_aq", "d_jc", "安全组", "Keep/技术平台部/基础技术部/安全组", 30))
-    rows.append(("d_gj", "d_jc", "固件组", "Keep/技术平台部/基础技术部/固件组", 40))
+    for i, (name, cnt) in enumerate(_STAFF_DEPTS, start=1):
+        rows.append(("d%d" % i, "0", name, name, cnt))  # 裸路径(无 Keep 前缀)
+    # 技术平台部(300) 下:基础技术部(120,递归) → 安全组(30)、固件组(40)。裸路径。
+    rows.append(("d_jc", "d3", "基础技术部", "技术平台部/基础技术部", 120))
+    rows.append(("d_aq", "d_jc", "安全组", "技术平台部/基础技术部/安全组", 30))
+    rows.append(("d_gj", "d_jc", "固件组", "技术平台部/基础技术部/固件组", 40))
+    # 合作商外包子树:整棵收口到 外部合作商,只计含外包。
+    rows.append(("d_hz", "0", "合作商", "合作商", _CONTRACTOR_TOTAL))
+    rows.append(("d_hzw", "d_hz", "W", "合作商/W", 494))
+    rows.append(("d_hzwc", "d_hzw", "某供应商(SP000442)",
+                 "合作商/W/某供应商(SP000442)", 30))
+    rows.append(("d_hzv", "d_hz", "V", "合作商/V", 94))
+    # 合作商/V 下的业务外包(叶子短横命名,真实数据里会回折真实部门)—— 仍属外包,不进员工。
+    rows.append(("d_hzvx", "d_hzv", "技术平台部-基础技术部-安全组",
+                 "合作商/V/技术平台部-基础技术部-安全组", 2))
 
     if with_member_count:
         conn.executemany(
@@ -96,26 +101,46 @@ def _mk_feishu_users(conn):
     conn.commit()
 
 
+def _val(slot, idx):
+    """map 值统一取:新口径 [total, staff] 取 idx;老标量两口径相等。"""
+    if isinstance(slot, (list, tuple)):
+        return slot[idx] if idx < len(slot) else slot[0]
+    return slot
+
+
 def _consume_node_hc(conn):
-    """复刻 dev_collector 消费点(_teams)构建 node_hc 的逻辑,验证最终喂给部门榜的人数。
-    与生产消费点同分支:member_count 口径直接查值 + Keep 根=顶层之和;否则 _ancestors roll-up。"""
-    dc._dept_headcount_mem = None  # 清进程缓存,避免跨场景污染
+    """复刻 dev_collector 消费点(_teams)双口径 node_hc 构建,验证最终喂给部门榜的人数。"""
+    dc._dept_headcount_mem = None
     dc._dept_headcount_source_used_mem = None
     headcount_map = dc._dept_headcount_map(conn)
-    node_hc = {}
+    node_total = {}
+    node_staff = {}
     if dc._dept_headcount_is_precounted(dc._dept_headcount_source_used()):
-        for path, cnt in headcount_map.items():
-            node_hc[dc._normalize_dept_path(path)] = (cnt or 0)
-        keep_total = sum(
-            cnt for npath, cnt in node_hc.items()
-            if npath != "Keep" and npath.startswith("Keep/") and npath.count("/") == 1)
-        if keep_total > 0:
-            node_hc["Keep"] = keep_total
+        for path, val in headcount_map.items():
+            npath = dc._member_count_dept_key(path)[0] or dc._normalize_dept_path(path)
+            if isinstance(val, (list, tuple)):
+                total = int(val[0] or 0)
+                staff = int(val[1] or 0) if len(val) > 1 else total
+            else:
+                total = staff = int(val or 0)
+            node_total[npath] = max(node_total.get(npath, 0), total)
+            node_staff[npath] = max(node_staff.get(npath, 0), staff)
+
+        def _ksum(m):
+            return sum(c for p, c in m.items()
+                       if p != "Keep" and p.startswith("Keep/") and p.count("/") == 1)
+        kt, ks = _ksum(node_total), _ksum(node_staff)
+        if kt > 0:
+            node_total["Keep"] = kt
+        if ks > 0:
+            node_staff["Keep"] = ks
     else:
         for path, cnt in headcount_map.items():
+            cnt = int(_val(cnt, 0) or 0)
             for anc in dc._ancestors(dc._normalize_dept_path(path)):
-                node_hc[anc] = node_hc.get(anc, 0) + (cnt or 0)
-    return node_hc, dc._dept_headcount_source_used()
+                node_total[anc] = node_total.get(anc, 0) + cnt
+                node_staff[anc] = node_staff.get(anc, 0) + cnt
+    return node_total, node_staff, dc._dept_headcount_source_used()
 
 
 def _reset_cache():
@@ -138,40 +163,54 @@ def main():
         if not ok:
             failures.append(name)
 
-    # --- 场景1:member_count 为主源,口径标记正确 ---
+    # --- 场景1:member_count 为主源,口径标记 + 命名空间补前缀 ---
     c1 = sqlite3.connect(":memory:")
     _mk_departments(c1, with_member_count=True)
     ret1 = dc._fetch_dept_headcount_feishu(c1)
     check("有 member_count→口径=feishu_member_count", ret1[1], "feishu_member_count")
     mc_map = ret1[0]
-    check("member_count 市场与内容中心=21", mc_map.get("Keep/市场与内容中心"), 21)
-    check("member_count 客户商业化中心=74", mc_map.get("Keep/客户商业化中心"), 74)
+    # ⚠️命名空间:裸 '市场与内容中心' 必须补 'Keep/' 前缀(否则人员侧对不上)。
+    check("裸路径补 Keep 前缀:市场与内容中心=[21,21]",
+          mc_map.get("Keep/市场与内容中心"), [21, 21])
+    check("裸路径无前缀键不存在(确认已补全)",
+          "市场与内容中心" in mc_map, False)
+    # ⚠️合作商:整棵收口到 外部合作商,total=607,staff=0;绝不映成 Keep 根。
+    check("合作商收口外部合作商 total=607 staff=0",
+          mc_map.get("Keep/外部合作商"), [607, 0])
+    check("合作商不污染 Keep 根键", "Keep" in mc_map, False)
+    # 合作商/V 业务外包也归外部合作商(不折回真实安全组,避免双计)。
+    check("合作商/V 业务外包不折回真实部门",
+          mc_map.get("Keep/技术平台部/基础技术部/安全组"), [30, 30])  # 仅真实安全组 30,无 +2
 
     # --- 场景2(核心):消费点直接查值,父不被子叠加翻倍 ---
     _reset_cache()
-    node_hc, src = _consume_node_hc(c1)
+    node_total, node_staff, src = _consume_node_hc(c1)
     check("消费点口径=feishu_member_count", src, "feishu_member_count")
-    # 技术平台部 member_count=300(已递归)。若错误 roll-up,会变成
-    # 300 + 基础技术部120 + 安全组30 + 固件组40 = 490(翻倍)。直接查值必须是 300。
-    check("技术平台部=300(非 roll-up 翻倍的 490)", node_hc.get("Keep/技术平台部"), 300)
-    check("基础技术部=120(直接查值,非 120+30+40=190)",
-          node_hc.get("Keep/技术平台部/基础技术部"), 120)
-    check("安全组=30", node_hc.get("Keep/技术平台部/基础技术部/安全组"), 30)
+    check("技术平台部 total=300(非 roll-up 翻倍的 490)",
+          node_total.get("Keep/技术平台部"), 300)
+    check("技术平台部 staff=300(真实部门 staff=total)",
+          node_staff.get("Keep/技术平台部"), 300)
+    check("基础技术部=120(直接查值,非 190)",
+          node_total.get("Keep/技术平台部/基础技术部"), 120)
+    check("安全组=30", node_total.get("Keep/技术平台部/基础技术部/安全组"), 30)
 
-    # --- 场景3:Keep 顶级根 = 13 顶层之和 ≈ 1297(非数千) ---
-    check("Keep 顶级=1297(顶层 member_count 之和)", node_hc.get("Keep"), _TOTAL)
-    assert _TOTAL == 1297, "测试数据总和应为 1297, 实为 %d" % _TOTAL
-    # 防回归:绝不接近 roll-up 的虚高值。若误 roll-up,Keep 会 = 1297 + 子部门重复叠加 > 1297。
-    check("Keep 不超过 1297(无 roll-up 重复计数)", node_hc.get("Keep") <= 1297, True)
+    # --- 场景3:双口径 Keep 根 —— total=1297(含外包) / staff=690(员工) ---
+    check("Keep 含外包 total=1297", node_total.get("Keep"), _GRAND_TOTAL)
+    check("Keep 员工 staff=690(排除外部合作商)", node_staff.get("Keep"), _STAFF_TOTAL)
+    assert _GRAND_TOTAL == 1297 and _STAFF_TOTAL == 690
+    check("Keep total 不超 1297(无 roll-up 重复)", node_total.get("Keep") <= 1297, True)
+    check("外部合作商 total=607 staff=0",
+          (node_total.get("Keep/外部合作商"), node_staff.get("Keep/外部合作商")),
+          (607, 0))
 
     # --- 场景4:优先级 —— member_count 与 feishu_users 同库,仍取 member_count ---
     c4 = sqlite3.connect(":memory:")
     _mk_departments(c4, with_member_count=True)
-    _mk_feishu_users(c4)  # 安全组叶子=2,若误用会让安全组=2 而非 member_count 的 30
+    _mk_feishu_users(c4)
     ret4 = dc._fetch_dept_headcount_feishu(c4)
     check("同库优先 member_count(口径)", ret4[1], "feishu_member_count")
-    check("同库优先 member_count(安全组=30 非 feishu_users 的 2)",
-          ret4[0].get("Keep/技术平台部/基础技术部/安全组"), 30)
+    check("同库优先 member_count(安全组=[30,30] 非 feishu_users 的 2)",
+          ret4[0].get("Keep/技术平台部/基础技术部/安全组"), [30, 30])
 
     # --- 场景5:老库无 member_count 列 → 优雅回退 feishu_users(不崩) ---
     c5 = sqlite3.connect(":memory:")
@@ -182,7 +221,7 @@ def main():
     check("回退后安全组=2(feishu_users 叶子计数)",
           ret5[0].get("Keep/技术平台部/基础技术部/安全组"), 2)
 
-    # --- 场景6:member_count 全 0(生产库副本现状)→ 回退 feishu_users,不崩 ---
+    # --- 场景6:member_count 全 0 → 回退 feishu_users,不崩 ---
     c6 = sqlite3.connect(":memory:")
     _mk_departments(c6, with_member_count=True)
     c6.execute("UPDATE departments SET member_count=0")

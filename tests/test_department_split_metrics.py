@@ -61,7 +61,7 @@ def _usage(conn, email, raw_dept, effective_dept, bucket, tokens, cost, messages
 
 
 def _teams(dc, conn, monkeypatch):
-    monkeypatch.setattr(dc, "_dept_headcount_map", lambda: {"Keep/技术平台部/固件组": 3})
+    monkeypatch.setattr(dc, "_dept_headcount_map", lambda *_a, **_k: {"Keep/技术平台部/固件组": 3})
     captured = {}
 
     class Fake:

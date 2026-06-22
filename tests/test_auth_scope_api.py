@@ -105,7 +105,7 @@ def test_owner_teams_returns_owned_subtree_rollup_only(monkeypatch, tmp_path):
     monkeypatch.setattr(
         dc,
         "_dept_headcount_map",
-        lambda: {
+        lambda *_a, **_k: {
             "Keep/技术平台部/固件组": 2,
             "Keep/运动消费事业部/市场营销部": 3,
         },

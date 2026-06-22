@@ -69,7 +69,7 @@ _RECENT = datetime.date.today().isoformat()
 
 
 def _teams(dc, conn, monkeypatch, headcount=None):
-    monkeypatch.setattr(dc, "_dept_headcount_map", lambda: dict(headcount or {}))
+    monkeypatch.setattr(dc, "_dept_headcount_map", lambda *_a, **_k: dict(headcount or {}))
     cap = {}
 
     class Fake:

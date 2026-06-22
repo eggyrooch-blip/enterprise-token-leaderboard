@@ -85,7 +85,7 @@ def test_teams_exclude_configured_outlier_from_rollup_by_default(monkeypatch, tm
     monkeypatch.setattr(
         dc,
         "_dept_headcount_map",
-        lambda: {
+        lambda *_a, **_k: {
             "Keep/技术平台部/基础技术部/IT 组": 1,
             "Keep/技术平台部/基础技术部/安全组": 1,
         },
