@@ -819,3 +819,29 @@ def test_mark_external_orphans_self_corrects_rejoined():
     conn.execute("INSERT INTO feishu_users VALUES('o','wb-x@keep.com','转正','Keep/技术部','active')")
     fds.mark_external_orphans_departed(conn)
     assert conn.execute("SELECT COUNT(*) FROM departed WHERE email='wb-x@keep.com'").fetchone()[0] == 0
+
+
+def test_marked_orphan_excluded_from_real_leaderboard(tmp_path, monkeypatch):
+    """端到端(codex 评审补):标记 external_orphan 后,真实 /v1/leaderboard 口径(_personal_board_rows)
+    确实把该 wb- 外包剔除;真实在册员工保留。验证大小写 LIKE + departed 过滤端到端打通。"""
+    import importlib, feishu_directory_sync as fds
+    import dev_collector as dc
+    dc = importlib.reload(dc)
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    conn.execute("""CREATE TABLE IF NOT EXISTS feishu_users(open_id TEXT PRIMARY KEY, email TEXT,
+        name TEXT, dept_path TEXT, status TEXT DEFAULT 'active')""")
+    # 在册真人 + wb- 外包(都有 token 用量,大写变体测大小写)
+    conn.execute("INSERT INTO feishu_users VALUES('o','real@keep.com','真人','Keep/技术部','active')")
+    for em in ("real@keep.com", "WB-waibao01@keep.com"):
+        conn.execute(dc._UPSERT_SQL, (em, "Keep/技术部", "day", "2026-06-10", "subscription",
+                                      "Claude Code", "", "m", 1000, 0, 0, 0, 0, 1000, 1.0, 1))
+    conn.commit()
+    n = fds.mark_external_orphans_departed(conn); conn.commit()
+    assert n == 1  # 只标 wb- 外包(大小写不敏感命中)
+    handler = type("H", (), {"_send": lambda self, c, o: setattr(self, "p", o)})()
+    dc.H._leaderboard(handler, conn, {"from": ["2026-06-01"], "to": ["2026-06-30"]})
+    emails = {r["email"] for r in handler.p["leaderboard"]}
+    assert "real@keep.com" in emails               # 真人保留
+    assert "WB-waibao01@keep.com" not in emails     # 外包被离职过滤掉
+    conn.close()

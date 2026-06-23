@@ -1245,12 +1245,13 @@ def mark_external_orphans_departed(conn):
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     conn.execute(
         "INSERT OR IGNORE INTO departed(email, reason, marked_at)"
-        " SELECT DISTINCT u.email, 'external_orphan', ?"
+        " SELECT u.email, 'external_orphan', ?"
         " FROM usage u"
         " WHERE u.source != 'litellm_agent' AND u.email NOT LIKE 'litellm-%'"
-        "   AND (u.email LIKE 'wb-%' OR lower(u.email) GLOB ?)"
+        "   AND (lower(u.email) LIKE 'wb-%' OR lower(u.email) GLOB ?)"
         "   AND lower(u.email) NOT IN (SELECT lower(email) FROM feishu_users"
-        "       WHERE status='active' AND email!='')",
+        "       WHERE status='active' AND email!='')"
+        " GROUP BY u.email HAVING SUM(u.total) > 0",   # 真有 token 用量才入离职(codex 评审)
         (now, hexpat))
     after = conn.execute("SELECT COUNT(*) FROM departed").fetchone()[0]
     return after - before
