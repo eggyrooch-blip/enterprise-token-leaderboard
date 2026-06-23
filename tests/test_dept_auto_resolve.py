@@ -460,3 +460,11 @@ def test_bare_people_dept_resolves_via_trusted_keep_path():
     cd2 = dc._canon_dept_for("x@keep.com", ["unknown"], "unknown",
                              {"x@keep.com": "Keep/技术平台部/安全组"}, True)
     assert cd2 == "Keep/技术平台部/安全组"
+    # codex 评审:单段顶级部门(无 '/')也要补 Keep 根,不能漏。
+    cd3 = dc._canon_dept_for("y@keep.com", ["unknown"], "unknown",
+                             {"y@keep.com": "技术平台部"}, True)
+    assert cd3 == "Keep/技术平台部"
+    # 合作商/SP 仍收口外部合作商
+    cd4 = dc._canon_dept_for("z@keep.com", ["unknown"], "unknown",
+                             {"z@keep.com": "合作商/W/某公司(SP123)"}, True)
+    assert cd4 == "Keep/外部合作商/某公司(SP123)"
