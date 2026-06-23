@@ -443,3 +443,20 @@ def test_cursor_board_prefers_people_dept(dc):
     conn.commit()
     cb = _cursor_board(dc, conn)
     assert cb["guo@keep.com"]["dept"] == "Keep/技术平台部/推荐搜索部/算法组"
+
+
+def test_bare_people_dept_resolves_via_trusted_keep_path():
+    """2026-06-23 孙可:个人榜/部门榜大量 unknown。根因 people.dept 存成裸路径(无 Keep 前缀),
+    _to_keep 只认 Keep 前缀 → 返 None → 落 usage 的 unknown / 部门榜未归类。
+    修:可信 people 路径用 _trusted_keep_path 补 Keep 根。"""
+    import importlib, dev_collector
+    dc = importlib.reload(dev_collector)
+    bare = "客户商业化中心/资源策略部"
+    # _canon_dept_for(部门榜/人员明细共用):usage effective 是 unknown,但 people 裸路径应被救起。
+    cd = dc._canon_dept_for("zoulan@keep.com", ["unknown"], "unknown",
+                            {"zoulan@keep.com": bare}, True)
+    assert cd == "Keep/客户商业化中心/资源策略部"   # 不再落 Keep/未归类
+    # 已带 Keep 前缀的不受影响
+    cd2 = dc._canon_dept_for("x@keep.com", ["unknown"], "unknown",
+                             {"x@keep.com": "Keep/技术平台部/安全组"}, True)
+    assert cd2 == "Keep/技术平台部/安全组"

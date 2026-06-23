@@ -1693,7 +1693,11 @@ def _canon_dept_for(email, depts, effective_dept, pdept, has_attr):
         trusted = _trusted_keep_path(effective_dept)
         if trusted:
             return trusted
-    cand = _to_keep(pdept.get(email))
+    # people/feishu 的 dept 是【可信组织路径】,可能存成【裸路径】(无 Keep 前缀,如「客户商业化中心/资源
+    # 策略部」)。_to_keep 只认 Keep 前缀 → 裸路径返 None → 误落「未归类」/usage 的 unknown(2026-06-23
+    # 孙可发现:个人榜大量 unknown、部门榜统计漏人)。先用 _trusted_keep_path 给可信裸路径补 Keep 根。
+    pd = pdept.get(email)
+    cand = _trusted_keep_path(pd) or _to_keep(pd)
     if cand:
         return cand
     keeps = [c for c in (_to_keep(x) for x in depts) if c]
@@ -2410,7 +2414,7 @@ def _personal_board_rows(conn, qs, auth_user=None):
     by_email = {}
     for r in rows:
         row = {
-            "email": r[0], "dept": _to_keep(r[13]) or _normalize_dept_path(r[1]),
+            "email": r[0], "dept": (_trusted_keep_path(r[13]) or _to_keep(r[13]) or _normalize_dept_path(r[1])),  # 可信裸路径补 Keep,免 unknown
             "visible_dept_paths": visible_paths.get(r[0], []),
             "input": r[2] or 0, "output": r[3] or 0,
             "cache_read": r[4] or 0, "cache_write": r[5] or 0,
@@ -3218,7 +3222,7 @@ class H(BaseHTTPRequestHandler):
             # 部门优先用 people.dept(飞连自愈的全路径),裸的 MAX(u.dept) 只兜底 ——
             # 否则 LiteLLM 团队别名(裸"技术平台部")会被 MAX 误选盖掉飞连全路径(中文排在 'K' 之后)。
             row = {
-                "email": r[0], "dept": _to_keep(r[13]) or _normalize_dept_path(r[1]),
+                "email": r[0], "dept": (_trusted_keep_path(r[13]) or _to_keep(r[13]) or _normalize_dept_path(r[1])),  # 可信裸路径补 Keep,免 unknown
                 "visible_dept_paths": visible_paths.get(r[0], []),
                 "input": r[2] or 0, "output": r[3] or 0,
                 "cache_read": r[4] or 0, "cache_write": r[5] or 0,
@@ -3413,7 +3417,7 @@ class H(BaseHTTPRequestHandler):
         win_e = cost_end if cost_end is not None else today
         for r in rows:
             result.append({
-                "email": r[0], "dept": _to_keep(r[12]) or _normalize_dept_path(r[1]),  # 优先 people.dept(飞连全路径)
+                "email": r[0], "dept": (_trusted_keep_path(r[12]) or _to_keep(r[12]) or _normalize_dept_path(r[1])),  # 优先 people.dept(可信裸路径补 Keep,免 unknown)
                 "input": r[2] or 0, "output": r[3] or 0,
                 "cache_read": r[4] or 0, "cache_write": r[5] or 0,
                 "reasoning": r[6] or 0, "tokens": r[7] or 0,
