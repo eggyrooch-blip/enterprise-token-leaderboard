@@ -3737,33 +3737,31 @@ class H(BaseHTTPRequestHandler):
         else:
             pdept = dict(conn.execute("SELECT email, dept FROM people").fetchall())
 
-        # 1) usage 侧:按 email 聚合 VISIBLE bucket 的量(与部门榜 token 口径一致),记录是否窗口内活跃。
-        per = {}
+        # 1) usage 侧:严格复刻 _teams 的「按 (email, effective_dept, bucket) 分片各自归因」。
+        #    SQL 已 GROUP BY 1,2,3,4 → 每行就是一个分片。逐片 canon,只把【落在目标子树内】的
+        #    分片量按 email 汇总。多部门归属的人因此只计该子树的那部分 token —— 与部门行
+        #    token_users/tokens 完全同口径(codex 跨模型评审发现:按 email 先合并会把两部门量
+        #    合到一个叶子、又在另一个叶子让人消失)。
+        token_active = {}   # email -> {tok,cost,msg}
         for email, dept, raw_dept, bucket, tok, cost, msg in rows:
             bucket = bucket or BUCKET_EMPLOYEE
             if bucket not in (BUCKET_EMPLOYEE, BUCKET_BUSINESS, BUCKET_PENDING_BUSINESS, BUCKET_UNRESOLVED):
                 bucket = BUCKET_UNRESOLVED
-            p = per.get(email)
-            if p is None:
-                p = {"tok": 0, "cost": 0.0, "msg": 0, "depts": [], "visible": False,
-                     "effective_dept": dept or ""}
-                per[email] = p
-            if dept:
-                p["depts"].append(dept)
+            if bucket not in VISIBLE_SPEND_BUCKETS:
+                continue   # 与 _teams 一致:只有 VISIBLE bucket 进 token_users/tokens
+            depts = [dept] if dept else []
             if raw_dept and raw_dept != dept:
-                p["depts"].append(raw_dept)
-            if bucket in VISIBLE_SPEND_BUCKETS:
-                p["visible"] = True   # 与 _teams 的 token_users 成员判定一致(有可见 bucket 行即算活跃)
-                p["tok"] += tok or 0
-                p["cost"] += cost or 0
-                p["msg"] += msg or 0
-
-        token_active = {}   # email -> {tok,cost,msg}
-        for email, p in per.items():
-            cd = _canon_dept_for(email, p["depts"], p.get("effective_dept"), pdept, has_attr)
-            if not _under(cd) or not p["visible"] or not _in_scope(email, cd):
+                depts.append(raw_dept)
+            cd = _canon_dept_for(email, depts, dept, pdept, has_attr)  # dept 即该分片 effective_dept
+            if not _under(cd) or not _in_scope(email, cd):
                 continue
-            token_active[email] = {"tok": p["tok"], "cost": p["cost"], "msg": p["msg"]}
+            a = token_active.get(email)
+            if a is None:
+                a = {"tok": 0, "cost": 0.0, "msg": 0}
+                token_active[email] = a
+            a["tok"] += tok or 0
+            a["cost"] += cost or 0
+            a["msg"] += msg or 0
 
         # 2) aily(飞书 AI 权益)活跃:窗口内 credits>0,canon 用 _to_keep(pdept)→_to_keep(fdept),与部门榜同口径。
         frng, fparams = _feishu_range(qs)

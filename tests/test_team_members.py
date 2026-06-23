@@ -160,6 +160,50 @@ def test_scope_owner_other_dept_sees_nothing(conn_5people, monkeypatch):
     assert obj["used_count"] == 0 and obj["unused_count"] == 0
 
 
+def test_multi_dept_user_token_split_matches_teams(monkeypatch):
+    """跨模型评审(codex)发现的回归:一个人用量归属两个部门时,_team_members 必须像 _teams 一样
+    按 (email, effective_dept, bucket) 分片各自归因 —— 目标叶子只计该子树内的那部分 token,
+    不能把两部门的量合到一个叶子、又在另一个叶子让人消失。"""
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    other = "Keep/技术平台部/安全组"
+    _person(conn, "x@keep.com", "跨部门X", DEPT)            # people 主部门记 DEPT
+    _use(conn, "x@keep.com", DEPT, 200)                      # 200 归 运动科学部
+    _use(conn, "x@keep.com", other, 100)                  # 100 归 安全组
+    # 目标=运动科学部:X 只应显示 200(不是 300)
+    obj_d = _call(dc, conn, monkeypatch, qs={"dept": [DEPT]}, headcount=1)
+    used_d = {u["name"]: u["tokens"] for u in obj_d["used"]}
+    assert used_d.get("跨部门X") == 200, obj_d["used"]
+    # 目标=安全组:X 应出现且只显示 100
+    monkeypatch.setattr(dc, "_dept_headcount_map", lambda *_a, **_k: {other: 1})
+    cap = {}
+
+    class Fake:
+        _scope_user = None
+
+        def _send(self, code, o):
+            cap["o"] = o
+
+    dc.H._team_members(Fake(), conn, {"dept": [other]})
+    used_o = {u["name"]: u["tokens"] for u in cap["o"]["used"]}
+    assert used_o.get("跨部门X") == 100, cap["o"]["used"]
+    # 与 _teams 一致性:两个部门行都应把 X 计为活跃 1 人
+    monkeypatch.setattr(dc, "_dept_headcount_source_used", lambda: dc._HEADCOUNT_SOURCE_PRECOUNTED)
+    monkeypatch.setattr(dc, "_dept_headcount_map", lambda *_a, **_k: {DEPT: 1, other: 1})
+    tcap = {}
+
+    class FakeT:
+        _scope_user = None
+
+        def _send(self, code, o):
+            tcap["o"] = o
+
+    dc.H._teams(FakeT(), conn, {})
+    teams = {t["dept"]: t for t in tcap["o"]["teams"]}
+    assert teams[DEPT]["people"] == 1 and teams[other]["people"] == 1
+
+
 def test_aily_only_user_counts_as_used(monkeypatch):
     """只用了飞书 AI 权益(credits)、没 token 的人,也算活跃(used)。"""
     dc = importlib.reload(dev_collector)

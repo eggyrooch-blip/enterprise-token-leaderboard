@@ -635,24 +635,24 @@ function renderMembersPanel(dept, depth){
   // 表头:用了 X / 没用 Y (+ 未同步 N)
   var hd='用了 '+used.length+' · 没用 '+unused.length+(missing?(' · 未同步 '+missing):'');
   out.push(line('<div class="nm muted" style="font-size:12px">'+hd+'</div>'));
-  used.forEach(function(u){
-    var fb=(u.name||'·').slice(-2);
-    var av=u.avatar?('<img class="av" src="'+u.avatar+'" onerror="this.outerHTML=&quot;<span class=\\&quot;av fb\\&quot;>'+fb+'</span>&quot;">')
+  // 头像/姓名来自飞书目录(半可信),统一过 esc() 防破坏标记或注入(codex 评审)。
+  function avHtml(u){
+    var fb=esc((u.name||'·').slice(-2));
+    return u.avatar?('<img class="av" src="'+esc(u.avatar)+'" onerror="this.outerHTML=&quot;<span class=\\&quot;av fb\\&quot;>'+fb+'</span>&quot;">')
                    :('<span class="av fb">'+fb+'</span>');
+  }
+  used.forEach(function(u){
     var pct=Math.max(2,(u.tokens||0)/maxTok*100);
     var extra=(u.credits>0)?(' · 权益 '+grp(Math.round(u.credits))+' 点'):'';
-    out.push('<div class="r mrow" data-depth="'+depth+'">'+ind+av+
-      '<div class="nm">'+(u.name||'—')+'</div>'+
+    out.push('<div class="r mrow" data-depth="'+depth+'">'+ind+avHtml(u)+
+      '<div class="nm">'+esc(u.name||'—')+'</div>'+
       '<div class="track"><div class="fill" style="width:'+pct+'%;background:'+toolColor('Claude Code')+'"></div></div>'+
       '<div class="val"><div class="t num">'+compact(metricTok(u.tokens||0))+'</div><div class="s num">'+
         (u.tokens>0?'token':'仅权益')+extra+'</div></div></div>');
   });
   unused.forEach(function(u){
-    var fb=(u.name||'·').slice(-2);
-    var av=u.avatar?('<img class="av" src="'+u.avatar+'" onerror="this.outerHTML=&quot;<span class=\\&quot;av fb\\&quot;>'+fb+'</span>&quot;">')
-                   :('<span class="av fb">'+fb+'</span>');
-    out.push('<div class="r mrow muted" data-depth="'+depth+'">'+ind+av+
-      '<div class="nm">'+(u.name||'—')+'</div>'+
+    out.push('<div class="r mrow muted" data-depth="'+depth+'">'+ind+avHtml(u)+
+      '<div class="nm">'+esc(u.name||'—')+'</div>'+
       '<div class="track"></div>'+
       '<div class="val"><div class="t num">未使用</div></div></div>');
   });
