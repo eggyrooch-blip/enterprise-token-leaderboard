@@ -277,7 +277,7 @@ var METRIC="total", SORT="token", SHOW_DEPARTED=false, META_MIN="", META_MAX="";
 var TEAM_EXPANDED=null;
 // 末级部门「人员明细」下钻:MEMBERS_OPEN=已展开的末级部门 path;TEAM_MEMBERS=该部门人员数据缓存。
 // 区间变更(load)时清空,保证人员名单与所选窗口一致。
-var MEMBERS_OPEN=new Set(), TEAM_MEMBERS={};
+var MEMBERS_OPEN=new Set(), TEAM_MEMBERS={}, MEMBERS_KEY=null;  // MEMBERS_KEY=上次加载的区间/口径,变了才清人员面板
 function curRangeQS(){
   var parts=[];
   if(RANGE_FROM||RANGE_TO){ parts.push('from='+RANGE_FROM); parts.push('to='+RANGE_TO); }
@@ -406,7 +406,10 @@ var GOVERNANCE_METRICS=[
 async function load(){
   await fillAuth();
   await fillMeta();              // 确保 META_MIN/MAX 已就绪(日均精确口径要用)
-  MEMBERS_OPEN=new Set(); TEAM_MEMBERS={};   // 区间一变,折叠并清空末级人员明细,避免名单跨窗口串台
+  // 只在【区间/离职口径真正变化】时折叠并清空末级人员明细(避免名单跨窗口串台);
+  // 30s 自动刷新(同区间)保留用户已展开的人员面板,不打断查看(孙可 2026-06-23)。
+  var _mkey=[RANGE_FROM,RANGE_TO,SHOW_DEPARTED].join('|');
+  if(_mkey!==MEMBERS_KEY){ MEMBERS_OPEN=new Set(); TEAM_MEMBERS={}; MEMBERS_KEY=_mkey; }
   var parts=[];
   if(RANGE_FROM||RANGE_TO){
     // 用户选了范围:两种模式数据相同(都是 day 桶区间和),按所选范围请求
