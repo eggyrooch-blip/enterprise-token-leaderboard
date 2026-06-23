@@ -3801,32 +3801,56 @@ class H(BaseHTTPRequestHandler):
                 continue
             aily_active[email] = credits or 0
 
-        # 3) 花名册:people 表里 canon 部门落在目标子树的在职人(show_departed 时含离职)。
-        if "effective_dept" in people_cols:
-            prows = conn.execute(
-                "SELECT email, COALESCE(name,''), COALESCE(avatar,''),"
-                " COALESCE(NULLIF(effective_dept,''), dept), COALESCE(raw_dept,'') FROM people"
-            ).fetchall()
-        else:
-            prows = [(e, n, a, d, "") for e, n, a, d in conn.execute(
-                "SELECT email, COALESCE(name,''), COALESCE(avatar,''), dept FROM people"
-            ).fetchall()]
+        # 3) 花名册:优先 feishu_users 全员表(open_id 主键,含无邮箱供应商行,sync 已逐部门拉全 ~1217),
+        #    canon 部门落在目标子树的在职人。feishu_users 缺表/为空 → 回退 people 子集(旧兜底行为)。
+        #    show_departed 时含离职。键用 email(有则);无邮箱供应商行用 'oid:'+open_id 兜底唯一键。
+        #    avatar 仍从 people(按 email)取(feishu_users 不存头像)。
+        pname = dict(conn.execute("SELECT email, COALESCE(name,'') FROM people").fetchall())
+        pav = dict(conn.execute("SELECT email, COALESCE(avatar,'') FROM people").fetchall())
         departed_set = set()
         if not sd:
             departed_set = {r[0] for r in conn.execute("SELECT email FROM departed").fetchall()}
-        roster = {}   # email -> {name, avatar}
-        for email, name, avatar, eff, raw in prows:
-            if email in departed_set:
-                continue
-            cd = _canon_dept_for(email, [eff, raw], eff, pdept, has_attr)
-            if not _under(cd) or not _in_scope(email, cd):
-                continue
-            roster[email] = {"name": name, "avatar": avatar}
+        roster = {}   # key(email | 'oid:'+open_id) -> {name, email, avatar}
+        fu_rows = []
+        if _table_columns(conn, "feishu_users"):
+            try:
+                fu_rows = conn.execute(
+                    "SELECT open_id, COALESCE(name,''), COALESCE(email,''),"
+                    " COALESCE(dept_path,''), COALESCE(status,'active') FROM feishu_users"
+                ).fetchall()
+            except Exception:
+                fu_rows = []
+        if fu_rows:
+            for oid, name, email, dpath, status in fu_rows:
+                if not sd and status and status != "active":
+                    continue
+                if not sd and email and email in departed_set:
+                    continue
+                cd = _canon_dept_for(email, [dpath], dpath, pdept, has_attr)
+                if not _under(cd) or not _in_scope(email or oid, cd):
+                    continue
+                key = email or ("oid:" + str(oid))
+                roster[key] = {"name": name, "email": email, "avatar": pav.get(email, "")}
+        else:
+            # 兜底:people 子集(feishu_users 缺表/为空,如老库/未跑通讯录同步)。
+            if "effective_dept" in people_cols:
+                prows = conn.execute(
+                    "SELECT email, COALESCE(name,''), COALESCE(avatar,''),"
+                    " COALESCE(NULLIF(effective_dept,''), dept), COALESCE(raw_dept,'') FROM people"
+                ).fetchall()
+            else:
+                prows = [(e, n, a, d, "") for e, n, a, d in conn.execute(
+                    "SELECT email, COALESCE(name,''), COALESCE(avatar,''), dept FROM people"
+                ).fetchall()]
+            for email, name, avatar, eff, raw in prows:
+                if email in departed_set:
+                    continue
+                cd = _canon_dept_for(email, [eff, raw], eff, pdept, has_attr)
+                if not _under(cd) or not _in_scope(email, cd):
+                    continue
+                roster[email] = {"name": name, "email": email, "avatar": avatar}
 
         # 4) 组装。used 名字优先花名册→people→邮箱前缀。
-        pname = dict(conn.execute("SELECT email, COALESCE(name,'') FROM people").fetchall())
-        pav = dict(conn.execute("SELECT email, COALESCE(avatar,'') FROM people").fetchall())
-
         def _nm(email):
             return (roster.get(email, {}).get("name") or pname.get(email)
                     or (email or "").split("@")[0] or "—")
@@ -3846,9 +3870,10 @@ class H(BaseHTTPRequestHandler):
                 "credits": round(aily_active.get(email, 0), 2),
             })
         used.sort(key=lambda x: (-x["tokens"], -x["credits"], x["name"]))
+        # 没用的人 = 花名册里 email 不在 used 集的人(无邮箱供应商行 email='' 永远算没用)。
         unused = sorted(
-            ({"email": e, "name": i["name"] or _nm(e), "avatar": i["avatar"]}
-             for e, i in roster.items() if e not in used_emails),
+            ({"email": i["email"], "name": i["name"] or _nm(i["email"]), "avatar": i["avatar"]}
+             for i in roster.values() if i["email"] not in used_emails),
             key=lambda x: x["name"])
 
         # 5) headcount(member_count 递归含外包) → missing。

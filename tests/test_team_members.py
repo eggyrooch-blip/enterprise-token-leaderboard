@@ -277,3 +277,41 @@ def test_aily_only_user_counts_as_used(monkeypatch):
     obj = _call(dc, conn, monkeypatch, headcount=1)
     assert [u["name"] for u in obj["used"]] == ["权益用户"]
     assert obj["used"][0]["credits"] == 12.0
+
+
+def test_roster_from_feishu_users_includes_never_used(monkeypatch):
+    """花名册源换 feishu_users(全员表):从没用过、不在 people 里的员工也能作为「没用」点名。
+    这是「谁没用点全名」真正生效的关键 —— people 是 usage 派生,缺从未用过的人。"""
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    conn.execute("""CREATE TABLE feishu_users(open_id TEXT PRIMARY KEY, name TEXT, email TEXT,
+        dept_path TEXT, status TEXT DEFAULT 'active')""")
+    raw = "AI 平台事业部/AI 业务部/运动科学部"   # feishu_users.dept_path 是裸飞书路径
+    # 3 个在职成员:王衡用了,张三/李四从没用过(且不在 people)
+    for oid, nm, em in [("ou_w", "王衡", "wangheng01@keep.com"),
+                        ("ou_z", "张三", "zhangsan@keep.com"),
+                        ("ou_l", "李四", "lisi@keep.com")]:
+        conn.execute("INSERT INTO feishu_users(open_id,name,email,dept_path,status) VALUES(?,?,?,?,?)",
+                     (oid, nm, em, raw, "active"))
+    _person(conn, "wangheng01@keep.com", "王衡", DEPT)   # 只有用了的人在 people
+    _use(conn, "wangheng01@keep.com", DEPT, 16_800_000_000)
+    obj = _call(dc, conn, monkeypatch, headcount=3)
+    assert [u["name"] for u in obj["used"]] == ["王衡"]
+    unused_names = sorted(u["name"] for u in obj["unused"])
+    assert unused_names == ["张三", "李四"]      # 从未用过、不在 people 的人,经 feishu_users 点到名
+    assert obj["missing"] == 0                    # 3 花名册全点到名 = headcount 3
+
+
+def test_feishu_users_no_email_vendor_row_is_unused(monkeypatch):
+    """feishu_users 无邮箱供应商行:用 open_id 兜底键,算「没用」,不报错不崩。"""
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    conn.execute("""CREATE TABLE feishu_users(open_id TEXT PRIMARY KEY, name TEXT, email TEXT,
+        dept_path TEXT, status TEXT DEFAULT 'active')""")
+    raw = "AI 平台事业部/AI 业务部/运动科学部"
+    conn.execute("INSERT INTO feishu_users VALUES('ou_v','供应商甲','',?, 'active')", (raw,))
+    obj = _call(dc, conn, monkeypatch, headcount=1)
+    assert [u["name"] for u in obj["unused"]] == ["供应商甲"]
+    assert obj["used_count"] == 0
