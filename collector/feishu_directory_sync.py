@@ -1181,12 +1181,22 @@ class FeishuDirectoryClient(object):
         for d in departments:
             d["path"] = path_by_id.get(d["dept_id"], d.get("name", ""))
         users, seen = [], set()
-        # find_by_department from root with fetch_child=true returns the whole tree.
-        for u in self.list_users_by_department(root, fetch_child=True):
-            if u["open_id"] and u["open_id"] not in seen:
-                seen.add(u["open_id"])
-                u["dept_path"] = path_by_id.get(u["dept_id"], "")
-                users.append(u)
+        # NOTE(2026-06-23): 本租户里 find_by_department(department_id="0", fetch_child=true)
+        # 【不递归】—— 它只返回某部门的【直属】成员,虚拟根 "0" 没有直属成员,故返回 0。
+        # 旧实现因此只靠 enrich_required_users 的 leader 兜底拿到 ~152 人(全员≈1297)。
+        # 验证:逐部门(fetch_child=false)拉直属成员并去重 union = 1217 人。
+        # 因此枚举【每个部门】的直属成员,union 即全员花名册。dept_path 仍取该用户主部门
+        # (department_ids[0] → _normalize_user 的 dept_id)的路径,不用所在迭代部门覆盖。
+        for d in departments:
+            did = d.get("dept_id")
+            if not did:
+                continue
+            for u in self.list_users_by_department(did, fetch_child=False):
+                oid = u.get("open_id")
+                if oid and oid not in seen:
+                    seen.add(oid)
+                    u["dept_path"] = path_by_id.get(u["dept_id"], "")
+                    users.append(u)
         return departments, users
 
     def validate_visibility_coverage(self, departments, users):

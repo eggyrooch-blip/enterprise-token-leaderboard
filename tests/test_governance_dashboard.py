@@ -60,9 +60,11 @@ def test_dashboard_has_feishu_auth_controls():
     assert "/v1/auth/login?next=" in html
     assert "/v1/auth/logout" in html
     assert "scope-pill" in html
-    assert "owned_departments" in html
-    assert "me.roles" in html
     assert "me.open_id" in html
+    # owned_departments 的明细展示 + me.roles 直读已在「看板页头美化」(commit e5328a7)中按设计移除/
+    # 重构为局部变量 —— scope 仍由【后端】owned_departments 强制(dev_collector),前端页头保留
+    # 姓名/退出/scope-pill/角色标签即可。此处不再断言已被重构掉的内部 JS 表达式(避免脆性误报)。
+    assert "auth-role" in html        # 角色标签仍在(渲染自局部 roles 变量)
 
 
 def test_public_pages_use_generic_company_logo_path():

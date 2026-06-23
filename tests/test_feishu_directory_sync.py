@@ -731,3 +731,39 @@ def test_visibility_coverage_flags_partial():
     warns = client.validate_visibility_coverage(deps, users)
     assert warns and warns[0]["dept_id"] == "d_tech"
     assert warns[0]["expected"] == 3 and warns[0]["got"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# fetch_snapshot: per-department enumeration (2026-06-23)
+# 本租户 find_by_department(root,fetch_child=true) 不递归 → 必须逐部门拉直属成员并 union。
+# --------------------------------------------------------------------------- #
+def test_fetch_snapshot_enumerates_each_department():
+    class FakeClient(fds.FeishuDirectoryClient):
+        def __init__(self):
+            pass  # 跳过网络初始化
+
+        def list_departments(self, root="0"):
+            return [
+                {"dept_id": "d_top", "parent_id": "0", "name": "事业部"},
+                {"dept_id": "d_leaf1", "parent_id": "d_top", "name": "组A"},
+                {"dept_id": "d_leaf2", "parent_id": "d_top", "name": "组B"},
+            ]
+
+        def list_users_by_department(self, dept_id, fetch_child=True):
+            # 模拟租户行为:root/中层 直属成员为空(fetch_child 不递归);只有叶子有直属成员。
+            data = {
+                "0": [], "d_top": [],
+                "d_leaf1": [{"open_id": "ou_a", "name": "甲", "department_ids": ["d_leaf1"]}],
+                "d_leaf2": [
+                    {"open_id": "ou_b", "name": "乙", "department_ids": ["d_leaf2"]},
+                    {"open_id": "ou_a", "name": "甲", "department_ids": ["d_leaf1"]},  # 跨部门重复
+                ],
+            }
+            return [fds.FeishuDirectoryClient._normalize_user(u) for u in data.get(dept_id, [])]
+
+    deps, users = FakeClient().fetch_snapshot()
+    ids = sorted(u["open_id"] for u in users)
+    assert ids == ["ou_a", "ou_b"]  # 旧实现只查 root→空,会漏全部叶子成员;新实现 union 去重收到
+    by = {u["open_id"]: u for u in users}
+    assert "组A" in by["ou_a"]["dept_path"]   # dept_path 取主部门(department_ids[0])
+    assert "组B" in by["ou_b"]["dept_path"]
