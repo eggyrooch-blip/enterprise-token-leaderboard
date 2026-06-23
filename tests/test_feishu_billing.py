@@ -133,3 +133,25 @@ def test_feishu_rate_comes_from_env_and_is_exposed_on_feishu_payload(monkeypatch
     assert payload["package_points"] == 2000000
     assert payload["cny_per_usd"] == 10
     assert payload["package_usd"] == pytest.approx(9900)
+
+
+def test_feishu_member_dept_enriched_from_people_without_join(monkeypatch, tmp_path):
+    """PERF 热修(2026-06-23):_feishu 去掉 lower(email) 全表 JOIN,改 Python 补部门。
+    契约:成员部门仍优先取 people(覆盖 feishu_member.dept)。若回退成只用 f.dept,本断言会失败。"""
+    dc = _reload_dc(monkeypatch)
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    conn = dc.db()
+    try:
+        # feishu_member 里 dept 是旧/粗路径;people 里是真实部门 → 输出应取 people 的。
+        _insert_feishu(conn, "u1@keep.com", 1000)        # feishu_member.dept = Keep/平台/基础
+        _insert_people(conn, "u1@keep.com", "用户一", "Keep/AI 平台事业部/AI 业务部/运动科学部")
+        # 大小写不一致也要命中(原 JOIN 用 lower();Python dict 键也用 lower)。
+        _insert_feishu(conn, "U2@Keep.com", 500)
+        _insert_people(conn, "u2@keep.com", "用户二", "Keep/技术平台部/安全组")
+        conn.commit()
+        payload = _feishu(dc, conn, {"from": ["2026-06-01"], "to": ["2026-06-30"]})
+        m = {r["email"]: r["dept"] for r in payload["members"]}
+        assert m["u1@keep.com"] == "Keep/AI 平台事业部/AI 业务部/运动科学部"
+        assert m["U2@Keep.com"] == "Keep/技术平台部/安全组"   # 大小写不敏感命中 people
+    finally:
+        conn.close()

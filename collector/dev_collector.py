@@ -3059,18 +3059,33 @@ class H(BaseHTTPRequestHandler):
         sd = _show_departed(qs)
         dep = "" if sd else " AND f.email NOT IN (SELECT email FROM departed)"
         ex, ex_params = _excluded_filter(qs, "f.")
-        member_rows = conn.execute(
-            "SELECT f.email, MAX(f.name),"
-            " COALESCE(MAX(NULLIF(p.effective_dept,'')), MAX(NULLIF(p.dept,'')), MAX(f.dept)),"
-            " MAX(f.avatar), SUM(f.credits),"
+        # PERF(2026-06-23 prod 热修):原先 LEFT JOIN people ON lower(p.email)=lower(f.email),
+        # lower() 让 email 索引失效 → 全表笛卡尔扫(prod feishu_member 13921 × people 936 ≈ 5s,
+        # 页面 Promise.all 等它超 nginx 超时 → 数据不出 + 看似掉登录)。改为单表聚合(快)+ Python
+        # 补部门(与 _teams 同法,people 一次扫成 dict)。
+        raw_rows = conn.execute(
+            "SELECT f.email, MAX(f.name), MAX(f.dept), MAX(f.avatar), SUM(f.credits),"
             " SUM(CASE WHEN f.feature_key='AI_credits' THEN f.credits ELSE 0 END),"
             " SUM(CASE WHEN f.feature_key='aily_credits' THEN f.credits ELSE 0 END),"
             " MIN(f.usage_date), MAX(f.usage_date)"
-            " FROM feishu_member f LEFT JOIN people p ON lower(p.email)=lower(f.email)"
+            " FROM feishu_member f"
             " WHERE 1=1%s%s%s"
             " GROUP BY f.email HAVING SUM(f.credits)>0 ORDER BY SUM(f.credits) DESC"
             % (rng, dep, ex),
             params + ex_params).fetchall()
+        # people 部门字典(一次扫):effective_dept 优先 → dept;键用小写 email。
+        _pcols = _table_columns(conn, "people")
+        if "effective_dept" in _pcols:
+            _pdept_full = {(e or "").lower(): (ed or d or "") for e, ed, d in conn.execute(
+                "SELECT email, effective_dept, dept FROM people").fetchall()}
+        else:
+            _pdept_full = {(e or "").lower(): (d or "") for e, d in conn.execute(
+                "SELECT email, dept FROM people").fetchall()}
+        # 补部门:people.effective_dept/dept 优先,回退 feishu_member.dept(与原 COALESCE 同口径)。
+        member_rows = [
+            (r[0], r[1], (_pdept_full.get((r[0] or "").lower()) or r[2]),
+             r[3], r[4], r[5], r[6], r[7], r[8])
+            for r in raw_rows]
         if scope_user and not scope_user.get("is_admin"):
             member_rows = [
                 r for r in member_rows
