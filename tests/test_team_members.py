@@ -315,3 +315,19 @@ def test_feishu_users_no_email_vendor_row_is_unused(monkeypatch):
     obj = _call(dc, conn, monkeypatch, headcount=1)
     assert [u["name"] for u in obj["unused"]] == ["供应商甲"]
     assert obj["used_count"] == 0
+    assert obj["missing"] == 0   # 1 花名册行(无邮箱)= headcount 1
+
+
+def test_inactive_feishu_user_excluded(monkeypatch):
+    """feishu_users 非 active(离职/冻结)成员默认不进花名册。"""
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    conn.execute("""CREATE TABLE feishu_users(open_id TEXT PRIMARY KEY, name TEXT, email TEXT,
+        dept_path TEXT, status TEXT DEFAULT 'active')""")
+    raw = "AI 平台事业部/AI 业务部/运动科学部"
+    conn.execute("INSERT INTO feishu_users VALUES('ou_a','在职甲','a@keep.com',?,'active')", (raw,))
+    conn.execute("INSERT INTO feishu_users VALUES('ou_x','离职乙','x@keep.com',?,'inactive')", (raw,))
+    obj = _call(dc, conn, monkeypatch, headcount=1)
+    names = [u["name"] for u in obj["used"]] + [u["name"] for u in obj["unused"]]
+    assert "离职乙" not in names and "在职甲" in names
