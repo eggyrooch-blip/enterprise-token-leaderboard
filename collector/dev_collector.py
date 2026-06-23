@@ -625,8 +625,8 @@ AUTH_COOKIE_SECURE = os.environ.get(
 # Data routes guarded by AUTH_ENFORCE. The report/static/auth routes are NOT here.
 DATA_ROUTES = {
     "/v1/leaderboard", "/v1/agent_leaderboard", "/v1/agent_owner_summary",
-    "/v1/teams", "/v1/cursor", "/v1/breakdown", "/v1/trend", "/v1/ai/usage",
-    "/v1/meta", "/v1/governance_metrics", "/v1/feishu", "/v1/raw",
+    "/v1/teams", "/v1/team_members", "/v1/cursor", "/v1/breakdown", "/v1/trend",
+    "/v1/ai/usage", "/v1/meta", "/v1/governance_metrics", "/v1/feishu", "/v1/raw",
 }
 # Route authorization categories (only consulted when AUTH_ENFORCE=1):
 #  - ADMIN_ONLY: company-wide aggregates that can't be row-scoped to an
@@ -637,7 +637,7 @@ DATA_ROUTES = {
 ADMIN_ONLY_ROUTES = {
     "/v1/governance_metrics", "/v1/raw",
 }
-OWNER_OR_ADMIN_ROUTES = {"/v1/teams"}
+OWNER_OR_ADMIN_ROUTES = {"/v1/teams", "/v1/team_members"}
 
 
 def auth_enforced():
@@ -1682,6 +1682,24 @@ def _trusted_keep_path(raw):
     if "/" in n:
         return "Keep/" + n
     return None
+
+
+def _canon_dept_for(email, depts, effective_dept, pdept, has_attr):
+    """每人规范部门(_teams 与 _team_members 共用,口径必须一致):
+    people.dept 优先 → 新 attribution 的可信 effective_dept → usage 里最具体可归一 Keep 路径 →
+    都归不到则 'Keep/未归类'。两条路径共用此函数,保证「部门榜活跃集」与「末级人员明细用了的人」
+    严格同口径。"""
+    if has_attr:
+        trusted = _trusted_keep_path(effective_dept)
+        if trusted:
+            return trusted
+    cand = _to_keep(pdept.get(email))
+    if cand:
+        return cand
+    keeps = [c for c in (_to_keep(x) for x in depts) if c]
+    if keeps:
+        return max(keeps, key=len)
+    return "Keep/未归类"
 
 
 def _canonical_dept_key(raw_path):
@@ -2983,6 +3001,8 @@ class H(BaseHTTPRequestHandler):
                 return self._agent_owner_summary(conn, qs)
             if path == "/v1/teams":
                 return self._teams(conn, qs)
+            if path == "/v1/team_members":
+                return self._team_members(conn, qs)
             if path == "/v1/cursor":
                 return self._cursor(conn, qs)
             if path == "/v1/breakdown":
@@ -3476,20 +3496,8 @@ class H(BaseHTTPRequestHandler):
                 p["depts"].append(raw_dept)
 
         def _canon_dept(email, depts, effective_dept=""):
-            """每人规范部门：people.dept 优先 → usage 里最具体的可归一 Keep 路径 →
-            都归不到则 'Keep/未归类'。统一过 _to_keep：外包折回真实部门、裸供应商(SP码)收口外部合作商，
-            与 headcount 同口径。裸非 SP 组名/unknown 归不到 Keep → 未归类。"""
-            if has_attr:
-                trusted = _trusted_keep_path(effective_dept)
-                if trusted:
-                    return trusted
-            cand = _to_keep(pdept.get(email))
-            if cand:
-                return cand
-            keeps = [c for c in (_to_keep(x) for x in depts) if c]
-            if keeps:
-                return max(keeps, key=len)
-            return "Keep/未归类"
+            # 共用模块级实现,保证与 _team_members(末级人员明细)同口径。
+            return _canon_dept_for(email, depts, effective_dept, pdept, has_attr)
 
         # 部门总人数(默认飞书组织架构,飞书无数据回退飞连;缓存,懒加载,graceful)。
         # 双口径:node_hc_total(含外包)+ node_hc_staff(员工=排除外部合作商子树)。
@@ -3668,6 +3676,187 @@ class H(BaseHTTPRequestHandler):
             })
         result.sort(key=lambda x: -x["tokens"])
         self._send(200, {"teams": result})
+
+    def _team_members(self, conn, qs, auth_user=None):
+        """末级部门人员明细。dept=<canonical Keep path>，返回该部门(含子部门递归)的人员:
+          used   = 窗口内有 token/aily 用量的人(与部门榜「活跃集」严格同口径:同窗口/bucket/departed/
+                   scope/excluded 过滤 + 共用 _canon_dept_for)，按 token 倒序，带 姓名/邮箱/头像/token/cost。
+          unused = 花名册(people 表)里 canon 部门落在该子树、但窗口内没用的人。
+          missing= max(0, headcount(member_count 递归含外包) − 已点到名的人数) → 前端「另有 N 人未同步通讯录」。
+        people 花名册受飞书通讯录可见范围限制(见 SPEC dead-ends)，missing 如实交代缺口，绝不假装完整。"""
+        if auth_user is not None:
+            self._scope_user = auth_user
+        scope_user = getattr(self, "_scope_user", None)
+        target = (qs.get("dept") or [""])[0]
+        target = _normalize_dept_path(target) or target
+        if not target:
+            return self._send(400, {"error": "dept required"})
+
+        def _under(path):
+            return bool(path) and (path == target or path.startswith(target + "/"))
+
+        def _in_scope(email, cd):
+            if not scope_user or scope_user.get("is_admin"):
+                return True
+            return email_in_scope(scope_user, email, cd)
+
+        where, params = _range_clause(qs)
+        sd = _show_departed(qs)
+        dep_clause = _departed_filter(sd, "")
+        ex_clause, ex_params = _excluded_filter(qs, "")
+        usage_cols = _table_columns(conn, "usage")
+        has_attr = "effective_dept" in usage_cols and "spend_bucket" in usage_cols
+        if has_attr:
+            rows = conn.execute("""
+                SELECT email,
+                       COALESCE(NULLIF(effective_dept,''), dept) AS effective_dept,
+                       COALESCE(NULLIF(raw_dept,''), dept) AS raw_dept,
+                       COALESCE(NULLIF(spend_bucket,''), ?) AS spend_bucket,
+                       SUM(total), SUM(cost), SUM(messages)
+                FROM usage
+                WHERE %s AND source != 'litellm_agent'%s%s
+                GROUP BY 1,2,3,4
+            """ % (where, dep_clause, ex_clause),
+                [BUCKET_EMPLOYEE] + params + ex_params).fetchall()
+        else:
+            rows = [
+                (email, dept, dept, BUCKET_EMPLOYEE, tok, cost, msg)
+                for email, dept, tok, cost, msg in conn.execute("""
+                    SELECT email, dept, SUM(total), SUM(cost), SUM(messages)
+                    FROM usage
+                    WHERE %s AND source != 'litellm_agent'%s%s
+                    GROUP BY email, dept
+                """ % (where, dep_clause, ex_clause), params + ex_params).fetchall()
+            ]
+
+        people_cols = _table_columns(conn, "people")
+        if "effective_dept" in people_cols:
+            pdept = dict(conn.execute(
+                "SELECT email, COALESCE(NULLIF(effective_dept,''), dept) FROM people"
+            ).fetchall())
+        else:
+            pdept = dict(conn.execute("SELECT email, dept FROM people").fetchall())
+
+        # 1) usage 侧:按 email 聚合 VISIBLE bucket 的量(与部门榜 token 口径一致),记录是否窗口内活跃。
+        per = {}
+        for email, dept, raw_dept, bucket, tok, cost, msg in rows:
+            bucket = bucket or BUCKET_EMPLOYEE
+            if bucket not in (BUCKET_EMPLOYEE, BUCKET_BUSINESS, BUCKET_PENDING_BUSINESS, BUCKET_UNRESOLVED):
+                bucket = BUCKET_UNRESOLVED
+            p = per.get(email)
+            if p is None:
+                p = {"tok": 0, "cost": 0.0, "msg": 0, "depts": [], "visible": False,
+                     "effective_dept": dept or ""}
+                per[email] = p
+            if dept:
+                p["depts"].append(dept)
+            if raw_dept and raw_dept != dept:
+                p["depts"].append(raw_dept)
+            if bucket in VISIBLE_SPEND_BUCKETS:
+                p["visible"] = True   # 与 _teams 的 token_users 成员判定一致(有可见 bucket 行即算活跃)
+                p["tok"] += tok or 0
+                p["cost"] += cost or 0
+                p["msg"] += msg or 0
+
+        token_active = {}   # email -> {tok,cost,msg}
+        for email, p in per.items():
+            cd = _canon_dept_for(email, p["depts"], p.get("effective_dept"), pdept, has_attr)
+            if not _under(cd) or not p["visible"] or not _in_scope(email, cd):
+                continue
+            token_active[email] = {"tok": p["tok"], "cost": p["cost"], "msg": p["msg"]}
+
+        # 2) aily(飞书 AI 权益)活跃:窗口内 credits>0,canon 用 _to_keep(pdept)→_to_keep(fdept),与部门榜同口径。
+        frng, fparams = _feishu_range(qs)
+        fdep = "" if sd else " AND email NOT IN (SELECT email FROM departed)"
+        fex, fex_params = _excluded_filter(qs, "")
+        aily_active = {}
+        for email, fdept, credits in conn.execute(
+            "SELECT email, MAX(dept), SUM(credits) FROM feishu_member"
+            " WHERE 1=1%s%s%s GROUP BY email HAVING SUM(credits)>0" % (frng, fdep, fex),
+            fparams + fex_params).fetchall():
+            cd = _to_keep(pdept.get(email)) or _to_keep(fdept)
+            if not _under(cd) or not _in_scope(email, cd):
+                continue
+            aily_active[email] = credits or 0
+
+        # 3) 花名册:people 表里 canon 部门落在目标子树的在职人(show_departed 时含离职)。
+        if "effective_dept" in people_cols:
+            prows = conn.execute(
+                "SELECT email, COALESCE(name,''), COALESCE(avatar,''),"
+                " COALESCE(NULLIF(effective_dept,''), dept), COALESCE(raw_dept,'') FROM people"
+            ).fetchall()
+        else:
+            prows = [(e, n, a, d, "") for e, n, a, d in conn.execute(
+                "SELECT email, COALESCE(name,''), COALESCE(avatar,''), dept FROM people"
+            ).fetchall()]
+        departed_set = set()
+        if not sd:
+            departed_set = {r[0] for r in conn.execute("SELECT email FROM departed").fetchall()}
+        roster = {}   # email -> {name, avatar}
+        for email, name, avatar, eff, raw in prows:
+            if email in departed_set:
+                continue
+            cd = _canon_dept_for(email, [eff, raw], eff, pdept, has_attr)
+            if not _under(cd) or not _in_scope(email, cd):
+                continue
+            roster[email] = {"name": name, "avatar": avatar}
+
+        # 4) 组装。used 名字优先花名册→people→邮箱前缀。
+        pname = dict(conn.execute("SELECT email, COALESCE(name,'') FROM people").fetchall())
+        pav = dict(conn.execute("SELECT email, COALESCE(avatar,'') FROM people").fetchall())
+
+        def _nm(email):
+            return (roster.get(email, {}).get("name") or pname.get(email)
+                    or (email or "").split("@")[0] or "—")
+
+        def _av(email):
+            return roster.get(email, {}).get("avatar") or pav.get(email) or ""
+
+        used_emails = set(token_active) | set(aily_active)
+        used = []
+        for email in used_emails:
+            ta = token_active.get(email)
+            used.append({
+                "email": email, "name": _nm(email), "avatar": _av(email),
+                "tokens": ta["tok"] if ta else 0,
+                "cost": round(ta["cost"], 4) if ta else 0.0,
+                "messages": ta["msg"] if ta else 0,
+                "credits": round(aily_active.get(email, 0), 2),
+            })
+        used.sort(key=lambda x: (-x["tokens"], -x["credits"], x["name"]))
+        unused = sorted(
+            ({"email": e, "name": i["name"] or _nm(e), "avatar": i["avatar"]}
+             for e, i in roster.items() if e not in used_emails),
+            key=lambda x: x["name"])
+
+        # 5) headcount(member_count 递归含外包) → missing。
+        headcount_map = _dept_headcount_map(conn)
+        hc_total = None
+        if _dept_headcount_is_precounted(_dept_headcount_source_used()):
+            # member_count 已是递归值:直接取 target 自身节点的值(绝不 roll-up 子值)。
+            for path, val in headcount_map.items():
+                npath = _member_count_dept_key(path)[0] or _normalize_dept_path(path)
+                if npath == target:
+                    total = int(val[0] or 0) if isinstance(val, (list, tuple)) else int(val or 0)
+                    hc_total = max(hc_total or 0, total)
+        else:
+            # 叶子级计数:累加子树。
+            cnt = 0
+            for path, c in headcount_map.items():
+                np = _normalize_dept_path(path)
+                if _under(np):
+                    cnt += int((c or [0])[0] or 0) if isinstance(c, (list, tuple)) else int(c or 0)
+            hc_total = cnt or None
+
+        named = used_emails | set(roster)
+        missing = max(0, (hc_total or 0) - len(named))
+        self._send(200, {
+            "dept": target,
+            "headcount_total": hc_total,
+            "used": used, "unused": unused,
+            "used_count": len(used), "unused_count": len(unused),
+            "missing": missing,
+        })
 
     def _breakdown(self, conn, qs, auth_user=None):
         """四种维度聚合 lifetime 快照。

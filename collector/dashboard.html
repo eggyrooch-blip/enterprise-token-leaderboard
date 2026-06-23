@@ -90,6 +90,12 @@
   .r{display:flex;align-items:center;gap:14px;padding:15px 0;border-bottom:1px solid var(--div);transition:background .12s ease}
   .r:last-child{border-bottom:0}
   .r:hover{background:var(--bg2)}
+  /* 末级部门人员明细行:缩进、淡底、小头像;.muted 给"没用/未同步/表头"灰显。 */
+  .mrow{padding:9px 0;font-size:13px;background:var(--bg2)}
+  .mrow .av{width:26px;height:26px;font-size:11px}
+  .mrow .nm{font-size:13px}
+  .mrow.muted{opacity:.65}
+  .muted,.mrow.muted .nm{color:var(--t3)}
   .rk{font-family:var(--display);font-weight:800;font-size:16px;color:#CCC;width:22px;text-align:center;flex:0 0 auto;font-variant-numeric:tabular-nums}
   .rk.first{color:var(--green)}
   /* 部门树:展开三角 + 缩进 */
@@ -269,6 +275,25 @@ var CACHE={}, CUR="person", RANGE_FROM="", RANGE_TO="", META_DONE=false;
 var METRIC="total", SORT="token", SHOW_DEPARTED=false, META_MIN="", META_MAX="";
 // 部门榜(树)展开状态:记住展开了哪些完整 dept 路径。null=尚未初始化(首次按 depth<=1 展开)。
 var TEAM_EXPANDED=null;
+// 末级部门「人员明细」下钻:MEMBERS_OPEN=已展开的末级部门 path;TEAM_MEMBERS=该部门人员数据缓存。
+// 区间变更(load)时清空,保证人员名单与所选窗口一致。
+var MEMBERS_OPEN=new Set(), TEAM_MEMBERS={};
+function curRangeQS(){
+  var parts=[];
+  if(RANGE_FROM||RANGE_TO){ parts.push('from='+RANGE_FROM); parts.push('to='+RANGE_TO); }
+  else if(METRIC==='daily' && META_MIN && META_MAX){ parts.push('from='+META_MIN); parts.push('to='+META_MAX); }
+  if(SHOW_DEPARTED) parts.push('show_departed=1');
+  return parts.join('&');
+}
+async function loadMembers(dept){
+  if(TEAM_MEMBERS[dept] && TEAM_MEMBERS[dept].loading) return;   // 防重复请求
+  TEAM_MEMBERS[dept]={loading:true};
+  renderTeamTree();
+  var qs=curRangeQS();
+  var u='/v1/team_members?dept='+encodeURIComponent(dept)+(qs?('&'+qs):'');
+  try{ TEAM_MEMBERS[dept]=await j(u); }catch(e){ TEAM_MEMBERS[dept]={error:true}; }
+  renderTeamTree();
+}
 // 计算用于"日均"的天数:优先用选中的时间范围,否则用 /v1/meta 的 min/max。天数<1 兜底 1。
 function rangeDays(){
   var f=RANGE_FROM||META_MIN, t=RANGE_TO||META_MAX;
@@ -379,6 +404,7 @@ var GOVERNANCE_METRICS=[
 async function load(){
   await fillAuth();
   await fillMeta();              // 确保 META_MIN/MAX 已就绪(日均精确口径要用)
+  MEMBERS_OPEN=new Set(); TEAM_MEMBERS={};   // 区间一变,折叠并清空末级人员明细,避免名单跨窗口串台
   var parts=[];
   if(RANGE_FROM||RANGE_TO){
     // 用户选了范围:两种模式数据相同(都是 day 桶区间和),按所选范围请求
@@ -543,9 +569,12 @@ function renderTeamTree(){
     list.forEach(function(x){
       var kids=children[x.dept]||[];
       var hasKids=kids.length>0;
-      var open=TEAM_EXPANDED.has(x.dept);
-      var tri=hasKids?(open?'▾':'▸'):'';
-      var twCls='tw'+(hasKids?'':' leaf');
+      // 末级真实部门(无子部门、非外部合作商、非合成 Keep 根)→ 可展开「人员明细」。
+      var isLeafDept=!hasKids && !isExt(x.dept) && x.dept!=='Keep';
+      var open=hasKids?TEAM_EXPANDED.has(x.dept):MEMBERS_OPEN.has(x.dept);
+      var expandable=hasKids||isLeafDept;
+      var tri=expandable?(open?'▾':'▸'):'';
+      var twCls='tw'+(expandable?'':' leaf');
       var name=lastSeg(x.dept)||'—';
       var sub;
       sub=fmtHeadcountSub(x);
@@ -555,8 +584,9 @@ function renderTeamTree(){
       // 「点」只保留在「飞书 AI 权益」tab。此处 $ 为估算(含订阅席位摊销)。
       var small='总 '+compact(metricTok(x.tokens||0))+' · 估算$(含订阅摊销) '+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%';
       var pad=depth*18;                                 // 每级缩进 18px,层级靠缩进体现
-      // 有子节点的行:整行可点(data-path + 手型光标),点哪都展开/收起,不必精准点三角
-      var rowAttr=hasKids?(' data-path="'+encodeURIComponent(x.dept)+'" style="cursor:pointer"'):'';
+      // 有子节点→点行下钻子部门(data-path);末级真实部门→点行展开人员明细(data-leaf)。
+      var rowAttr=hasKids?(' data-path="'+encodeURIComponent(x.dept)+'" style="cursor:pointer"')
+                :(isLeafDept?(' data-leaf="'+encodeURIComponent(x.dept)+'" style="cursor:pointer"'):'');
       html.push('<div class="r" data-depth="'+depth+'"'+rowAttr+'>'+
         '<span class="tw-pad" style="width:'+pad+'px"></span>'+
         '<span class="'+twCls+'">'+tri+'</span>'+
@@ -564,6 +594,7 @@ function renderTeamTree(){
         '<div class="track"><div class="fill" style="width:'+pct+'%"></div></div>'+
         '<div class="val"><div class="t num">'+big+'</div><div class="s num">'+small+'</div></div></div>');
       if(hasKids && open) walk(kids, depth+1);           // 展开才下钻直接子节点
+      else if(isLeafDept && open) html.push(renderMembersPanel(x.dept, depth+1));  // 末级→人员明细
     });
   };
   // 去掉最前面的一级 'Keep' 根:若顶层只有 Keep,直接从它的子节点(一级事业部/线)起树
@@ -579,6 +610,54 @@ function renderTeamTree(){
       renderTeamTree();
     };
   });
+  // 末级部门:点行展开/收起人员明细;首次展开懒加载 /v1/team_members(随当前区间)。
+  $('list').querySelectorAll('.r[data-leaf]').forEach(function(t){
+    t.onclick=function(){
+      var p=decodeURIComponent(t.getAttribute('data-leaf'));
+      if(MEMBERS_OPEN.has(p)){ MEMBERS_OPEN.delete(p); renderTeamTree(); }
+      else { MEMBERS_OPEN.add(p); if(!TEAM_MEMBERS[p]) loadMembers(p); else renderTeamTree(); }
+    };
+  });
+}
+// 末级部门人员明细面板:用了的人(token 倒序,带 token 条)+ 没用的人(灰显)+ 未同步缺口行。
+function renderMembersPanel(dept, depth){
+  var pad=depth*18;
+  var ind='<span class="tw-pad" style="width:'+pad+'px"></span>';
+  var d=TEAM_MEMBERS[dept];
+  function line(inner){ return '<div class="r mrow" data-depth="'+depth+'">'+ind+inner+'</div>'; }
+  if(!d || d.loading) return line('<div class="nm muted">加载人员中…</div>');
+  if(d.error)         return line('<div class="nm muted">人员加载失败,点部门收起再展开重试</div>');
+  var used=d.used||[], unused=d.unused||[], missing=d.missing||0;
+  if(!used.length && !unused.length && !missing)
+    return line('<div class="nm muted">该部门暂无可点名人员(通讯录未同步)</div>');
+  var maxTok=used.reduce(function(a,u){return Math.max(a,u.tokens||0)},1);
+  var out=[];
+  // 表头:用了 X / 没用 Y (+ 未同步 N)
+  var hd='用了 '+used.length+' · 没用 '+unused.length+(missing?(' · 未同步 '+missing):'');
+  out.push(line('<div class="nm muted" style="font-size:12px">'+hd+'</div>'));
+  used.forEach(function(u){
+    var fb=(u.name||'·').slice(-2);
+    var av=u.avatar?('<img class="av" src="'+u.avatar+'" onerror="this.outerHTML=&quot;<span class=\\&quot;av fb\\&quot;>'+fb+'</span>&quot;">')
+                   :('<span class="av fb">'+fb+'</span>');
+    var pct=Math.max(2,(u.tokens||0)/maxTok*100);
+    var extra=(u.credits>0)?(' · 权益 '+grp(Math.round(u.credits))+' 点'):'';
+    out.push('<div class="r mrow" data-depth="'+depth+'">'+ind+av+
+      '<div class="nm">'+(u.name||'—')+'</div>'+
+      '<div class="track"><div class="fill" style="width:'+pct+'%;background:'+toolColor('Claude Code')+'"></div></div>'+
+      '<div class="val"><div class="t num">'+compact(metricTok(u.tokens||0))+'</div><div class="s num">'+
+        (u.tokens>0?'token':'仅权益')+extra+'</div></div></div>');
+  });
+  unused.forEach(function(u){
+    var fb=(u.name||'·').slice(-2);
+    var av=u.avatar?('<img class="av" src="'+u.avatar+'" onerror="this.outerHTML=&quot;<span class=\\&quot;av fb\\&quot;>'+fb+'</span>&quot;">')
+                   :('<span class="av fb">'+fb+'</span>');
+    out.push('<div class="r mrow muted" data-depth="'+depth+'">'+ind+av+
+      '<div class="nm">'+(u.name||'—')+'</div>'+
+      '<div class="track"></div>'+
+      '<div class="val"><div class="t num">未使用</div></div></div>');
+  });
+  if(missing>0) out.push(line('<div class="nm muted">⋯ 另有 '+missing+' 人未同步通讯录(无法点名)</div>'));
+  return out.join('');
 }
 function render(){
   syncSortCtl();

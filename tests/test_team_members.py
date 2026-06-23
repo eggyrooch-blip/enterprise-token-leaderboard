@@ -1,0 +1,173 @@
+"""末级部门人员明细 /v1/team_members 回归测试。
+
+来源:2026-06-23 孙可「部门榜到末级部门要显示人员:哪些人用了用了多少 token、哪些人没用」。
+要点:
+  * used(用了的人) 必须与部门榜「活跃集」同口径(同窗口/bucket/departed/scope),按 token 倒序;
+  * unused(没用的人) = 花名册(people)在该子树、窗口内没用的人;
+  * missing = member_count(递归含外包) − 已点到名人数 → 前端「另有 N 人未同步通讯录」,如实交代缺口;
+  * 子部门递归归入;非本 scope 的部门负责人看不到;离职默认不出现。
+"""
+import importlib
+import sqlite3
+import sys
+import pathlib
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "collector"))
+
+import dev_collector  # noqa: E402
+
+DEPT = "Keep/AI 平台事业部/AI 业务部/运动科学部"
+
+
+def _schema(conn):
+    conn.executescript(
+        """
+        CREATE TABLE usage(email TEXT, dept TEXT, period_type TEXT, period TEXT,
+            source TEXT, client TEXT, total INTEGER, cost REAL, messages INTEGER,
+            raw_dept TEXT, effective_dept TEXT, spend_bucket TEXT);
+        CREATE TABLE people(email TEXT PRIMARY KEY, name TEXT, avatar TEXT, dept TEXT,
+            raw_dept TEXT, effective_dept TEXT);
+        CREATE TABLE feishu_member(email TEXT, name TEXT, dept TEXT, feature_key TEXT,
+            credits REAL, usage_date TEXT, avatar TEXT, entity_id TEXT);
+        CREATE TABLE departed(email TEXT PRIMARY KEY);
+        """
+    )
+
+
+def _person(conn, email, name, dept, departed=False):
+    conn.execute("INSERT OR REPLACE INTO people VALUES(?,?,?,?,?,?)",
+                 (email, name, "", dept, dept, dept))
+    if departed:
+        conn.execute("INSERT OR REPLACE INTO departed VALUES(?)", (email,))
+
+
+def _use(conn, email, dept, tokens, bucket="employee_staff_outsourcing", cost=1.0):
+    conn.execute("INSERT INTO usage VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                 (email, dept, "lifetime", "all", "subscription", "Claude Code",
+                  tokens, cost, 0, dept, dept, bucket))
+
+
+def _call(dc, conn, monkeypatch, qs=None, headcount=6, precounted=True, scope_user=None):
+    monkeypatch.setattr(dc, "_dept_headcount_map", lambda *_a, **_k: {DEPT: headcount})
+    monkeypatch.setattr(dc, "_dept_headcount_source_used",
+                        lambda: dc._HEADCOUNT_SOURCE_PRECOUNTED if precounted else "people")
+    captured = {}
+
+    class Fake:
+        _scope_user = scope_user
+
+        def _send(self, code, obj):
+            captured["code"] = code
+            captured["obj"] = obj
+
+    dc.H._team_members(Fake(), conn, qs or {"dept": [DEPT]})
+    assert captured["code"] == 200, captured
+    return captured["obj"]
+
+
+@pytest.fixture()
+def conn_5people():
+    """5 人在 运动科学部:4 人用了(token 不同), 1 人(周啸天)没用。member_count=6 → missing=1。"""
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    _person(conn, "wangheng01@keep.com", "王衡", DEPT)
+    _person(conn, "liuzifang@keep.com", "刘自方", DEPT)
+    _person(conn, "dongqingnan@keep.com", "董庆楠", DEPT)
+    _person(conn, "yangfan01@keep.com", "杨帆", DEPT)
+    _person(conn, "zhouxiaotian@keep.com", "周啸天", DEPT)   # 没用
+    _use(conn, "wangheng01@keep.com", DEPT, 16_800_000_000)
+    _use(conn, "liuzifang@keep.com", DEPT, 10_100_000_000)
+    _use(conn, "dongqingnan@keep.com", DEPT, 12_100_000_000)
+    _use(conn, "yangfan01@keep.com", DEPT, 373_000_000)
+    return conn
+
+
+def test_used_unused_missing(conn_5people, monkeypatch):
+    dc = importlib.reload(dev_collector)
+    obj = _call(dc, conn_5people, monkeypatch)
+    assert obj["used_count"] == 4
+    assert obj["unused_count"] == 1
+    assert obj["unused"][0]["name"] == "周啸天"
+    assert obj["missing"] == 1                      # member_count 6 − 已点名 5
+    # used 按 token 倒序
+    toks = [u["tokens"] for u in obj["used"]]
+    assert toks == sorted(toks, reverse=True)
+    assert obj["used"][0]["name"] == "王衡"
+    assert obj["used"][0]["tokens"] == 16_800_000_000
+
+
+def test_used_count_equals_active_denominator(conn_5people, monkeypatch):
+    """used 人数必须等于部门榜该行的活跃人数(同口径)。"""
+    dc = importlib.reload(dev_collector)
+    monkeypatch.setattr(dc, "_dept_headcount_source_used",
+                        lambda: dc._HEADCOUNT_SOURCE_PRECOUNTED)
+    monkeypatch.setattr(dc, "_dept_headcount_map", lambda *_a, **_k: {DEPT: 6})
+    cap = {}
+
+    class Fake:
+        _scope_user = None
+
+        def _send(self, code, obj):
+            cap[code] = obj
+
+    dc.H._teams(Fake(), conn_5people, {})
+    team = {t["dept"]: t for t in cap[200]["teams"]}[DEPT]
+    obj = _call(dc, conn_5people, monkeypatch)
+    assert obj["used_count"] == team["people"]      # 活跃集严格一致
+
+
+def test_no_synthetic_completeness_when_roster_short(conn_5people, monkeypatch):
+    """花名册短于 member_count 时,绝不假装完整 —— 用 missing 如实交代。"""
+    dc = importlib.reload(dev_collector)
+    obj = _call(dc, conn_5people, monkeypatch, headcount=6)
+    assert obj["used_count"] + obj["unused_count"] + obj["missing"] == 6
+
+
+def test_departed_excluded_by_default(monkeypatch):
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    _person(conn, "a@keep.com", "A", DEPT)
+    _person(conn, "gone@keep.com", "离职人", DEPT, departed=True)
+    _use(conn, "a@keep.com", DEPT, 100)
+    obj = _call(dc, conn, monkeypatch, headcount=2)
+    names = [u["name"] for u in obj["used"]] + [u["name"] for u in obj["unused"]]
+    assert "离职人" not in names
+
+
+def test_child_dept_recursion(monkeypatch):
+    """子部门的人计入父末级节点(member_count 递归口径)。"""
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    child = DEPT + "/算法组"
+    _person(conn, "kid@keep.com", "小组员", child)
+    _use(conn, "kid@keep.com", child, 500)
+    _person(conn, "sib@keep.com", "隔壁部门", "Keep/技术平台部/安全组")
+    _use(conn, "sib@keep.com", "Keep/技术平台部/安全组", 999)
+    obj = _call(dc, conn, monkeypatch, headcount=1)
+    assert [u["name"] for u in obj["used"]] == ["小组员"]   # 隔壁部门不混入
+
+
+def test_scope_owner_other_dept_sees_nothing(conn_5people, monkeypatch):
+    dc = importlib.reload(dev_collector)
+    other = {"is_admin": False, "scope": "department",
+             "owned_departments": ["Keep/技术平台部"], "email": "boss@keep.com"}
+    obj = _call(dc, conn_5people, monkeypatch, scope_user=other)
+    assert obj["used_count"] == 0 and obj["unused_count"] == 0
+
+
+def test_aily_only_user_counts_as_used(monkeypatch):
+    """只用了飞书 AI 权益(credits)、没 token 的人,也算活跃(used)。"""
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    _person(conn, "aily@keep.com", "权益用户", DEPT)
+    conn.execute("INSERT INTO feishu_member VALUES(?,?,?,?,?,?,?,?)",
+                 ("aily@keep.com", "权益用户", DEPT, "ai", 12.0, "2099-01-01", "", ""))
+    obj = _call(dc, conn, monkeypatch, headcount=1)
+    assert [u["name"] for u in obj["used"]] == ["权益用户"]
+    assert obj["used"][0]["credits"] == 12.0
