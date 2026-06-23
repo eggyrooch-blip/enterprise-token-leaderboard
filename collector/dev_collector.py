@@ -3634,6 +3634,16 @@ class H(BaseHTTPRequestHandler):
                 "aily_people": len(b["aily_users"]),
             }
 
+        # 组织结构「末级部门」判定:前端只在【真·末级】部门上展开人员明细。不能用「/v1/teams 里
+        # 没有子行」判断 —— 本接口只物化【有用量】的部门,子部门若零用量就不出现,会把中层误判为末级,
+        # 进而在中层暴露整棵子树花名册(codex 评审第三轮发现)。改用组织结构全集(member_count 源的
+        # 全部部门 ∪ 用量树节点)判断:某节点下若还存在任何更深路径,即非末级。
+        known_paths = set(node_hc_total) | set(nodes)
+
+        def _is_org_leaf(p):
+            pre = p + "/"
+            return not any(q != p and q.startswith(pre) for q in known_paths)
+
         result = []
         for path, n in nodes.items():
             token_people = len(n["token_users"])
@@ -3654,6 +3664,7 @@ class H(BaseHTTPRequestHandler):
             result.append({
                 "dept": path,
                 "depth": path.count("/"),     # 'Keep'=0, 'Keep/技术平台部'=1 ... 供前端建树/缩进
+                "is_leaf": _is_org_leaf(path),  # 真·末级部门(组织结构无更深子部门)→ 前端才允许展开人员
                 "people": people,             # 活跃人数(token∪aily),供活跃渗透
                 "token_people": token_people,
                 "aily_people": aily_people,

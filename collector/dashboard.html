@@ -571,8 +571,11 @@ function renderTeamTree(){
     list.forEach(function(x){
       var kids=children[x.dept]||[];
       var hasKids=kids.length>0;
-      // 末级真实部门(无子部门、非外部合作商、非合成 Keep 根)→ 可展开「人员明细」。
-      var isLeafDept=!hasKids && !isExt(x.dept) && x.dept!=='Keep';
+      // 末级真实部门 → 可展开「人员明细」。用后端组织结构 is_leaf 判定,不能用「无活跃子行」:
+      // /v1/teams 只列有用量的部门,子部门零用量时缺席,会把中层误判为末级、暴露整棵子树花名册
+      // (codex 评审)。老接口无 is_leaf 时回退 !hasKids。外部合作商/合成 Keep 根不展开。
+      var leafFlag=(x.is_leaf===undefined?!hasKids:x.is_leaf);
+      var isLeafDept=leafFlag && !hasKids && !isExt(x.dept) && x.dept!=='Keep';
       var open=hasKids?TEAM_EXPANDED.has(x.dept):MEMBERS_OPEN.has(x.dept);
       var expandable=hasKids||isLeafDept;
       var tri=expandable?(open?'▾':'▸'):'';

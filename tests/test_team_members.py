@@ -215,6 +215,57 @@ def test_multi_dept_user_token_split_matches_teams(monkeypatch):
     assert teams[DEPT]["people"] == 1 and teams[other]["people"] == 1
 
 
+def test_mid_dept_with_inactive_child_is_not_leaf(monkeypatch):
+    """codex 评审第三轮:中层部门若有【零用量】子部门,/v1/teams 因只物化有用量部门会缺子行,
+    绝不能因此把中层判成末级(否则前端在中层展开会暴露整棵子树花名册)。后端 is_leaf 须看组织结构。"""
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    parent = "Keep/AI 平台事业部/AI 业务部"
+    # 直属 parent 的人有用量;子部门 运动科学部 零用量(无 usage 行)。
+    _person(conn, "boss@keep.com", "业务主管", parent)
+    _use(conn, "boss@keep.com", parent, 5000)
+    # 组织结构(member_count 源)里 parent 下有子部门 运动科学部 → parent 非末级。
+    monkeypatch.setattr(dc, "_dept_headcount_source_used", lambda: dc._HEADCOUNT_SOURCE_PRECOUNTED)
+    monkeypatch.setattr(dc, "_dept_headcount_map",
+                        lambda *_a, **_k: {"AI 平台事业部/AI 业务部": 6,
+                                           "AI 平台事业部/AI 业务部/运动科学部": 6})
+    cap = {}
+
+    class Fake:
+        _scope_user = None
+
+        def _send(self, code, o):
+            cap["o"] = o
+
+    dc.H._teams(Fake(), conn, {})
+    nodes = {t["dept"]: t for t in cap["o"]["teams"]}
+    assert nodes[parent]["is_leaf"] is False     # 中层(有子部门)→ 非末级,前端不展开人员
+    # 真叶子(无更深子部门)仍是末级
+    leaf = parent + "/运动科学部"
+    if leaf in nodes:
+        assert nodes[leaf]["is_leaf"] is True
+
+
+def test_real_leaf_is_marked_leaf(conn_5people, monkeypatch):
+    """真末级部门 is_leaf=True(供前端允许展开人员)。"""
+    dc = importlib.reload(dev_collector)
+    monkeypatch.setattr(dc, "_dept_headcount_source_used", lambda: dc._HEADCOUNT_SOURCE_PRECOUNTED)
+    monkeypatch.setattr(dc, "_dept_headcount_map", lambda *_a, **_k: {DEPT: 6})
+    cap = {}
+
+    class Fake:
+        _scope_user = None
+
+        def _send(self, code, o):
+            cap["o"] = o
+
+    dc.H._teams(Fake(), conn_5people, {})
+    nodes = {t["dept"]: t for t in cap["o"]["teams"]}
+    assert nodes[DEPT]["is_leaf"] is True
+    assert nodes["Keep/AI 平台事业部"]["is_leaf"] is False   # 上层非末级
+
+
 def test_aily_only_user_counts_as_used(monkeypatch):
     """只用了飞书 AI 权益(credits)、没 token 的人,也算活跃(used)。"""
     dc = importlib.reload(dev_collector)
