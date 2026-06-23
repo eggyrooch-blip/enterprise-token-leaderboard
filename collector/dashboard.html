@@ -278,6 +278,41 @@ var TEAM_EXPANDED=null;
 // 末级部门「人员明细」下钻:MEMBERS_OPEN=已展开的末级部门 path;TEAM_MEMBERS=该部门人员数据缓存。
 // 区间变更(load)时清空,保证人员名单与所选窗口一致。
 var MEMBERS_OPEN=new Set(), TEAM_MEMBERS={}, MEMBERS_KEY=null;  // MEMBERS_KEY=上次加载的区间/口径,变了才清人员面板
+// 懒加载:每个 tab 只在首次进入(且当前区间未拉过)时拉它自己的接口,而不是 load() 一次性拉 13 个。
+// LOADED_KEY=当前区间/口径标识(区间/离职变化即翻新),LOADED_TABS=本 key 下已拉过数据的 tab 集合。
+var LOADED_KEY=null, LOADED_TABS=new Set();
+// tab → 它的 CACHE 键由哪个接口填充(qs 占位符:'?'=独立 query,'&'=拼到已有 query)。
+// person 永远拉(KPI 由它派生);其余 tab(含 4 个 client 榜)懒加载:进 tab 才拉一次,本区间内缓存。
+var TAB_EP={
+  person:    {key:'person',     ep:'/v1/leaderboard',           qs:'?', pick:function(r){return r.leaderboard||[];}},
+  team:      {key:'team',       ep:'/v1/teams',                 qs:'?', pick:function(r){return r.teams||[];}},
+  tool:      {key:'tool',       ep:'/v1/breakdown?by=client',   qs:'&', pick:function(r){return r.breakdown||[];}},
+  model:     {key:'model',      ep:'/v1/breakdown?by=model',    qs:'&', pick:function(r){return r.breakdown||[];}},
+  cursor:    {key:'cursor',     ep:'/v1/cursor',                qs:'?', pick:function(r){return r.cursor||[];}},
+  agent:     {key:'agent',      ep:'/v1/agent_leaderboard',     qs:'?', pick:function(r){return r.agent_leaderboard||[];}},
+  governance:{key:'governance', ep:'/v1/governance_metrics',    qs:'?', pick:function(r){return r;}},
+  feishu:    {key:'feishu',     ep:'/v1/feishu',                qs:'?', pick:function(r){return r||{};}},
+  // 4 个 client 榜【懒加载】(不在首屏/改区间 load,进对应 tab 才拉一次、本区间缓存)。
+  // 不从 person.composition 派生 —— client 榜的 cost 有各自口径(Claude/Codex 订阅摊销、Hermes 推断价、
+  // LiteLLM 网关实销),且 Hermes 有大小写变体 'hermes' 需后端合并,composition 单一公式无法还原(2026-06-23 实测)。
+  claude:    {key:'claude',     ep:'/v1/leaderboard?client=Claude%20Code', qs:'&', pick:function(r){return r.leaderboard||[];}},
+  codex:     {key:'codex',      ep:'/v1/leaderboard?client=Codex%20CLI',   qs:'&', pick:function(r){return r.leaderboard||[];}},
+  litellm:   {key:'litellm',    ep:'/v1/leaderboard?client=LiteLLM',       qs:'&', pick:function(r){return r.leaderboard||[];}},
+  hermes:    {key:'hermes',     ep:'/v1/leaderboard?client=Hermes',        qs:'&', pick:function(r){return r.leaderboard||[];}}
+};
+// 进入某 tab 前确保它的 CACHE 已就绪:按 TAB_EP 拉一次,本区间内缓存(person 由 load() 常驻)。
+// force=true 用于 30s 自动刷新当前 tab(无视缓存重拉)。
+async function ensureTab(tab, force){
+  var spec=TAB_EP[tab];
+  if(!spec || spec.key==='person') return;   // person 已由 load() 常驻拉取
+  if(!force && LOADED_TABS.has(tab)) return;  // 本区间已拉过,直接用缓存
+  var qp=curRangeQS();
+  var url=spec.ep + (spec.qs==='?' ? (qp?('?'+qp):'') : (qp?('&'+qp):''));
+  var r=await j(url);
+  if(spec.key==='governance'){ CACHE.governance=r.metrics||GOVERNANCE_METRICS; CACHE.govSummary=r.summary||{}; }
+  else { CACHE[spec.key]=spec.pick(r); }
+  LOADED_TABS.add(tab);
+}
 function curRangeQS(){
   var parts=[];
   if(RANGE_FROM||RANGE_TO){ parts.push('from='+RANGE_FROM); parts.push('to='+RANGE_TO); }
@@ -410,34 +445,17 @@ async function load(){
   // 30s 自动刷新(同区间)保留用户已展开的人员面板,不打断查看(孙可 2026-06-23)。
   var _mkey=[RANGE_FROM,RANGE_TO,SHOW_DEPARTED].join('|');
   if(_mkey!==MEMBERS_KEY){ MEMBERS_OPEN=new Set(); TEAM_MEMBERS={}; MEMBERS_KEY=_mkey; }
-  var parts=[];
-  if(RANGE_FROM||RANGE_TO){
-    // 用户选了范围:两种模式数据相同(都是 day 桶区间和),按所选范围请求
-    parts.push('from='+RANGE_FROM); parts.push('to='+RANGE_TO);
-  } else if(METRIC==='daily' && META_MIN && META_MAX){
-    // "全部"+日均:强制按 day 桶全窗口聚合,使分子(day桶和)与分母(天数)同源、精确
-    // (不带范围时后端走 lifetime 累计,可能早于最早 day 桶,除以跨度会偏高)
-    parts.push('from='+META_MIN); parts.push('to='+META_MAX);
+  // 懒加载缓存 key:区间/离职口径变了 → 重置已加载 tab 集合 + 清空懒加载 tab 的 CACHE(避免跨窗口串台)。
+  if(_mkey!==LOADED_KEY){
+    LOADED_KEY=_mkey; LOADED_TABS=new Set();
+    ['team','tool','model','cursor','agent','governance','feishu','claude','codex','litellm','hermes'].forEach(function(k){ delete CACHE[k]; });
+    CACHE.govSummary={};
   }
-  // "全部"+总量:不带 from/to → 后端返回 lifetime 大盘累计(保持不变)
-  if(SHOW_DEPARTED) parts.push('show_departed=1');
-  var qp = parts.join('&');
+  var qp = curRangeQS();   // 与旧 load 同源:有范围按范围;全部+日均按 meta 全窗口;全部+总量不带 from/to
   var q = qp ? ('?'+qp) : '';
-  var qa = qp ? ('&'+qp) : '';
-  var [lb,tm,tool,model,cur,ag,gov,cc,cx,ll,hm,fs]=await Promise.all([
-    j('/v1/leaderboard'+q), j('/v1/teams'+q),
-    j('/v1/breakdown?by=client'+qa), j('/v1/breakdown?by=model'+qa), j('/v1/cursor'+q),
-    j('/v1/agent_leaderboard'+q), j('/v1/governance_metrics'+q),
-    j('/v1/leaderboard?client='+encodeURIComponent('Claude Code')+qa),
-    j('/v1/leaderboard?client='+encodeURIComponent('Codex CLI')+qa),
-    j('/v1/leaderboard?client='+encodeURIComponent('LiteLLM')+qa),   // LiteLLM 榜=网关用量(已自动排除 agent)
-    j('/v1/leaderboard?client='+encodeURIComponent('Hermes')+qa),
-    j('/v1/feishu'+q)   // 飞书 AI 权益(按天聚合,随所选区间走;无区间默认近 30 天)
-  ]);
-  CACHE.person=lb.leaderboard||[]; CACHE.team=tm.teams||[];
-  CACHE.tool=tool.breakdown||[]; CACHE.model=model.breakdown||[]; CACHE.cursor=cur.cursor||[];
-  CACHE.agent=ag.agent_leaderboard||[]; CACHE.governance=gov.metrics||GOVERNANCE_METRICS; CACHE.govSummary=gov.summary||{};
-  CACHE.claude=cc.leaderboard||[]; CACHE.codex=cx.leaderboard||[]; CACHE.litellm=ll.leaderboard||[]; CACHE.hermes=hm.leaderboard||[]; CACHE.feishu=fs||{};
+  // 只拉【person】(KPI 由它派生,且 client 榜由它的 composition 派生)。其余 tab 进入时按需懒加载。
+  var lb=await j('/v1/leaderboard'+q);
+  CACHE.person=lb.leaderboard||[];
   // KPI
   var tot=CACHE.person.reduce(function(a,x){return a+(x.tokens||0)},0);
   var cost=CACHE.person.reduce(function(a,x){return a+(x.cost||0)},0);
@@ -447,6 +465,7 @@ async function load(){
   $('k-msg').textContent=compact(msg);
   $('k-ppl').textContent=CACHE.person.length;
   if(typeof updTrig==='function') updTrig();   // 触发按钮显示当前区间(随 meta/预设/自定义变化)
+  await ensureTab(CUR);   // 确保当前 tab 数据就绪(client 榜派生;其余按需拉一次)
   render();
 }
 function $(id){return document.getElementById(id)}
@@ -773,8 +792,8 @@ function render(){
   $('list').innerHTML=__lg+__body;
 }
 document.querySelectorAll('.tab').forEach(function(b){
-  b.onclick=function(){document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('on')});
-    b.classList.add('on');CUR=b.dataset.t;syncSortCtl();render();};
+  b.onclick=async function(){document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('on')});
+    b.classList.add('on');CUR=b.dataset.t;syncSortCtl();await ensureTab(CUR);render();};
 });
 // 总量/日均 切换:在"全部"模式下两者数据不同(总量=lifetime 累计,日均=day 桶区间和),
 // 必须重新 load();统一都 load() 简单且无回归(选了范围时数据相同,load 仅多一次同样请求)。
@@ -865,7 +884,28 @@ function dpPick(d){
 $('rangeTrig').onclick=function(e){e.stopPropagation();$('rangePop').classList.contains('on')?dpClose():dpOpen();};
 document.addEventListener('click',function(e){var w=$('rangePop'),t=$('rangeTrig');if(w&&!w.contains(e.target)&&!t.contains(e.target))dpClose();});
 load();                     // load() 内部已 await fillMeta(),meta 就绪后再发榜单请求
-setInterval(load, 30000);   // 30s 自动刷新
+// 30s 自动刷新:只刷新当前视图,不再一次性拉 13 个接口。
+// 始终重拉 person(保 KPI 实时)→ 重算 KPI → 强制刷新当前 tab(client 榜派生;其余重拉一次)→ render。
+// 同区间刷新不动 MEMBERS_KEY/LOADED_KEY,故 MEMBERS_OPEN(末级人员展开)与已加载缓存均保留,不打断查看。
+async function refreshCurrent(){
+  await fillMeta();
+  var _mkey=[RANGE_FROM,RANGE_TO,SHOW_DEPARTED].join('|');
+  if(_mkey!==MEMBERS_KEY){ MEMBERS_OPEN=new Set(); TEAM_MEMBERS={}; MEMBERS_KEY=_mkey; }
+  if(_mkey!==LOADED_KEY){ LOADED_KEY=_mkey; LOADED_TABS=new Set(); }
+  var qp=curRangeQS(); var q=qp?('?'+qp):'';
+  var lb=await j('/v1/leaderboard'+q);
+  CACHE.person=lb.leaderboard||[];
+  var tot=CACHE.person.reduce(function(a,x){return a+(x.tokens||0)},0);
+  var cost=CACHE.person.reduce(function(a,x){return a+(x.cost||0)},0);
+  var msg=CACHE.person.reduce(function(a,x){return a+(x.messages||0)},0);
+  $('k-tok').textContent=(tot/1e8>=100?(tot/1e8).toFixed(1):(tot/1e8).toFixed(2));
+  $('k-cost').textContent='$'+compact(Math.round(metricCost(cost)));
+  $('k-msg').textContent=compact(msg);
+  $('k-ppl').textContent=CACHE.person.length;
+  await ensureTab(CUR, true);   // force=true:重拉当前 tab(client 榜派生,零请求)
+  render();
+}
+setInterval(refreshCurrent, 30000);   // 30s 自动刷新(仅当前视图:person + 当前 tab)
 </script>
 </body>
 </html>

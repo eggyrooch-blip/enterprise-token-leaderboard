@@ -8,12 +8,12 @@ DASHBOARD = ROOT / "collector" / "dashboard.html"
 
 def test_cursor_leaderboard_request_uses_global_date_range():
     html = DASHBOARD.read_text(encoding="utf-8")
-    match = re.search(r"j\('/v1/cursor'(?P<suffix>[^)]*)\)", html)
-
-    assert match, "dashboard must request /v1/cursor"
-    assert "+q" in match.group("suffix"), (
-        "Cursor leaderboard must use the same ?from=...&to=... range as other rankings"
-    )
+    # cursor 现走懒加载 TAB_EP(2026-06-23 性能优化:首屏/改区间不再一次拉 13 个接口),
+    # 请求由 ensureTab 用 curRangeQS() 拼上所选区间(from/to)。要求未变:cursor 跟随全局区间。
+    assert "ep:'/v1/cursor'" in html, "TAB_EP 必须包含 /v1/cursor"
+    assert "curRangeQS" in html, "ensureTab 必须用 curRangeQS 拼区间"
+    qs = html[html.index("function curRangeQS()"):html.index("function curRangeQS()") + 400]
+    assert "from='+RANGE_FROM" in qs and "to='+RANGE_TO" in qs, "区间必须写进请求"
 
 
 def test_meta_default_range_becomes_request_state():
@@ -63,8 +63,10 @@ def test_hermes_board_is_standalone_after_litellm():
 
     assert litellm_pos < hermes_pos < agent_pos
     assert "Hermes 榜" in html
-    assert "encodeURIComponent('Hermes')" in html
-    assert "CACHE.hermes=hm.leaderboard||[]" in html
+    # Hermes 榜走懒加载、独立请求 /v1/leaderboard?client=Hermes(2026-06-23:不从 composition 派生 ——
+    # Hermes 有大小写变体且 cost 是推断价,单一 composition 公式还原不出,故保留后端独立榜口径)。
+    assert "/v1/leaderboard?client=Hermes" in html
+    assert "hermes:" in html  # TAB_EP 含 hermes 懒加载条目
     assert "CUR==='hermes'" in html
     assert "'Hermes'" in html[html.index("var TOOL_COLOR="):html.index("function toolColor")]
 
