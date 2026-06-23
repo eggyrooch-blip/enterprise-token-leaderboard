@@ -661,7 +661,7 @@ function renderMembersPanel(dept, depth){
     out.push('<div class="r mrow muted" data-depth="'+depth+'">'+ind+avHtml(u)+
       '<div class="nm">'+esc(u.name||'—')+'</div>'+
       '<div class="track"></div>'+
-      '<div class="val"><div class="t num">未使用</div></div></div>');
+      '<div class="val"><div class="t num">0</div><div class="s num">未使用</div></div></div>');  // 显式 token=0(SPEC)+「未使用」标签(孙可预览)
   });
   if(missing>0) out.push(line('<div class="nm muted">⋯ 另有 '+missing+' 人未同步通讯录(无法点名)</div>'));
   return out.join('');
