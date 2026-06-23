@@ -767,3 +767,55 @@ def test_fetch_snapshot_enumerates_each_department():
     by = {u["open_id"]: u for u in users}
     assert "组A" in by["ou_a"]["dept_path"]   # dept_path 取主部门(department_ids[0])
     assert "组B" in by["ou_b"]["dept_path"]
+
+
+# --------------------------------------------------------------------------- #
+# mark_external_orphans_departed (2026-06-23 孙可:残留 unknown 全是 wb-* 外包 → 离职桶)
+# --------------------------------------------------------------------------- #
+def _orphan_db():
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.executescript("""
+        CREATE TABLE usage(email TEXT, source TEXT, total INTEGER);
+        CREATE TABLE feishu_users(open_id TEXT PRIMARY KEY, email TEXT, name TEXT,
+            dept_path TEXT, status TEXT DEFAULT 'active');
+        CREATE TABLE departed(email TEXT PRIMARY KEY, reason TEXT, marked_at TEXT);
+    """)
+    return conn
+
+
+def test_mark_external_orphans_only_contractors_and_synthetic():
+    conn = _orphan_db()
+    # 有用量的各类账号
+    for e in ("wb-zhangsan@keep.com", "311e86ec@keep.com", "yaochaoyu@keep.com",
+              "real@keep.com", "wb-injob@keep.com"):
+        conn.execute("INSERT INTO usage VALUES(?,?,?)", (e, "subscription", 100))
+    conn.execute("INSERT INTO usage VALUES('litellm-key:x', 'litellm', 100)")  # 合成 key 不算
+    # real@ 与 wb-injob@ 在通讯录在册 → 不该离职
+    conn.execute("INSERT INTO feishu_users VALUES('o1','real@keep.com','真实','Keep/技术部','active')")
+    conn.execute("INSERT INTO feishu_users VALUES('o2','wb-injob@keep.com','在册外包','Keep/外部合作商/X','active')")
+    # 手工离职名单(不能被动)
+    conn.execute("INSERT INTO departed VALUES('manualquit@keep.com','manual','2026-01-01')")
+    import feishu_directory_sync as fds
+    n = fds.mark_external_orphans_departed(conn)
+    dep = {r[0]: r[1] for r in conn.execute("SELECT email,reason FROM departed").fetchall()}
+    assert "wb-zhangsan@keep.com" in dep and dep["wb-zhangsan@keep.com"] == "external_orphan"
+    assert "311e86ec@keep.com" in dep                      # 8位hex 合成号
+    assert "yaochaoyu@keep.com" not in dep                 # 真实姓名邮箱:不误杀
+    assert "real@keep.com" not in dep                      # 在册真人
+    assert "wb-injob@keep.com" not in dep                  # 在册外包(已进通讯录)
+    assert "litellm-key:x" not in dep
+    assert dep.get("manualquit@keep.com") == "manual"      # 手工离职保留
+    assert n == 2
+
+
+def test_mark_external_orphans_self_corrects_rejoined():
+    conn = _orphan_db()
+    conn.execute("INSERT INTO usage VALUES('wb-x@keep.com','subscription',100)")
+    import feishu_directory_sync as fds
+    fds.mark_external_orphans_departed(conn)
+    assert conn.execute("SELECT COUNT(*) FROM departed WHERE email='wb-x@keep.com'").fetchone()[0] == 1
+    # 该外包后来进了通讯录 → 再跑应撤销其 auto 离职
+    conn.execute("INSERT INTO feishu_users VALUES('o','wb-x@keep.com','转正','Keep/技术部','active')")
+    fds.mark_external_orphans_departed(conn)
+    assert conn.execute("SELECT COUNT(*) FROM departed WHERE email='wb-x@keep.com'").fetchone()[0] == 0

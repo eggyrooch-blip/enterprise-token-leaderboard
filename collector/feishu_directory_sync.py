@@ -1221,6 +1221,41 @@ class FeishuDirectoryClient(object):
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def mark_external_orphans_departed(conn):
+    """把【有用量、但邮箱是外包(wb-)或合成(8位hex)、且不在飞书通讯录(feishu_users active)】的账号
+    标记离职(reason='external_orphan'),从默认活跃榜剔除(孙可 2026-06-23:残留 unknown 全是 wb-* 外包,
+    放离职桶)。
+
+    安全边界:
+      * 只认 wb-* 外包 与 8位hex 合成号 —— 【真实姓名邮箱】(如 yaochaoyu@keep.com)即使不在通讯录也
+        【不】自动离职,那是目录缺口,需人工确认,不能误杀真人。
+      * 自纠:每次先撤销已重新在册的 auto 离职(reason='external_orphan' 且现已进 feishu_users),
+        再插当前孤儿。只动 reason='external_orphan',绝不碰手工维护的离职名单。
+    返回本次新标记的离职数。departed 表必须存在(dev_collector.db() 建)。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(departed)").fetchall()}
+    if not cols:
+        return 0
+    # 1) 已重新进通讯录的 auto 离职 → 撤销(不碰手工条目)。
+    conn.execute(
+        "DELETE FROM departed WHERE reason='external_orphan'"
+        " AND lower(email) IN (SELECT lower(email) FROM feishu_users"
+        " WHERE status='active' AND email!='')")
+    before = conn.execute("SELECT COUNT(*) FROM departed").fetchone()[0]
+    hexpat = "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]@keep.com"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    conn.execute(
+        "INSERT OR IGNORE INTO departed(email, reason, marked_at)"
+        " SELECT DISTINCT u.email, 'external_orphan', ?"
+        " FROM usage u"
+        " WHERE u.source != 'litellm_agent' AND u.email NOT LIKE 'litellm-%'"
+        "   AND (u.email LIKE 'wb-%' OR lower(u.email) GLOB ?)"
+        "   AND lower(u.email) NOT IN (SELECT lower(email) FROM feishu_users"
+        "       WHERE status='active' AND email!='')",
+        (now, hexpat))
+    after = conn.execute("SELECT COUNT(*) FROM departed").fetchone()[0]
+    return after - before
+
+
 def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(description="Feishu directory sync")
@@ -1316,6 +1351,7 @@ def main(argv=None):
             MIN_RESOLVED_BUSINESS_OUTSOURCING_RATE,
             business_rollup_enabled,
         )
+        result["external_orphans_departed"] = mark_external_orphans_departed(conn)
         conn.commit()
     finally:
         conn.close()
