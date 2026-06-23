@@ -3700,6 +3700,19 @@ class H(BaseHTTPRequestHandler):
                 return True
             return email_in_scope(scope_user, email, cd)
 
+        # 越权部门:非 admin 请求自己管辖外的部门 → 整体置空,连 headcount/missing 也不返回
+        # (codex 评审:仅清人员还会泄露他部门的总人数/缺口数,与「只能看自己部门」口径相悖)。
+        if scope_user and not scope_user.get("is_admin"):
+            owned = [o for o in (scope_user.get("owned_departments") or []) if o]
+            tkey = _canonical_dept_key(target)
+            in_scope_dept = any(
+                tkey == _canonical_dept_key(o) or tkey.startswith(_canonical_dept_key(o) + "/")
+                for o in owned)
+            if not in_scope_dept:
+                return self._send(200, {
+                    "dept": target, "headcount_total": None,
+                    "used": [], "unused": [], "used_count": 0, "unused_count": 0, "missing": 0})
+
         where, params = _range_clause(qs)
         sd = _show_departed(qs)
         dep_clause = _departed_filter(sd, "")

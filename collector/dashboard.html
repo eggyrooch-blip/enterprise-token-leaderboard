@@ -311,6 +311,8 @@ function syncSortCtl(){var e=$('sortCtl'); if(e)e.style.display=(CUR==='person')
 function compact(n){n=n||0; if(n>=1e8)return (n/1e8).toFixed(n>=1e9?1:2)+' 亿'; if(n>=1e4)return (n/1e4).toFixed(1)+' 万'; return (n).toLocaleString('en-US');}
 function grp(n){return (n||0).toLocaleString('en-US');}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+// 头像加载失败 → 用 DOM/textContent 构造首字母兜底,绝不把名字塞进 innerHTML/JS 字符串(防注入)。
+function avFallback(img){var s=document.createElement('span');s.className='av fb';s.textContent=img.getAttribute('data-fb')||'·';img.replaceWith(s);}
 function ini(s){s=s||'·'; var a=s.split('@')[0]; return a.slice(-2);}
 var TOOL_COLOR={'Claude Code':'#24C789','Codex CLI':'#5A87F9','Cursor':'#6D51F4','Gemini CLI':'#F5824E','Kimi CLI':'#17BEB2','OpenCode':'#A4D44C','LiteLLM':'#FFB15A','Hermes':'#E06B8A','hermes':'#E06B8A'};
 function toolColor(c){return TOOL_COLOR[c]||'#CCCCCC';}
@@ -635,11 +637,13 @@ function renderMembersPanel(dept, depth){
   // 表头:用了 X / 没用 Y (+ 未同步 N)
   var hd='用了 '+used.length+' · 没用 '+unused.length+(missing?(' · 未同步 '+missing):'');
   out.push(line('<div class="nm muted" style="font-size:12px">'+hd+'</div>'));
-  // 头像/姓名来自飞书目录(半可信),统一过 esc() 防破坏标记或注入(codex 评审)。
+  // 头像/姓名来自飞书目录(半可信)。img 失败回退不再内联 JS 拼 fb(避免 JS 字符串上下文被
+  // 名字里的引号/反斜杠破坏,codex 评审);改为 onerror 调全局 avFallback(this),它用 textContent
+  // 构造首字母兜底,零注入。src/data-fb/姓名一律过 esc() 做 HTML 属性转义。
   function avHtml(u){
-    var fb=esc((u.name||'·').slice(-2));
-    return u.avatar?('<img class="av" src="'+esc(u.avatar)+'" onerror="this.outerHTML=&quot;<span class=\\&quot;av fb\\&quot;>'+fb+'</span>&quot;">')
-                   :('<span class="av fb">'+fb+'</span>');
+    var fb=(u.name||'·').slice(-2);
+    return u.avatar?('<img class="av" src="'+esc(u.avatar)+'" data-fb="'+esc(fb)+'" onerror="avFallback(this)">')
+                   :('<span class="av fb">'+esc(fb)+'</span>');
   }
   used.forEach(function(u){
     var pct=Math.max(2,(u.tokens||0)/maxTok*100);

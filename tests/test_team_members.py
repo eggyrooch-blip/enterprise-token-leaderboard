@@ -158,6 +158,17 @@ def test_scope_owner_other_dept_sees_nothing(conn_5people, monkeypatch):
              "owned_departments": ["Keep/技术平台部"], "email": "boss@keep.com"}
     obj = _call(dc, conn_5people, monkeypatch, scope_user=other)
     assert obj["used_count"] == 0 and obj["unused_count"] == 0
+    # codex 评审:越权部门连 headcount/missing 也不能泄露
+    assert obj["headcount_total"] is None and obj["missing"] == 0
+
+
+def test_scope_owner_own_subtree_sees_members(conn_5people, monkeypatch):
+    """部门负责人能看自己管辖子树的人员(运动科学部在 AI 平台事业部 下)。"""
+    dc = importlib.reload(dev_collector)
+    owner = {"is_admin": False, "scope": "department",
+             "owned_departments": ["Keep/AI 平台事业部"], "email": "lead@keep.com"}
+    obj = _call(dc, conn_5people, monkeypatch, scope_user=owner)
+    assert obj["used_count"] == 4 and obj["headcount_total"] == 6
 
 
 def test_multi_dept_user_token_split_matches_teams(monkeypatch):
