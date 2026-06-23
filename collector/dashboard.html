@@ -587,7 +587,11 @@ function renderTeamTree(){
       var big=compact(mv(x))+'/人';
       // 飞书 AI 权益「点」不在主榜展示(2026-06-22 孙可:与 token 不同口径,统一以 token 为准);
       // 「点」只保留在「飞书 AI 权益」tab。此处 $ 为估算(含订阅席位摊销)。
-      var small='总 '+compact(metricTok(x.tokens||0))+' · 估算$(含订阅摊销) '+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%';
+      // 全员均摊(renlei P7 2026-06-18):总 token ÷ 部门总人数(headcount,含没用的人),与「人均(活跃)」
+      // 互补 —— 活跃人均高但全员均摊低 = 渗透不足。headcount 缺失(老库/合作商节点)时不显示。
+      var allhc=x.headcount_total||x.headcount||0;
+      var allcap=allhc>0?('全员均摊 '+compact(metricTok((x.tokens||0)/allhc))+'/人 · '):'';
+      var small=allcap+'总 '+compact(metricTok(x.tokens||0))+' · 估算$(含订阅摊销) '+grp(Math.round(x.cost||0))+' · '+share.toFixed(1)+'%';
       var pad=depth*18;                                 // 每级缩进 18px,层级靠缩进体现
       // 有子节点→点行下钻子部门(data-path);末级真实部门→点行展开人员明细(data-leaf)。
       var rowAttr=hasKids?(' data-path="'+encodeURIComponent(x.dept)+'" style="cursor:pointer"')
