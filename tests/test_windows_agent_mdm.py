@@ -41,6 +41,22 @@ def test_windows_reporter_collects_serial_and_posts_existing_tokscale_payload():
     assert "Rename-Computer" not in script
 
 
+def test_windows_scripts_force_tls12_before_any_https_call():
+    """根因(2026-06-24):collector nginx 只收 TLSv1.2/1.3,Windows PowerShell 5.1 默认 TLS 1.0,
+    bootstrap 的 Invoke-WebRequest 下载 / reporter 的上报都在 TLS 握手阶段失败 —— 连 access log 都不留,
+    MDM 仍报"执行成功",两台机零上报。两个脚本都必须在任何 HTTPS 调用前强制叠加 Tls12。"""
+    for path in (BOOTSTRAP, REPORTER):
+        script = path.read_text(encoding="utf-8")
+        assert "SecurityProtocolType]::Tls12" in script, (
+            f"{path.name} 必须强制 TLS 1.2(否则 PS5.1 默认 TLS1.0,HTTPS 握手失败)"
+        )
+        # 必须出现在脚本前部(任何真实 HTTPS 调用之前;搜实际调用签名,避开注释里的字面词)
+        tls_pos = script.index("SecurityProtocolType]::Tls12")
+        web_pos = script.find("Invoke-WebRequest -UseBasicParsing")
+        if web_pos != -1:
+            assert tls_pos < web_pos, f"{path.name}:TLS1.2 设置必须在首个 HTTPS 调用之前"
+
+
 def test_windows_reporter_writes_programdata_log_for_mdm_debugging():
     script = REPORTER.read_text(encoding="utf-8")
 

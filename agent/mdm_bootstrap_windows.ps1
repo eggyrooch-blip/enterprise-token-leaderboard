@@ -12,6 +12,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# 强制 TLS 1.2 —— collector 的 nginx 只收 TLSv1.2/1.3,而 Windows PowerShell 5.1 默认 TLS 1.0。
+# 不强制会让下方下载 tokreport.ps1 的 HTTPS 请求在 TLS 握手阶段就失败(连 access log 都不留,
+# MDM 仍报"执行成功",极难发现 —— 2026-06-24 两台机零上报的根因)。-bor 叠加,对 PS7 也无害。
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+
 function Log {
     param([string]$Message)
     Write-Output "[tokreport-windows-bootstrap] $Message"

@@ -11,6 +11,9 @@ param(
 # It only uploads aggregate token/cost JSON to /v1/tokscale/report.
 
 $ErrorActionPreference = "Stop"
+# 强制 TLS 1.2 —— collector 的 nginx 只收 TLSv1.2/1.3,Windows PowerShell 5.1 默认 TLS 1.0。
+# 不强制会让上报 /v1/tokscale/report 在 TLS 握手阶段失败(2026-06-24 根因)。-bor 叠加,对 PS7 无害。
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 $ScriptTimeoutSeconds = 600
 $CommandTimeoutSeconds = 180
 $StartedAt = Get-Date
