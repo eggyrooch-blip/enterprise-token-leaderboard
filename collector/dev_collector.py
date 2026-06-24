@@ -3754,6 +3754,45 @@ class H(BaseHTTPRequestHandler):
                     b["messages"] += p["msg"]
                     b["token_users"].add(email)
 
+        # === R4 成本对齐:部门榜 cost 用【个人榜权威口径】(网关 litellm/api + 订阅窗口摊销)按
+        # canon 部门归集,替代上面 SUM(原始 usage.cost)(含原始 subscription 全额 + cursor 原始 →
+        # 与顶部 KPI「公司实付」不一致,任磊 R4)。保证部门榜 Keep 根 cost == 个人榜求和 == 顶部 KPI。
+        # token/people/活跃率/headcount 一概不动。个人榜口径取不到时 graceful 保留原 cost。
+        try:
+            _pcost = {}
+            for _r in _personal_board_rows(conn, qs):
+                _em = (_r.get("email") or "").lower()
+                if _em:
+                    _pcost[_em] = float(_r.get("cost") or 0)
+            # 每人 canon 部门 + 主桶(取其 per 条目里 token 最大的那条),只取一次。
+            _pcanon, _pbest = {}, {}
+            for (email, _e, _b), p in per.items():
+                cd = _canon_dept(email, p["depts"], p.get("effective_dept"))
+                if not cd or cd == "Keep/未归类":
+                    continue
+                if email not in _pcanon or (p.get("tok") or 0) > _pbest.get(email, -1):
+                    bkt = p.get("bucket") or BUCKET_EMPLOYEE
+                    if bkt not in (BUCKET_EMPLOYEE, BUCKET_BUSINESS, BUCKET_PENDING_BUSINESS, BUCKET_UNRESOLVED):
+                        bkt = BUCKET_UNRESOLVED
+                    _pcanon[email] = (cd, bkt)
+                    _pbest[email] = p.get("tok") or 0
+            # 清零已攒的 cost(token/users 已建好,保留),按个人榜权威 cost 重算并 roll-up。
+            for n in nodes.values():
+                n["cost"] = 0.0
+                for b in n["buckets"].values():
+                    b["cost"] = 0.0
+            for email, (cd, bkt) in _pcanon.items():
+                c = _pcost.get((email or "").lower())
+                if not c:
+                    continue
+                for anc in _ancestors(cd):
+                    n = _node(anc)
+                    n["cost"] += c                       # 节点总 cost = 个人榜口径,保证对账
+                    if bkt in n["buckets"]:
+                        n["buckets"][bkt]["cost"] += c   # 主桶归集(分桶 cost 仅作分解参考)
+        except Exception:
+            pass
+
         # aily(飞书 AI 权益)并入部门榜:按天聚合,跟随所选区间(与 token 同窗口,默认近30天),
         # 不再取「最新月快照」死数据(孙可 2026-06-12:月累计污染部门榜)。单位「点」credits,
         # 不与 token 加总;aily 的人并进活跃集 → 活跃渗透取并集。

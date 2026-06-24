@@ -619,3 +619,41 @@ def test_cursor_client_leaderboard_keeps_cost_unchanged(dc, monkeypatch, tmp_pat
     finally:
         conn.close()
     assert _row_by_email(rows, "cur@keep.com")["cost"] == 0
+
+
+def _teams_payload(dc, conn, qs):
+    handler = _DummyHandler()
+    dc.H._teams(handler, conn, qs)
+    assert handler.code == 200
+    return {t["dept"]: t for t in handler.payload["teams"]}
+
+
+def test_dept_board_cost_reconciles_with_person_board(dc, monkeypatch, tmp_path):
+    """R4: 部门榜 Keep 根 cost 必须 == 个人榜(_leaderboard)所有人 cost 求和(=顶部 KPI 口径)。
+    旧实现 _teams 用 SUM(原始 usage.cost)(含原始 subscription 行) → 远大于个人榜(网关+摊销)。
+    等式即不变量;改实现前差额很大(RED),改后差额=0(GREEN)。"""
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    monkeypatch.setattr(dc, "_dept_headcount_map", lambda *_a, **_k: {})
+    conn = dc.db()
+    try:
+        _insert_people(conn, "alice@keep.com", "Alice", "Keep/平台/基础")
+        _insert_people(conn, "bob@keep.com", "Bob", "Keep/平台/基础")
+        # 网关实销(litellm): 个人榜与部门榜都该计
+        _insert_usage(dc, conn, "alice@keep.com", "Keep/平台/基础", "2026-06-10", "litellm", "LiteLLM", 1000, 10.0, 5)
+        _insert_usage(dc, conn, "bob@keep.com", "Keep/平台/基础", "2026-06-10", "litellm", "LiteLLM", 2000, 20.0, 5)
+        # 原始 subscription usage 行(带 cost=99): 旧部门榜会错误 sum 进去,个人榜不计
+        _insert_usage(dc, conn, "alice@keep.com", "Keep/平台/基础", "2026-06-10", "subscription", "Claude Code", 0, 99.0, 0)
+        # 订阅席位: 个人榜按窗口摊销,部门榜应同口径
+        _insert_sub(conn, "alice@keep.com", "claude", "premium", 30.0, "Alice", "Keep/平台/基础")
+        conn.commit()
+
+        qs = {"days": ["30"]}
+        person_sum = round(sum((r.get("cost") or 0) for r in _leaderboard(dc, conn, qs)), 2)
+        teams = _teams_payload(dc, conn, qs)
+        keep_cost = round((teams.get("Keep", {}) or {}).get("cost") or 0, 2)
+        assert keep_cost == person_sum, (keep_cost, person_sum)
+        # 原始 subscription 行的 99 不得进部门榜总额(否则就是旧 bug:会 >= 99)
+        assert keep_cost < 99.0, keep_cost
+    finally:
+        conn.close()
