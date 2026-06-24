@@ -2289,51 +2289,93 @@ def _apply_v_headcount_additive(counts, conn):
             out[key] = list(val)
         else:
             out[key] = val
-    try:
-        dept_cols = {r[1] for r in conn.execute("PRAGMA table_info(departments)").fetchall()}
-    except Exception:
-        return out
-    if "member_count" not in dept_cols:
-        return out
-    status_filter = (" AND COALESCE(status,'active')='active'"
-                     if "status" in dept_cols else "")
-    rows = conn.execute(
-        "SELECT path, member_count FROM departments"
-        " WHERE COALESCE(path,'')<>'' AND COALESCE(member_count,0)>0"
-        + status_filter
-    ).fetchall()
-    # 第一遍:收集 V=人员外包行(合作商/V/<真实部门>)。记录 V 子路径(vkey,按 "/" 分段)、
-    # 递归 mc、折回的真实 Keep 路径。dash('-')编码的叶子是 V 下的【兄弟】(各自独立),
-    # 只有 "/" 分隔才是飞书部门树的【父子嵌套】(member_count 递归含子)。
-    v_rows = []
-    for path, mc in rows:
-        segs = [s for s in str(path).split("/") if s]
-        if "合作商" not in segs:
-            continue
-        rest = segs[segs.index("合作商") + 1:]
-        if len(rest) < 2 or rest[0] != "V":
-            continue
+    # v_by_real: 真实 Keep 路径 -> 该路径【自身】净增的 V 人员外包人头(尚未 roll-up)。
+    v_by_real = {}
+
+    # 数据源 A(首选):feishu_users 枚举到的实际人头。飞书 member_count 把【部门负责人】也算进去
+    # (实证 2026-06-24:安全组 V member_count=2 = 李沫延 + leader 李志杰,而李志杰已在真实安全组),
+    # 但 leader 不会作为 V 部门成员出现在 feishu_users(find_by_department 不返回 leader)。
+    # 故按 feishu_users 去重 open_id 计 V 人头 → 自然排除挂名 leader,不再把共享负责人多加进真实部门。
+    used_feishu = False
+    if "feishu_users" in _table_columns_owner(conn):
         try:
-            mc = int(mc or 0)
-        except (TypeError, ValueError):
-            mc = 0
-        if mc <= 0:
+            fu = conn.execute(
+                "SELECT COALESCE(dept_path,''), COUNT(DISTINCT open_id)"
+                " FROM feishu_users WHERE COALESCE(status,'active')='active'"
+                " AND COALESCE(open_id,'')<>'' GROUP BY dept_path"
+            ).fetchall()
+        except Exception:
+            fu = []
+        for dept_path, cnt in fu:
+            segs = [s for s in str(dept_path).split("/") if s]
+            if segs and segs[0] == "Keep":
+                segs = segs[1:]
+            if "合作商" not in segs:
+                continue
+            rest = segs[segs.index("合作商") + 1:]
+            if len(rest) < 2 or rest[0] != "V":
+                continue  # 只 合作商/V/<真实部门>;W=业务外包绝不进真实部门
+            realpath = _normalize_dept_path(dept_path)
+            if (not realpath or not realpath.startswith("Keep/")
+                    or realpath in ("Keep", _CONTRACTOR_NODE)):
+                continue
+            try:
+                cnt = int(cnt or 0)
+            except (TypeError, ValueError):
+                cnt = 0
+            if cnt > 0:
+                v_by_real[realpath] = v_by_real.get(realpath, 0) + cnt
+                used_feishu = True
+
+    # 数据源 B(回退):无 feishu_users 表/为空 → 用 departments.member_count 自身净值。
+    # member_count 是递归值,某 V 行可能是另一 V 行的 "/" 祖先 → own = mc − Σ(直接子 mc),
+    # 任意层数都对(只减直接子;dash 兄弟互不为前缀天然独立)。仅作兜底(测试/无目录库)。
+    if not used_feishu:
+        dept_cols = set()
+        try:
+            dept_cols = {r[1] for r in conn.execute("PRAGMA table_info(departments)").fetchall()}
+        except Exception:
+            return out
+        if "member_count" not in dept_cols:
+            return out
+        status_filter = (" AND COALESCE(status,'active')='active'"
+                         if "status" in dept_cols else "")
+        rows = conn.execute(
+            "SELECT path, member_count FROM departments"
+            " WHERE COALESCE(path,'')<>'' AND COALESCE(member_count,0)>0"
+            + status_filter
+        ).fetchall()
+        v_rows = []
+        for path, mc in rows:
+            segs = [s for s in str(path).split("/") if s]
+            if "合作商" not in segs:
+                continue
+            rest = segs[segs.index("合作商") + 1:]
+            if len(rest) < 2 or rest[0] != "V":
+                continue
+            try:
+                mc = int(mc or 0)
+            except (TypeError, ValueError):
+                mc = 0
+            if mc <= 0:
+                continue
+            realpath = _normalize_dept_path(path)
+            if (not realpath or not realpath.startswith("Keep/")
+                    or realpath in ("Keep", _CONTRACTOR_NODE)):
+                continue
+            v_rows.append((tuple(rest[1:]), mc, realpath))
+        for vkey, mc, realpath in v_rows:
+            own = mc - sum(m for k, m, _ in v_rows
+                           if len(k) == len(vkey) + 1 and k[:len(vkey)] == vkey)
+            if own > 0:
+                v_by_real[realpath] = v_by_real.get(realpath, 0) + own
+
+    # 加层:每个真实路径的 V 净人头 roll-up 到自身+所有真实祖先的 total/staff,并从外部合作商
+    # total 等额搬出(搬移而非复制:公司含外包守恒、不双计)。跳过 'Keep' 根(由 _keep_root_sum 汇总)。
+    for realpath, addcnt in v_by_real.items():
+        if addcnt <= 0:
             continue
-        realpath = _normalize_dept_path(path)
-        if (not realpath or not realpath.startswith("Keep/")
-                or realpath in ("Keep", _CONTRACTOR_NODE)):
-            continue
-        v_rows.append((tuple(rest[1:]), mc, realpath))
-    # 第二遍:member_count 是递归值 —— 若某 V 行是另一 V 行的 "/" 祖先,其 mc 已含后代。
-    # 取【自身净值】own = mc − Σ(【直接】子 V 行 mc) 再 roll-up:递归计数的标准去聚合,任意层数都对。
-    # 只减直接子(len 差 1):孙辈已被子行 mc 计过,若连孙辈一起减,三层子树会少计(codex 评审#3)。
-    # dash 兄弟叶子 vkey 互不为前缀,天然独立、不相互扣减。扁平叶子(无子)own==mc,退化为直接加。
-    for vkey, mc, realpath in v_rows:
-        own = mc - sum(m for k, m, _ in v_rows
-                       if len(k) == len(vkey) + 1 and k[:len(vkey)] == vkey)
-        if own <= 0:
-            continue  # 自身人数全在后代里 → 不重复加
-        for anc in _ancestors(realpath):   # 真实部门【及其每个真实祖先】+= own
+        for anc in _ancestors(realpath):
             if anc == "Keep":
                 continue
             slot = out.get(anc)
@@ -2341,12 +2383,11 @@ def _apply_v_headcount_additive(counts, conn):
                 base = slot if isinstance(slot, (tuple, list)) else [slot or 0, slot or 0]
                 slot = [int((base or [0])[0] or 0), int((base[1] if len(base) > 1 else base[0]) or 0)]
                 out[anc] = slot
-            slot[0] += own
-            slot[1] += own
-        # 从外部合作商 total 等额搬出(搬移而非复制):公司「含外包」总数守恒、不双计。staff 本为 0。
+            slot[0] += addcnt
+            slot[1] += addcnt
         cslot = out.get(_CONTRACTOR_NODE)
         if isinstance(cslot, list):
-            cslot[0] = max(0, cslot[0] - own)
+            cslot[0] = max(0, cslot[0] - addcnt)
     return out
 
 

@@ -284,7 +284,60 @@ def test_nested_v_member_count_no_double_count():
     _reset_cache()
 
 
+def test_v_excludes_shared_leader_via_feishu_users():
+    """飞书 member_count 含部门负责人(实证)。当 V 子部门的 leader 同时是真实部门的人时,
+    若用 member_count 加层会把共享负责人多计一次。改用 feishu_users 枚举人头(不含挂名 leader),
+    真实部门 staff = 真实 member_count + 枚举到的 V 人头。"""
+    _reset_cache()
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    conn.executescript(
+        """
+        CREATE TABLE feishu_users(
+            open_id TEXT, user_id TEXT, union_id TEXT, email TEXT, name TEXT,
+            dept_id TEXT, dept_path TEXT, status TEXT DEFAULT 'active',
+            employee_type TEXT, updated_at TEXT DEFAULT ''
+        );
+        """
+    )
+    # 真实安全组 member_count=3(含 leader 李志杰,且 leader 作为成员被枚举);
+    # V 安全组 member_count=2(含挂名 leader 李志杰),但实际 V 成员只有李沫延 1 人。
+    conn.executemany(
+        "INSERT INTO departments(dept_id,parent_id,name,path,member_count,leader_user_id) VALUES(?,?,?,?,?,?)",
+        [
+            ("d_tp", "0", "技术平台部", "技术平台部", 3, ""),
+            ("d_base", "d_tp", "基础技术部", "技术平台部/基础技术部", 3, ""),
+            ("d_sec", "d_base", "安全组", "技术平台部/基础技术部/安全组", 3, "ou_leader"),
+            ("d_hz", "0", "合作商", "合作商", 2, ""),
+            ("d_v", "d_hz", "V", "合作商/V", 2, ""),
+            ("d_vsec", "d_v", "技术平台部-基础技术部-安全组",
+             "合作商/V/技术平台部-基础技术部-安全组", 2, "ou_leader"),
+        ],
+    )
+    # feishu_users:真实安全组枚举到 3 人(含 leader 李志杰);V 安全组只枚举到李沫延(leader 不入册)。
+    conn.executemany(
+        "INSERT INTO feishu_users(open_id,name,email,dept_path,status) VALUES(?,?,?,?,'active')",
+        [
+            ("ou_lidong", "李栋", "lidong@keep.com", "技术平台部/基础技术部/安全组"),
+            ("ou_wangyang", "王杨", "wangyang02@keep.com", "技术平台部/基础技术部/安全组"),
+            ("ou_leader", "李志杰", "lizhijie@keep.com", "技术平台部/基础技术部/安全组"),
+            ("ou_limoyan", "李沫延", "limoyan_v@keep.com", "合作商/V/技术平台部-基础技术部-安全组"),
+        ],
+    )
+    conn.commit()
+    node_total, node_staff, source = _consume_node_hc(conn)
+    assert source == "feishu_member_count", source
+    # 安全组 staff = 真实 member_count 3 + 枚举到的 V 人头 1(李沫延) = 4。
+    # 用 member_count(V=2,含挂名 leader)会得 5 —— 多计共享负责人。
+    assert node_staff.get("Keep/技术平台部/基础技术部/安全组") == 4, node_staff
+    assert node_total.get("Keep/技术平台部/基础技术部/安全组") == 4, node_total
+    # 外部合作商搬出 1 名枚举 V:2-1=1。
+    assert node_total.get("Keep/外部合作商") == 1, node_total
+    _reset_cache()
+
+
 if __name__ == "__main__":
     main()
     test_nested_v_member_count_no_double_count()
-    print("NESTED-V: PASS")
+    test_v_excludes_shared_leader_via_feishu_users()
+    print("ALL: PASS")
