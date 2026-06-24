@@ -2325,12 +2325,12 @@ def _apply_v_headcount_additive(counts, conn):
             continue
         v_rows.append((tuple(rest[1:]), mc, realpath))
     # 第二遍:member_count 是递归值 —— 若某 V 行是另一 V 行的 "/" 祖先,其 mc 已含后代。
-    # 取【自身净值】own = mc − Σ(严格 "/" 后代 V 行 mc) 再 roll-up,避免嵌套 V 行把同一人
-    # 重复计入真实部门/重复从外部合作商扣减(codex 评审#3)。dash 兄弟叶子 vkey 互不为前缀,
-    # 天然独立、不相互扣减。扁平叶子(无后代)own==mc,退化为直接加。
+    # 取【自身净值】own = mc − Σ(【直接】子 V 行 mc) 再 roll-up:递归计数的标准去聚合,任意层数都对。
+    # 只减直接子(len 差 1):孙辈已被子行 mc 计过,若连孙辈一起减,三层子树会少计(codex 评审#3)。
+    # dash 兄弟叶子 vkey 互不为前缀,天然独立、不相互扣减。扁平叶子(无子)own==mc,退化为直接加。
     for vkey, mc, realpath in v_rows:
         own = mc - sum(m for k, m, _ in v_rows
-                       if len(k) > len(vkey) and k[:len(vkey)] == vkey)
+                       if len(k) == len(vkey) + 1 and k[:len(vkey)] == vkey)
         if own <= 0:
             continue  # 自身人数全在后代里 → 不重复加
         for anc in _ancestors(realpath):   # 真实部门【及其每个真实祖先】+= own

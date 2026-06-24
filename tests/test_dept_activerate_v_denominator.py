@@ -242,23 +242,26 @@ def test_dept_activerate_v_denominator():
 
 
 def test_nested_v_member_count_no_double_count():
-    """codex 评审#3:member_count 是递归值。V 子树若有 "/" 嵌套行(父 mc 已含子),
-    按自身净值(own=mc−后代mc)加层,不得把同一人在祖先里重复计入。"""
+    """codex 评审#3:member_count 递归。V 子树有 "/" 三层嵌套(A 含 B 含 C)时,按自身净值
+    (own=mc−【直接】子mc)加层 —— V 总数必须全算上(=A 的递归 mc),既不双计也不少计。"""
     _reset_cache()
     conn = sqlite3.connect(":memory:")
     _schema(conn)
     rows = [
-        ("d_tp", "0", "技术平台部", "技术平台部", 30),
-        ("d_base", "d_tp", "基础技术部", "技术平台部/基础技术部", 20),
-        ("d_sec", "d_base", "安全组", "技术平台部/基础技术部/安全组", 10),
-        ("d_hz", "0", "合作商", "合作商", 8),
-        ("d_hzw", "d_hz", "W", "合作商/W", 5),
-        ("d_hzv", "d_hz", "V", "合作商/V", 3),
-        # "/" 嵌套的 V 行:父(递归3,含子1) + 子(1)。
-        ("d_v_base", "d_hzv", "技术平台部-基础技术部",
-         "合作商/V/技术平台部-基础技术部", 3),
-        ("d_v_sec", "d_v_base", "安全组",
-         "合作商/V/技术平台部-基础技术部/安全组", 1),
+        ("d_tp", "0", "技术平台部", "技术平台部", 40),
+        ("d_base", "d_tp", "基础技术部", "技术平台部/基础技术部", 30),
+        ("d_sec", "d_base", "安全组", "技术平台部/基础技术部/安全组", 20),
+        ("d_enc", "d_sec", "加密组", "技术平台部/基础技术部/安全组/加密组", 10),
+        ("d_hz", "0", "合作商", "合作商", 9),
+        ("d_hzw", "d_hz", "W", "合作商/W", 4),
+        ("d_hzv", "d_hz", "V", "合作商/V", 5),
+        # "/" 三层嵌套:A(递归5,含 B3,含 C1)。own: A=5-3=2, B=3-1=2, C=1 → 合计 5。
+        ("d_vA", "d_hzv", "技术平台部-基础技术部",
+         "合作商/V/技术平台部-基础技术部", 5),
+        ("d_vB", "d_vA", "安全组",
+         "合作商/V/技术平台部-基础技术部/安全组", 3),
+        ("d_vC", "d_vB", "加密组",
+         "合作商/V/技术平台部-基础技术部/安全组/加密组", 1),
     ]
     conn.executemany(
         "INSERT INTO departments(dept_id,parent_id,name,path,member_count) VALUES(?,?,?,?,?)",
@@ -267,15 +270,17 @@ def test_nested_v_member_count_no_double_count():
     conn.commit()
     node_total, node_staff, source = _consume_node_hc(conn)
     assert source == "feishu_member_count"
-    # 安全组 = 真实10 + V子own1 = 11
-    assert node_total.get("Keep/技术平台部/基础技术部/安全组") == 11, node_total
-    # 基础技术部 = 真实20 + V父own2 + V子own1 = 23(不是双计的 24)
-    assert node_total.get("Keep/技术平台部/基础技术部") == 23, node_total
-    # 技术平台部 = 真实30 + V总3 = 33(不是双计的 34)
-    assert node_total.get("Keep/技术平台部") == 33, node_total
-    assert node_staff.get("Keep/技术平台部") == 33, node_staff
-    # 外部合作商等额搬出 V 净总(2+1=3):8-3=5(=W),不是多扣的 4。
-    assert node_total.get("Keep/外部合作商") == 5, node_total
+    # 加密组 = 真实10 + C own1 = 11
+    assert node_total.get("Keep/技术平台部/基础技术部/安全组/加密组") == 11, node_total
+    # 安全组 = 真实20 + (B own2 + C own1) = 23(= V 在安全组下递归 3)
+    assert node_total.get("Keep/技术平台部/基础技术部/安全组") == 23, node_total
+    # 基础技术部 = 真实30 + (A2+B2+C1)=5 = 35(= V 在基础技术部下递归 5;非少计的 34)
+    assert node_total.get("Keep/技术平台部/基础技术部") == 35, node_total
+    # 技术平台部 = 真实40 + V总5 = 45
+    assert node_total.get("Keep/技术平台部") == 45, node_total
+    assert node_staff.get("Keep/技术平台部") == 45, node_staff
+    # 外部合作商搬出 V 净总(2+2+1=5,等于 V 递归总数,不多不少):9-5=4(=W)。
+    assert node_total.get("Keep/外部合作商") == 4, node_total
     _reset_cache()
 
 
