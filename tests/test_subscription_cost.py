@@ -678,3 +678,27 @@ def test_dept_cost_no_double_count_on_email_case_variants(dc, monkeypatch, tmp_p
         assert keep_cost == person_sum, (keep_cost, person_sum)
     finally:
         conn.close()
+
+
+def test_dept_keep_root_includes_unclassified_for_kpi_parity(dc, monkeypatch, tmp_path):
+    """R4 边界(codex 评审):canon 解析不到真实部门(未归类)的人,其 cost 仍须计入 Keep 根,
+    才能与顶部 KPI(个人榜含所有人)对账一致;否则 Keep 根 < 个人榜求和。"""
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    monkeypatch.setattr(dc, "_dept_headcount_map", lambda *_a, **_k: {})
+    conn = dc.db()
+    try:
+        # 有真实部门的人
+        _insert_people(conn, "alice@keep.com", "Alice", "Keep/平台/基础")
+        _insert_usage(dc, conn, "alice@keep.com", "Keep/平台/基础", "2026-06-10", "litellm", "LiteLLM", 1000, 10.0, 5)
+        # 未归类的人:无 people 行 + dept 不可解析
+        _insert_usage(dc, conn, "ghost@keep.com", "unknown", "2026-06-10", "litellm", "LiteLLM", 800, 12.0, 4)
+        conn.commit()
+        qs = {"days": ["30"]}
+        person_sum = round(sum((r.get("cost") or 0) for r in _leaderboard(dc, conn, qs)), 2)
+        teams = _teams_payload(dc, conn, qs)
+        keep_cost = round((teams.get("Keep", {}) or {}).get("cost") or 0, 2)
+        assert keep_cost == person_sum, (keep_cost, person_sum)
+        assert keep_cost >= 12.0, keep_cost  # 未归类的 12 计入了 Keep 根
+    finally:
+        conn.close()

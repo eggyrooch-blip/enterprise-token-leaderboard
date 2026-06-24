@@ -3774,8 +3774,10 @@ class H(BaseHTTPRequestHandler):
                 if not el:
                     continue
                 cd = _canon_dept(email, p["depts"], p.get("effective_dept"))
+                # 未归类/解析不到真实部门的人:cost 仍计入公司总(Keep 根),与顶部 KPI(个人榜含所有人)
+                # 对账一致;但不挂具体子部门(codex 评审:否则 Keep 根 < 个人榜求和)。
                 if not cd or cd == "Keep/未归类":
-                    continue
+                    cd = "Keep"
                 if el not in _pcanon or (p.get("tok") or 0) > _pbest.get(el, -1):
                     bkt = p.get("bucket") or BUCKET_EMPLOYEE
                     if bkt not in (BUCKET_EMPLOYEE, BUCKET_BUSINESS, BUCKET_PENDING_BUSINESS, BUCKET_UNRESOLVED):
