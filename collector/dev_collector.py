@@ -1586,7 +1586,7 @@ def _normalize_dept_path(path):
        —— 部门榜聚成单个父节点，下钻见各公司，不平铺(孙可 2026-06-11「很乱」)。
        'Keep/合作商/W/北京再作品牌管理有限公司(SP000083)' → 'Keep/外部合作商/北京再作品牌管理有限公司(SP000083)'
        裸名 '四川乔木禾电子商务有限公司(SP000442)' → 'Keep/外部合作商/四川乔木禾电子商务有限公司(SP000442)'
-    2) 业务外包-V(真实部门)：剥 合作商/供应商 前缀，叶子按 '-' 拆层级，折回真实 Keep 树。
+    2) 人员外包-V(驻场、计入活跃率分母)：剥 合作商/供应商 前缀，叶子按 '-' 拆层级，折回真实 Keep 树。
        'Keep/合作商/V/技术平台部-基础技术部-安全组' → 'Keep/技术平台部/基础技术部/安全组'。
        叶子短横各段须与飞连真实部门名逐字一致，roll-up 才能与 headcount 正确合并。
     非外包路径原样返回(幂等)。空/None 原样返回。"""
@@ -1634,6 +1634,8 @@ def _member_count_dept_key(raw_path):
       * 合作商错映射:'合作商'(及其整棵子树 W/V)绝不能折进真实 Keep 部门或顶成 Keep 根。
         整棵 合作商 子树统一收口到单一 _CONTRACTOR_NODE='Keep/外部合作商',
         其 member_count 只进【含外包】口径,绝不进【员工】口径,也绝不污染真实部门。
+        其中 W=业务外包(整建制供应商,不进分母),V=人员外包(驻场,后续通过 additive pass
+        单独加回真实部门及祖先)。
     member_count 是递归值:本函数只做命名空间映射,不 roll-up、不拆短横折回真实树
     (那会与真实部门的 member_count 双重计数)。"""
     if not raw_path:
@@ -2124,7 +2126,6 @@ def _fetch_headcount_feishu_member_count(conn):
       * staff(员工) = 排除外部合作商子树后的 member_count。
     部门键经 _member_count_dept_key 映射到与人员侧【同命名空间】(裸 '技术平台部' → 补
     'Keep/技术平台部';整棵 合作商 子树收口到单一 'Keep/外部合作商',只计 total 不计 staff)。
-
     缺表/无 member_count 列/全为 0(老库未回填)→ None,让上层回退 feishu_users。
     异常 → 抛出,由上层 graceful。"""
     cols = _table_columns_owner(conn)
@@ -2167,6 +2168,8 @@ def _fetch_headcount_feishu_member_count(conn):
         slot[0] = max(slot[0], mc)              # total(含外包)
         if not is_contractor:
             slot[1] = max(slot[1], mc)          # staff(员工);合作商节点 staff 恒为 0
+    # V=人员外包的 additive 加回在 _apply_v_headcount_additive(_dept_headcount_map 调用),
+    # 不在此就地做,避免双重应用。本函数只出「合作商整棵收口外部合作商」的底值。
     return counts or None
 
 
@@ -2266,13 +2269,86 @@ def _member_count_available(conn):
         return False
 
 
+def _apply_v_headcount_additive(counts, conn):
+    """对 member_count 口径的输出 map 追加 V=人员外包分母。
+
+    规则：仅识别 departments.path 里的 '合作商/V/<真实部门-子部门>' 叶子，把该叶子的
+    member_count additive 加到真实部门及其所有祖先的 total/staff。W=业务外包(整建制
+    供应商)保持只在 Keep/外部合作商 total 展示，绝不进入真实部门分母。
+
+    注意这不是双计：V 叶子从 'Keep/外部合作商' total 中【搬出】(等额扣减)再加到真实部门,
+    搬移而非复制 → 公司「含外包」总数守恒、V 不被两处重复计入；W=业务外包仍只留在外部合作商。
+    """
+    if not counts or conn is None:
+        return counts
+    out = {}
+    for key, val in counts.items():
+        if isinstance(val, list):
+            out[key] = list(val)
+        elif isinstance(val, tuple):
+            out[key] = list(val)
+        else:
+            out[key] = val
+    try:
+        dept_cols = {r[1] for r in conn.execute("PRAGMA table_info(departments)").fetchall()}
+    except Exception:
+        return out
+    if "member_count" not in dept_cols:
+        return out
+    status_filter = (" AND COALESCE(status,'active')='active'"
+                     if "status" in dept_cols else "")
+    rows = conn.execute(
+        "SELECT path, member_count FROM departments"
+        " WHERE COALESCE(path,'')<>'' AND COALESCE(member_count,0)>0"
+        + status_filter
+    ).fetchall()
+    for path, mc in rows:
+        segs = [s for s in str(path).split("/") if s]
+        if "合作商" not in segs:
+            continue
+        i = segs.index("合作商")
+        rest = segs[i + 1:]
+        # 仅允许 '合作商/V/<真实部门叶子>' 这类人员外包叶子折回真实部门。
+        if len(rest) < 2 or rest[0] != "V":
+            continue
+        try:
+            mc = int(mc or 0)
+        except (TypeError, ValueError):
+            mc = 0
+        if mc <= 0:
+            continue
+        realpath = _normalize_dept_path(path)
+        if (not realpath or not realpath.startswith("Keep/")
+                or realpath in ("Keep", _CONTRACTOR_NODE)):
+            continue
+        # 先保留真实部门的递归底值(max),再对 V 做 +=，避免被后续 max(30,2) 吞没。
+        for anc in _ancestors(realpath):
+            if anc == "Keep":
+                continue
+            slot = out.get(anc)
+            if slot is None or not isinstance(slot, list):
+                base = slot if isinstance(slot, (tuple, list)) else [slot or 0, slot or 0]
+                slot = [int((base or [0])[0] or 0), int((base[1] if len(base) > 1 else base[0]) or 0)]
+                out[anc] = slot
+            slot[0] += mc
+            slot[1] += mc
+        # 从外部合作商 total 搬出该 V 叶子(搬移而非复制):公司「含外包」总数守恒、
+        # V 不在「外部合作商」与「真实部门」两处被重复计入。staff 本为 0,不动。
+        cslot = out.get(_CONTRACTOR_NODE)
+        if isinstance(cslot, list):
+            cslot[0] = max(0, cslot[0] - mc)
+    return out
+
+
 def _dept_headcount_map(conn=None):
     """部门完整路径 → 在职总人数。带 6h 文件缓存(DB 同目录 dept_headcount.json)。
     默认数据源飞书(DEPT_HEADCOUNT_SOURCE)，飞书无数据回退飞连。
     懒加载、graceful：任何数据源/IO 异常返回空 dict(或旧缓存)，绝不让 _teams 报错。
     缓存按 source 隔离：换源不会吃到旧源的脏缓存。
     同时记录本次实际口径(_dept_headcount_source_used_mem),消费点据此决定是否 roll-up：
-    member_count 口径已是递归值 → 直接查表;其余叶子级 → _ancestors roll-up。"""
+    member_count 口径已是递归值 → 直接查表;其余叶子级 → _ancestors roll-up。
+    对 member_count 口径,这里还会把 V=人员外包 additive 加回真实部门及祖先，保证所有消费点
+    读到的最终 map 已含活跃率分母所需的 V。"""
     global _dept_headcount_mem, _dept_headcount_source_used_mem
     if _dept_headcount_mem is not None:
         # 进程内缓存也要防陈旧(2026-06-22 codex 评审):长跑服务启动时若无 member_count
@@ -2318,6 +2394,8 @@ def _dept_headcount_map(conn=None):
     # 2) 过期/缺失/换源 → 重建，写盘
     try:
         counts, source_used = _build_dept_headcount(conn)
+        if source_used == "feishu_member_count":
+            counts = _apply_v_headcount_additive(counts, conn)
         try:
             with open(_DEPT_HEADCOUNT_FILE, "w") as f:
                 json.dump({"ts": now, "source": _DEPT_HEADCOUNT_SOURCE,

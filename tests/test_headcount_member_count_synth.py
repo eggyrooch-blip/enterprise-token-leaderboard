@@ -8,8 +8,8 @@
      求和。证明父部门人数 = 飞书 member_count 原值,不会因 roll-up 把子部门再叠加而翻倍;
   3) ⚠️命名空间修复:真实飞书 departments.path 是【裸】路径(无 Keep 前缀,如 '技术平台部'),
      消费点必须补 'Keep/' 前缀才能与人员侧('Keep/技术平台部')对上,否则 lookup 全 miss;
-  4) ⚠️合作商修复:'合作商' 子树(整棵 W/V)是外部合作商,绝不能折进真实部门或顶成 Keep 根;
-     统一收口到单一 'Keep/外部合作商' 节点,只计【含外包】不计【员工】;
+  4) ⚠️合作商修复:'合作商' 子树(整棵 W/V)仍收口到单一 'Keep/外部合作商' 节点;
+     但人员外包 V 的【叶子行】要额外 additive 加回真实部门及其祖先的 staff/total。
   5) 双口径:每部门 [total, staff];Keep 根 total=全量、staff=排除合作商;
   6) 合成 'Keep' 顶级根 = 各顶层节点之和;
   7) 优先级:有 member_count 时压过 feishu_users;老库无列/全 0 → 优雅回退 feishu_users。
@@ -68,7 +68,7 @@ def _mk_departments(conn, with_member_count=True):
     rows.append(("d_hzwc", "d_hzw", "某供应商(SP000442)",
                  "合作商/W/某供应商(SP000442)", 30))
     rows.append(("d_hzv", "d_hz", "V", "合作商/V", 94))
-    # 合作商/V 下的业务外包(叶子短横命名,真实数据里会回折真实部门)—— 仍属外包,不进员工。
+    # 合作商/V 下的人员外包(叶子短横命名,真实数据里会回折真实部门)。
     rows.append(("d_hzvx", "d_hzv", "技术平台部-基础技术部-安全组",
                  "合作商/V/技术平台部-基础技术部-安全组", 2))
 
@@ -178,30 +178,40 @@ def main():
     check("合作商收口外部合作商 total=607 staff=0",
           mc_map.get("Keep/外部合作商"), [607, 0])
     check("合作商不污染 Keep 根键", "Keep" in mc_map, False)
-    # 合作商/V 业务外包也归外部合作商(不折回真实安全组,避免双计)。
-    check("合作商/V 业务外包不折回真实部门",
-          mc_map.get("Keep/技术平台部/基础技术部/安全组"), [30, 30])  # 仅真实安全组 30,无 +2
+    # 人员外包 V 叶子仍走外部合作商键，避免被真实部门 max(30,2) 吞掉；加层在消费点做。
+    check("合作商/V 人员外包叶子不直接进真实部门 max 通道",
+          dc._member_count_dept_key("合作商/V/技术平台部-基础技术部-安全组"),
+          (dc._CONTRACTOR_NODE, True))
+    check("member_count 直接查值阶段真实安全组仍是 [30,30]",
+          mc_map.get("Keep/技术平台部/基础技术部/安全组"), [30, 30])
 
     # --- 场景2(核心):消费点直接查值,父不被子叠加翻倍 ---
     _reset_cache()
     node_total, node_staff, src = _consume_node_hc(c1)
     check("消费点口径=feishu_member_count", src, "feishu_member_count")
-    check("技术平台部 total=300(非 roll-up 翻倍的 490)",
-          node_total.get("Keep/技术平台部"), 300)
-    check("技术平台部 staff=300(真实部门 staff=total)",
-          node_staff.get("Keep/技术平台部"), 300)
-    check("基础技术部=120(直接查值,非 190)",
-          node_total.get("Keep/技术平台部/基础技术部"), 120)
-    check("安全组=30", node_total.get("Keep/技术平台部/基础技术部/安全组"), 30)
+    # V 搬迁后真实部门 total==staff(总量含员工,V 同进两口径);仍非 roll-up 翻倍(490)。
+    check("技术平台部 total=302(正式300+V2,非 roll-up 翻倍的 490)",
+          node_total.get("Keep/技术平台部"), 302)
+    check("技术平台部 staff=302(正式 300 + V 2)",
+          node_staff.get("Keep/技术平台部"), 302)
+    check("基础技术部=122(直接查值120+V2,非 190)",
+          node_total.get("Keep/技术平台部/基础技术部"), 122)
+    check("安全组 total=32(真实 30 + V 2)",
+          node_total.get("Keep/技术平台部/基础技术部/安全组"), 32)
+    check("安全组 staff=32(真实 30 + V 2)",
+          node_staff.get("Keep/技术平台部/基础技术部/安全组"), 32)
 
-    # --- 场景3:双口径 Keep 根 —— total=1297(含外包) / staff=690(员工) ---
-    check("Keep 含外包 total=1297", node_total.get("Keep"), _GRAND_TOTAL)
-    check("Keep 员工 staff=690(排除外部合作商)", node_staff.get("Keep"), _STAFF_TOTAL)
+    # --- 场景3:双口径 Keep 根 —— V 搬迁(非复制)→ 含外包总数守恒,员工分母纳入 V ---
+    check("Keep 含外包 total=1297(V 从外部合作商搬入真实部门,公司总数守恒)",
+          node_total.get("Keep"), _GRAND_TOTAL)
+    check("Keep 员工 staff=692(排除 W/SP,纳入人员外包 V=2)",
+          node_staff.get("Keep"), _STAFF_TOTAL + 2)
     assert _GRAND_TOTAL == 1297 and _STAFF_TOTAL == 690
-    check("Keep total 不超 1297(无 roll-up 重复)", node_total.get("Keep") <= 1297, True)
-    check("外部合作商 total=607 staff=0",
+    check("Keep total 不超 1297(无 roll-up 重复、无 V 双计)", node_total.get("Keep") <= 1297, True)
+    # V 叶子(2)已从外部合作商 total 搬出:607-2=605;staff 恒 0。
+    check("外部合作商搬出 V 后 total=605 staff=0",
           (node_total.get("Keep/外部合作商"), node_staff.get("Keep/外部合作商")),
-          (607, 0))
+          (605, 0))
 
     # --- 场景4:优先级 —— member_count 与 feishu_users 同库,仍取 member_count ---
     c4 = sqlite3.connect(":memory:")
@@ -209,7 +219,7 @@ def main():
     _mk_feishu_users(c4)
     ret4 = dc._fetch_dept_headcount_feishu(c4)
     check("同库优先 member_count(口径)", ret4[1], "feishu_member_count")
-    check("同库优先 member_count(安全组=[30,30] 非 feishu_users 的 2)",
+    check("同库优先 member_count(真实安全组底值仍是 [30,30],V 加层留给消费点)",
           ret4[0].get("Keep/技术平台部/基础技术部/安全组"), [30, 30])
 
     # --- 场景5:老库无 member_count 列 → 优雅回退 feishu_users(不崩) ---

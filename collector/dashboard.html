@@ -383,10 +383,11 @@ function fmtHeadcountSub(x){
   var total=(x.headcount_total!=null)?x.headcount_total:(x.headcount!=null?x.headcount:null);
   var people=x.people||0;
   if(total==null && staff==null) return '使用 '+people+' 人';
+  var tip=esc('活跃率 = 周期内有用量人数 ÷（正式员工 + 人员外包V）。业务外包W（供应商整建制）不计入分母，其用量在「含外包」口径单独展示。');
   var ar=(x.active_rate!=null)?(' · '+x.active_rate+'%'):'';
-  if(staff!=null && total!=null && staff!==total) return '活跃 '+people+'/员工'+staff+' · 含外包'+total+ar;
+  if(staff!=null && total!=null && staff!==total) return '<span title="'+tip+'">活跃 '+people+'/员工'+staff+' · 含外包'+total+ar+'</span>';
   var denom=(total!=null)?total:staff;
-  return '活跃 '+people+'/'+denom+ar;
+  return '<span title="'+tip+'">活跃 '+people+'/'+denom+ar+'</span>';
 }
 function loginHref(){return '/v1/auth/login?next='+encodeURIComponent(location.pathname+location.search);}
 function loginHtml(){return '<a class="login" href="'+loginHref()+'">登录</a>';}
