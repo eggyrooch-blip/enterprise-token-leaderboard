@@ -1665,7 +1665,10 @@ def _to_keep(raw):
     if not raw:
         return None
     n = _normalize_dept_path(raw)
-    return n if n and n.startswith("Keep") else None
+    # "Keep 根"判断必须精确:== 'Keep' 或以 'Keep/' 开头。不能用 startswith('Keep'),
+    # 否则【名字本身以 Keep 开头的真实部门】(如「Keep Goods 事业部」)会被误判为已带前缀,
+    # 与 member_count 侧产出的 'Keep/Keep Goods 事业部' 对不上 → 同部门裂成两行(R1)。
+    return n if n and (n == "Keep" or n.startswith("Keep/")) else None
 
 
 def _trusted_keep_path(raw):
@@ -1679,7 +1682,7 @@ def _trusted_keep_path(raw):
     n = _normalize_dept_path(raw)
     if not n or str(n).lower() in ("unknown", "none"):
         return None
-    if n.startswith("Keep"):
+    if n == "Keep" or n.startswith("Keep/"):   # 精确 Keep 根判断,见 _to_keep 注释(R1)
         return n
     if "/" in n:
         return "Keep/" + n
@@ -1696,7 +1699,7 @@ def _keep_path_from_people(raw):
     n = _normalize_dept_path(raw)
     if not n or str(n).lower() in ("unknown", "none"):
         return None
-    return n if n.startswith("Keep") else ("Keep/" + n)
+    return n if (n == "Keep" or n.startswith("Keep/")) else ("Keep/" + n)  # 精确 Keep 根(R1)
 
 
 def _canon_dept_for(email, depts, effective_dept, pdept, has_attr):

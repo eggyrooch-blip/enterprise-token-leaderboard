@@ -336,8 +336,21 @@ def test_v_excludes_shared_leader_via_feishu_users():
     _reset_cache()
 
 
+def test_keep_named_dept_gets_prefix_not_split():
+    """R1:名字本身以 'Keep' 开头的真实部门(如 'Keep Goods 事业部')必须补 'Keep/' 前缀,
+    与 member_count 侧 'Keep/Keep Goods 事业部' 一致,否则同部门在榜里裂成两行。"""
+    # 误判修复:不能因 startswith('Keep') 就当已带前缀。
+    assert dc._keep_path_from_people("Keep Goods 事业部") == "Keep/Keep Goods 事业部"
+    assert dc._trusted_keep_path("Keep Goods 事业部/产品运营部") == "Keep/Keep Goods 事业部/产品运营部"
+    # 回归:真正的 Keep 根路径不被破坏,普通顶级部门照常补根。
+    assert dc._keep_path_from_people("Keep/技术平台部") == "Keep/技术平台部"
+    assert dc._keep_path_from_people("技术平台部") == "Keep/技术平台部"
+    assert dc._to_keep("Keep/技术平台部") == "Keep/技术平台部"
+
+
 if __name__ == "__main__":
     main()
     test_nested_v_member_count_no_double_count()
     test_v_excludes_shared_leader_via_feishu_users()
+    test_keep_named_dept_gets_prefix_not_split()
     print("ALL: PASS")
