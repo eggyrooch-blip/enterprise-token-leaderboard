@@ -241,5 +241,45 @@ def test_dept_activerate_v_denominator():
     main()
 
 
+def test_nested_v_member_count_no_double_count():
+    """codex 评审#3:member_count 是递归值。V 子树若有 "/" 嵌套行(父 mc 已含子),
+    按自身净值(own=mc−后代mc)加层,不得把同一人在祖先里重复计入。"""
+    _reset_cache()
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    rows = [
+        ("d_tp", "0", "技术平台部", "技术平台部", 30),
+        ("d_base", "d_tp", "基础技术部", "技术平台部/基础技术部", 20),
+        ("d_sec", "d_base", "安全组", "技术平台部/基础技术部/安全组", 10),
+        ("d_hz", "0", "合作商", "合作商", 8),
+        ("d_hzw", "d_hz", "W", "合作商/W", 5),
+        ("d_hzv", "d_hz", "V", "合作商/V", 3),
+        # "/" 嵌套的 V 行:父(递归3,含子1) + 子(1)。
+        ("d_v_base", "d_hzv", "技术平台部-基础技术部",
+         "合作商/V/技术平台部-基础技术部", 3),
+        ("d_v_sec", "d_v_base", "安全组",
+         "合作商/V/技术平台部-基础技术部/安全组", 1),
+    ]
+    conn.executemany(
+        "INSERT INTO departments(dept_id,parent_id,name,path,member_count) VALUES(?,?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+    node_total, node_staff, source = _consume_node_hc(conn)
+    assert source == "feishu_member_count"
+    # 安全组 = 真实10 + V子own1 = 11
+    assert node_total.get("Keep/技术平台部/基础技术部/安全组") == 11, node_total
+    # 基础技术部 = 真实20 + V父own2 + V子own1 = 23(不是双计的 24)
+    assert node_total.get("Keep/技术平台部/基础技术部") == 23, node_total
+    # 技术平台部 = 真实30 + V总3 = 33(不是双计的 34)
+    assert node_total.get("Keep/技术平台部") == 33, node_total
+    assert node_staff.get("Keep/技术平台部") == 33, node_staff
+    # 外部合作商等额搬出 V 净总(2+1=3):8-3=5(=W),不是多扣的 4。
+    assert node_total.get("Keep/外部合作商") == 5, node_total
+    _reset_cache()
+
+
 if __name__ == "__main__":
     main()
+    test_nested_v_member_count_no_double_count()
+    print("NESTED-V: PASS")

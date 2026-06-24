@@ -2302,13 +2302,15 @@ def _apply_v_headcount_additive(counts, conn):
         " WHERE COALESCE(path,'')<>'' AND COALESCE(member_count,0)>0"
         + status_filter
     ).fetchall()
+    # 第一遍:收集 V=人员外包行(合作商/V/<真实部门>)。记录 V 子路径(vkey,按 "/" 分段)、
+    # 递归 mc、折回的真实 Keep 路径。dash('-')编码的叶子是 V 下的【兄弟】(各自独立),
+    # 只有 "/" 分隔才是飞书部门树的【父子嵌套】(member_count 递归含子)。
+    v_rows = []
     for path, mc in rows:
         segs = [s for s in str(path).split("/") if s]
         if "合作商" not in segs:
             continue
-        i = segs.index("合作商")
-        rest = segs[i + 1:]
-        # 仅允许 '合作商/V/<真实部门叶子>' 这类人员外包叶子折回真实部门。
+        rest = segs[segs.index("合作商") + 1:]
         if len(rest) < 2 or rest[0] != "V":
             continue
         try:
@@ -2321,8 +2323,17 @@ def _apply_v_headcount_additive(counts, conn):
         if (not realpath or not realpath.startswith("Keep/")
                 or realpath in ("Keep", _CONTRACTOR_NODE)):
             continue
-        # 先保留真实部门的递归底值(max),再对 V 做 +=，避免被后续 max(30,2) 吞没。
-        for anc in _ancestors(realpath):
+        v_rows.append((tuple(rest[1:]), mc, realpath))
+    # 第二遍:member_count 是递归值 —— 若某 V 行是另一 V 行的 "/" 祖先,其 mc 已含后代。
+    # 取【自身净值】own = mc − Σ(严格 "/" 后代 V 行 mc) 再 roll-up,避免嵌套 V 行把同一人
+    # 重复计入真实部门/重复从外部合作商扣减(codex 评审#3)。dash 兄弟叶子 vkey 互不为前缀,
+    # 天然独立、不相互扣减。扁平叶子(无后代)own==mc,退化为直接加。
+    for vkey, mc, realpath in v_rows:
+        own = mc - sum(m for k, m, _ in v_rows
+                       if len(k) > len(vkey) and k[:len(vkey)] == vkey)
+        if own <= 0:
+            continue  # 自身人数全在后代里 → 不重复加
+        for anc in _ancestors(realpath):   # 真实部门【及其每个真实祖先】+= own
             if anc == "Keep":
                 continue
             slot = out.get(anc)
@@ -2330,13 +2341,12 @@ def _apply_v_headcount_additive(counts, conn):
                 base = slot if isinstance(slot, (tuple, list)) else [slot or 0, slot or 0]
                 slot = [int((base or [0])[0] or 0), int((base[1] if len(base) > 1 else base[0]) or 0)]
                 out[anc] = slot
-            slot[0] += mc
-            slot[1] += mc
-        # 从外部合作商 total 搬出该 V 叶子(搬移而非复制):公司「含外包」总数守恒、
-        # V 不在「外部合作商」与「真实部门」两处被重复计入。staff 本为 0,不动。
+            slot[0] += own
+            slot[1] += own
+        # 从外部合作商 total 等额搬出(搬移而非复制):公司「含外包」总数守恒、不双计。staff 本为 0。
         cslot = out.get(_CONTRACTOR_NODE)
         if isinstance(cslot, list):
-            cslot[0] = max(0, cslot[0] - mc)
+            cslot[0] = max(0, cslot[0] - own)
     return out
 
 
