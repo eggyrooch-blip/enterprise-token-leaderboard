@@ -4074,6 +4074,43 @@ class H(BaseHTTPRequestHandler):
                     continue
                 roster[email] = {"name": name, "email": email, "avatar": avatar}
 
+        # 3b) 部门【负责人】补点名:leader 的主部门常是父级,不会作为本组成员被 feishu_users 枚举,
+        #     但飞书 member_count 把他算进本组(作为 leader)→ 否则他成匿名「未同步无法点名」(纪超案例)。
+        #     按 departments.leader_user_id → feishu_users(open_id) 解析姓名,归到其【所带部门】;
+        #     在目标子树内且未在册 → 补进 roster,使其按名展示、missing 收缩到真实缺口。
+        try:
+            if _table_columns(conn, "feishu_users") and _table_columns(conn, "departments"):
+                _fu_by_oid = {}
+                for _oid, _nm, _em, _st in conn.execute(
+                        "SELECT open_id, COALESCE(name,''), COALESCE(email,''),"
+                        " COALESCE(status,'active') FROM feishu_users"
+                        " WHERE COALESCE(open_id,'')<>''").fetchall():
+                    _fu_by_oid[_oid] = (_nm, _em, _st)
+                _dstatus = (" AND COALESCE(status,'active')='active'"
+                            if "status" in _table_columns(conn, "departments") else "")
+                for _dpath, _lid in conn.execute(
+                        "SELECT COALESCE(path,''), COALESCE(leader_user_id,'') FROM departments"
+                        " WHERE COALESCE(leader_user_id,'')<>'' AND COALESCE(path,'')<>''"
+                        + _dstatus).fetchall():
+                    cd = _keep_path_from_people(_dpath)
+                    if not cd or not _under(cd):
+                        continue   # leader 所带部门不在目标子树
+                    _info = _fu_by_oid.get(_lid)
+                    if not _info:
+                        continue   # leader 在 feishu_users 查不到名 → 仍无法点名(极少)
+                    _nm, _em, _st = _info
+                    if not sd and _st and _st != "active":
+                        continue
+                    if not sd and _em and _em in departed_set:
+                        continue
+                    if not _in_scope(_em or _lid, cd):
+                        continue
+                    _key = _em or ("oid:" + str(_lid))
+                    if _key not in roster:
+                        roster[_key] = {"name": _nm, "email": _em, "avatar": pav.get(_em, "")}
+        except Exception:
+            pass
+
         # 4) 组装。used 名字优先花名册→people→邮箱前缀。
         def _nm(email):
             return (roster.get(email, {}).get("name") or pname.get(email)

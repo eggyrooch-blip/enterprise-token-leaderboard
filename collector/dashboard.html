@@ -678,11 +678,11 @@ function renderMembersPanel(dept, depth){
   if(d.error)         return line('<div class="nm muted">人员加载失败,点部门收起再展开重试</div>');
   var used=d.used||[], unused=d.unused||[], missing=d.missing||0;
   if(!used.length && !unused.length && !missing)
-    return line('<div class="nm muted">该部门暂无可点名人员(通讯录未同步)</div>');
+    return line('<div class="nm muted">该部门暂无人员明细</div>');
   var maxTok=used.reduce(function(a,u){return Math.max(a,u.tokens||0)},1);
   var out=[];
-  // 表头:用了 X / 没用 Y (+ 未同步 N)
-  var hd='用了 '+used.length+' · 没用 '+unused.length+(missing?(' · 未同步 '+missing):'');
+  // 表头:用了 X / 没用 Y。负责人已补点名(后端 leader_user_id→姓名),不再显示"未同步"匿名缺口(孙可 2026-06-24)。
+  var hd='用了 '+used.length+' · 没用 '+unused.length;
   out.push(line('<div class="nm muted" style="font-size:12px">'+hd+'</div>'));
   // 头像/姓名来自飞书目录(半可信)。img 失败回退不再内联 JS 拼 fb(避免 JS 字符串上下文被
   // 名字里的引号/反斜杠破坏,codex 评审);改为 onerror 调全局 avFallback(this),它用 textContent
@@ -707,7 +707,8 @@ function renderMembersPanel(dept, depth){
       '<div class="track"></div>'+
       '<div class="val"><div class="t num">0</div><div class="s num">未使用</div></div></div>');  // 显式 token=0(SPEC)+「未使用」标签(孙可预览)
   });
-  if(missing>0) out.push(line('<div class="nm muted">⋯ 另有 '+missing+' 人未同步通讯录(无法点名)</div>'));
+  // 不再渲染"另有 N 人未同步通讯录(无法点名)":负责人已补点名;残留极少数飞书未枚举到的人
+  // 用户不希望看到匿名缺口状态(孙可 2026-06-24)。headcount/活跃率分母仍按真实 member_count。
   return out.join('');
 }
 function render(){

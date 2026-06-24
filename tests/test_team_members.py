@@ -331,3 +331,37 @@ def test_inactive_feishu_user_excluded(monkeypatch):
     obj = _call(dc, conn, monkeypatch, headcount=1)
     names = [u["name"] for u in obj["used"]] + [u["name"] for u in obj["unused"]]
     assert "离职乙" not in names and "在职甲" in names
+
+
+def test_dept_leader_named_not_anonymous(monkeypatch):
+    """部门负责人主部门在父级、不被本组 feishu_users 枚举,但飞书 member_count 把他算进本组。
+    应按 leader_user_id → feishu_users 解析姓名补进花名册(不再匿名"未同步无法点名")。纪超案例。"""
+    dc = importlib.reload(dev_collector)
+    conn = sqlite3.connect(":memory:")
+    _schema(conn)
+    conn.executescript(
+        """
+        CREATE TABLE feishu_users(open_id TEXT, user_id TEXT, union_id TEXT, email TEXT,
+            name TEXT, dept_id TEXT, dept_path TEXT, status TEXT DEFAULT 'active',
+            employee_type TEXT, updated_at TEXT DEFAULT '');
+        CREATE TABLE departments(dept_id TEXT PRIMARY KEY, open_dept_id TEXT DEFAULT '',
+            parent_id TEXT, name TEXT, path TEXT, leader_user_id TEXT DEFAULT '',
+            chat_id TEXT DEFAULT '', group_owner_user_id TEXT DEFAULT '',
+            member_count INTEGER DEFAULT 0, status TEXT DEFAULT 'active', updated_at TEXT DEFAULT '');
+        """
+    )
+    bare = "AI 平台事业部/AI 业务部/运动科学部"
+    _person(conn, "amy@keep.com", "Amy", DEPT)
+    _use(conn, "amy@keep.com", DEPT, 1000)
+    conn.execute("INSERT INTO feishu_users(open_id,name,email,dept_path,status) VALUES(?,?,?,?,'active')",
+                 ("ou_amy", "Amy", "amy@keep.com", bare))
+    # leader 主部门在父级,leads 本组
+    conn.execute("INSERT INTO feishu_users(open_id,name,email,dept_path,status) VALUES(?,?,?,?,'active')",
+                 ("ou_lead", "Leader Li", "leadli@keep.com", "AI 平台事业部/AI 业务部"))
+    conn.execute("INSERT INTO departments(dept_id,name,path,leader_user_id,member_count) VALUES(?,?,?,?,?)",
+                 ("d1", "运动科学部", bare, "ou_lead", 2))
+    conn.commit()
+    obj = _call(dc, conn, monkeypatch, headcount=2)
+    names = {p["name"] for p in obj["used"]} | {p["name"] for p in obj["unused"]}
+    assert "Leader Li" in names, obj      # 负责人按名出现
+    assert obj["missing"] == 0, obj       # 2 = Amy(用了) + Leader(没用),无匿名缺口
