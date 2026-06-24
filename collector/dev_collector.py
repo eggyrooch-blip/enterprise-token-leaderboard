@@ -2340,8 +2340,12 @@ def _apply_v_headcount_additive(counts, conn):
     return out
 
 
-def _dept_headcount_map(conn=None):
-    """部门完整路径 → 在职总人数。带 6h 文件缓存(DB 同目录 dept_headcount.json)。
+def _dept_headcount_map_raw(conn=None):
+    """部门完整路径 → 在职总人数【原始 member_count 值，未加 V 人员外包层】。
+    缓存(mem+file)只存这份原始值；V=人员外包的 additive 加层在 _dept_headcount_map 包装层
+    每次返回时套用，使【部署前写的旧缓存】读出来也能立即补上 V(不必等 6h 缓存过期),
+    且因 _apply_v_headcount_additive 是 copy-not-mutate,套用不会污染缓存、也不会双计。
+    带 6h 文件缓存(DB 同目录 dept_headcount.json)。
     默认数据源飞书(DEPT_HEADCOUNT_SOURCE)，飞书无数据回退飞连。
     懒加载、graceful：任何数据源/IO 异常返回空 dict(或旧缓存)，绝不让 _teams 报错。
     缓存按 source 隔离：换源不会吃到旧源的脏缓存。
@@ -2394,8 +2398,6 @@ def _dept_headcount_map(conn=None):
     # 2) 过期/缺失/换源 → 重建，写盘
     try:
         counts, source_used = _build_dept_headcount(conn)
-        if source_used == "feishu_member_count":
-            counts = _apply_v_headcount_additive(counts, conn)
         try:
             with open(_DEPT_HEADCOUNT_FILE, "w") as f:
                 json.dump({"ts": now, "source": _DEPT_HEADCOUNT_SOURCE,
@@ -2421,6 +2423,18 @@ def _dept_headcount_map(conn=None):
         except Exception:
             pass
         return {}
+
+
+def _dept_headcount_map(conn=None):
+    """部门完整路径 → 在职总人数(member_count 口径下已含 V=人员外包加层)。
+    = _dept_headcount_map_raw(原始/缓存值) + 返回时套用 _apply_v_headcount_additive。
+    在【返回时】而非【写缓存时】加 V 层 → 部署前写的旧缓存读出也立即含 V(无需等 6h 过期);
+    _apply_v_headcount_additive 是 copy-not-mutate,不污染缓存、不重复叠加。
+    非 member_count 口径(叶子级回退)不加层(叶子源无外包细分,V 已在叶子计数里)。"""
+    counts = _dept_headcount_map_raw(conn)
+    if counts and _dept_headcount_source_used() == "feishu_member_count":
+        return _apply_v_headcount_additive(counts, conn)
+    return counts
 
 
 # ---------------------------------------------------------------------------

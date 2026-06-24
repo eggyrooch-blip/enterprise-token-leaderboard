@@ -208,6 +208,28 @@ def main():
           keep["active_rate"] <= 100.0, True)
     check("防双计:安全组 staff 精确等于 32", sec["headcount_staff"], 32)
 
+    # --- 场景:部署前写的【旧缓存】(原始值、不含 V)命中时,返回仍要补 V(codex 评审#1) ---
+    # V 加层在【返回时】套用而非写缓存时,故 6h 内命中旧缓存也立即生效,无需等过期。
+    import json as _json, time as _time
+    dc._dept_headcount_mem = None
+    dc._dept_headcount_source_used_mem = None
+    raw_no_v = {
+        "Keep/技术平台部": [30, 30],
+        "Keep/技术平台部/基础技术部": [30, 30],
+        "Keep/技术平台部/基础技术部/安全组": [30, 30],
+        "Keep/市场与内容中心": [5, 5],
+        "Keep/外部合作商": [11, 0],
+    }
+    with open(dc._DEPT_HEADCOUNT_FILE, "w") as f:
+        _json.dump({"ts": _time.time(), "source": dc._DEPT_HEADCOUNT_SOURCE,
+                    "source_used": "feishu_member_count", "counts": raw_no_v},
+                   f, ensure_ascii=False)
+    stale_map = dc._dept_headcount_map(conn)
+    check("旧缓存(无V)命中时返回仍补 V:安全组=[32,32]",
+          stale_map.get("Keep/技术平台部/基础技术部/安全组"), [32, 32])
+    check("旧缓存命中时外部合作商搬出 V:total=9 staff=0",
+          stale_map.get("Keep/外部合作商"), [9, 0])
+
     _reset_cache()
     if failures:
         print("RESULT: FAIL ->", failures)

@@ -384,10 +384,12 @@ function fmtHeadcountSub(x){
   var people=x.people||0;
   if(total==null && staff==null) return '使用 '+people+' 人';
   var tip=esc('活跃率 = 周期内有用量人数 ÷（正式员工 + 人员外包V）。业务外包W（供应商整建制）不计入分母，其用量在「含外包」口径单独展示。');
+  // 可点击口径公示(任磊「点击进去给公示说明」):点 ⓘ 切换说明显隐;stopPropagation 防触发整行展开;title 作悬浮兜底。
+  var help=' <span class="rate-help" title="'+tip+'" role="button" tabindex="0" onclick="event.stopPropagation();var n=this.nextElementSibling;n.style.display=(n.style.display===\'inline\'?\'none\':\'inline\');" style="cursor:pointer;opacity:.55">ⓘ</span><span class="rate-help-tip" style="display:none;color:#888;font-size:11px;margin-left:4px">（'+tip+'）</span>';
   var ar=(x.active_rate!=null)?(' · '+x.active_rate+'%'):'';
-  if(staff!=null && total!=null && staff!==total) return '<span title="'+tip+'">活跃 '+people+'/员工'+staff+' · 含外包'+total+ar+'</span>';
+  if(staff!=null && total!=null && staff!==total) return '活跃 '+people+'/员工'+staff+' · 含外包'+total+ar+help;
   var denom=(total!=null)?total:staff;
-  return '<span title="'+tip+'">活跃 '+people+'/'+denom+ar+'</span>';
+  return '活跃 '+people+'/'+denom+ar+help;
 }
 function loginHref(){return '/v1/auth/login?next='+encodeURIComponent(location.pathname+location.search);}
 function loginHtml(){return '<a class="login" href="'+loginHref()+'">登录</a>';}
