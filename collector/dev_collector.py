@@ -3765,17 +3765,23 @@ class H(BaseHTTPRequestHandler):
                 if _em:
                     _pcost[_em] = float(_r.get("cost") or 0)
             # 每人 canon 部门 + 主桶(取其 per 条目里 token 最大的那条),只取一次。
+            # 键用 lower(email):个人榜 _pcost 已按 lower(email) 合并大小写变体,这里也必须按
+            # lower 去重,否则同一人的 Alice@/alice@ 两条 per 会各查到同一份合并 cost、重复加
+            # → Keep 根 > 个人榜求和(codex 评审发现的大小写双计)。
             _pcanon, _pbest = {}, {}
             for (email, _e, _b), p in per.items():
+                el = (email or "").lower()
+                if not el:
+                    continue
                 cd = _canon_dept(email, p["depts"], p.get("effective_dept"))
                 if not cd or cd == "Keep/未归类":
                     continue
-                if email not in _pcanon or (p.get("tok") or 0) > _pbest.get(email, -1):
+                if el not in _pcanon or (p.get("tok") or 0) > _pbest.get(el, -1):
                     bkt = p.get("bucket") or BUCKET_EMPLOYEE
                     if bkt not in (BUCKET_EMPLOYEE, BUCKET_BUSINESS, BUCKET_PENDING_BUSINESS, BUCKET_UNRESOLVED):
                         bkt = BUCKET_UNRESOLVED
-                    _pcanon[email] = (cd, bkt)
-                    _pbest[email] = p.get("tok") or 0
+                    _pcanon[el] = (cd, bkt)
+                    _pbest[el] = p.get("tok") or 0
             # 清零已攒的 cost(token/users 已建好,保留),按个人榜权威 cost 重算并 roll-up。
             for n in nodes.values():
                 n["cost"] = 0.0

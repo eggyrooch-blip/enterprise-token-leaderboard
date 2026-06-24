@@ -657,3 +657,24 @@ def test_dept_board_cost_reconciles_with_person_board(dc, monkeypatch, tmp_path)
         assert keep_cost < 99.0, keep_cost
     finally:
         conn.close()
+
+
+def test_dept_cost_no_double_count_on_email_case_variants(dc, monkeypatch, tmp_path):
+    """R4 边界(codex 评审):同一人 Alice@ 与 alice@ 大小写变体。个人榜按 lower 合并成一行,
+    部门榜也须按 lower 去重,否则同一份合并 cost 被加两次 → Keep 根 > 个人榜求和。"""
+    _freeze_today(monkeypatch, dc, "2026-06-12")
+    monkeypatch.setattr(dc, "DB", str(tmp_path / "tok.db"))
+    monkeypatch.setattr(dc, "_dept_headcount_map", lambda *_a, **_k: {})
+    conn = dc.db()
+    try:
+        _insert_people(conn, "alice@keep.com", "Alice", "Keep/平台/基础")
+        _insert_usage(dc, conn, "Alice@keep.com", "Keep/平台/基础", "2026-06-10", "litellm", "LiteLLM", 1000, 10.0, 5)
+        _insert_usage(dc, conn, "alice@keep.com", "Keep/平台/基础", "2026-06-10", "litellm", "LiteLLM", 500, 7.0, 3)
+        conn.commit()
+        qs = {"days": ["30"]}
+        person_sum = round(sum((r.get("cost") or 0) for r in _leaderboard(dc, conn, qs)), 2)
+        teams = _teams_payload(dc, conn, qs)
+        keep_cost = round((teams.get("Keep", {}) or {}).get("cost") or 0, 2)
+        assert keep_cost == person_sum, (keep_cost, person_sum)
+    finally:
+        conn.close()
