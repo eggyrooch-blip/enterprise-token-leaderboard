@@ -4509,6 +4509,7 @@ class H(BaseHTTPRequestHandler):
         today_d = datetime.date.today()
         idle_win_s, idle_win_e = _window_dates(qs) or (today_d, today_d)
         idle_fee_by = {}
+        idle_start_by = {}
         idle_emails = set()
         for email, subs in subs_by_email.items():
             if not include_excluded and (email or "").lower() in LEADERBOARD_EXCLUDE_EMAILS:
@@ -4522,8 +4523,45 @@ class H(BaseHTTPRequestHandler):
                 idle_emails.add(email)
                 key = (email, sub.get("tool") or "")
                 idle_fee_by[key] = idle_fee_by.get(key, 0.0) + float(sub.get("fee") or 0)
-        idle_people = [{"email": k[0], "tool": k[1], "fee": round(v, 4)}
-                       for k, v in sorted(idle_fee_by.items())]
+                st = sub.get("start") or ""
+                if st and (key not in idle_start_by or st < idle_start_by[key]):
+                    idle_start_by[key] = st  # 起订日取最早(任磊 R3:展示从何时起订)
+        # 名字解析优先级(任磊 R3:名单要可读、可操作):
+        #   subscriptions.display_name(订阅表自带,最权威) → feishu_users.name(真实目录名)
+        #   → people.name(可能含 *_v 等垃圾本地名,故置后) → 邮箱本地名兜底。
+        _idle_names = {}
+
+        def _fill(sql):
+            try:
+                for e, n in conn.execute(sql).fetchall():
+                    k = (e or "").lower()
+                    if k and n and not _idle_names.get(k):
+                        _idle_names[k] = n
+            except Exception:
+                pass
+
+        _fill("SELECT email, display_name FROM subscriptions WHERE COALESCE(display_name,'')<>''")
+        if "feishu_users" in _table_columns_owner(conn):
+            _fill("SELECT email, name FROM feishu_users WHERE COALESCE(email,'')<>''")
+        _fill("SELECT email, name FROM people WHERE COALESCE(name,'')<>''")
+        # 起订日:直接取 subscriptions.start_date(按 email+tool 取最早),比 load_subscriptions 的
+        # sub['start'] 可靠(后者部分行为空)。任磊 R3:展示从何时起订。
+        _idle_start_db = {}
+        try:
+            for e, tool, sd in conn.execute(
+                    "SELECT email, COALESCE(tool,''), COALESCE(start_date,'') FROM subscriptions"
+                    " WHERE COALESCE(start_date,'')<>''").fetchall():
+                kk = (e, tool)
+                if kk not in _idle_start_db or sd < _idle_start_db[kk]:
+                    _idle_start_db[kk] = sd
+        except Exception:
+            pass
+        idle_people = [{
+            "email": k[0],
+            "name": _idle_names.get((k[0] or "").lower()) or (k[0] or "").split("@")[0],
+            "tool": k[1], "fee": round(v, 4),
+            "start_date": _idle_start_db.get(k) or idle_start_by.get(k, ""),
+        } for k, v in sorted(idle_fee_by.items())]
         # count 按空置订阅人头算；同一人多个 tool 只计 1 人，但 monthly_fee_usd 累加全部席位。
         idle_subscriptions = {
             "count": len(idle_emails),

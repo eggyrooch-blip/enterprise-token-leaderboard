@@ -494,10 +494,23 @@ function renderGovernance(){
     if(unresolved>0) extra=' 需人工补齐订阅归属后再看个人公司实付。';
   }
   if(idle && (idle.count||0)>0){
-    notes.push('<span class="gov-pill">闲置/离职订阅席位 '+idle.count+' 人 · 月费 $'+compact(idle.monthly_fee_usd||0)+'（名单见接口）</span>');
+    notes.push('<span class="gov-pill">闲置/离职订阅席位 '+idle.count+' 人 · 月费 $'+compact(idle.monthly_fee_usd||0)+'（建议取消，见下表）</span>');
   }
   if(notes.length){
     body+='<div class="gov-note" style="margin-top:12px">'+notes.join(' ')+extra+'</div>';
+  }
+  // 闲置订阅「建议取消」明细名单(任磊 R3:订了周期内零用量的人,落地为可操作名单,带姓名/工具/起订日/月费)。
+  if(idle && idle.people && idle.people.length){
+    var idleRows=idle.people.slice().sort(function(a,b){return (b.fee||0)-(a.fee||0);}).map(function(p){
+      var nm=esc(p.name||p.email||''); var tool=esc(p.tool||'');
+      var since=p.start_date?(' · 自 '+esc(p.start_date)):'';
+      return '<tr><td style="padding:4px 12px 4px 0">'+nm+'</td>'
+           +'<td style="padding:4px 12px 4px 0;color:#888">'+tool+since+'</td>'
+           +'<td style="padding:4px 0;text-align:right">$'+(Math.round((p.fee||0)*100)/100)+'/月</td></tr>';
+    }).join('');
+    body+='<div class="gov-note" style="margin-top:10px">'
+        +'<div style="font-weight:600;margin-bottom:6px">建议取消的闲置订阅（周期内零用量）</div>'
+        +'<table style="border-collapse:collapse;font-size:12px;width:100%;max-width:560px">'+idleRows+'</table></div>';
   }
   $('list').innerHTML=body;
 }

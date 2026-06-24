@@ -118,8 +118,8 @@ def test_idle_subscription_person_is_absent_from_leaderboard_and_exposed_in_gove
         "count": 1,
         "monthly_fee_usd": 65.0,
         "people": [
-            {"email": "solo@keep.com", "tool": "codex", "fee": 25.0},
-            {"email": "solo@keep.com", "tool": "cursor", "fee": 40.0},
+            {"email": "solo@keep.com", "name": "Solo", "tool": "codex", "fee": 25.0, "start_date": ""},
+            {"email": "solo@keep.com", "name": "Solo", "tool": "cursor", "fee": 40.0, "start_date": ""},
         ],
     }
 
@@ -456,7 +456,8 @@ def test_idle_excludes_pre_window_deleted_seat(dc, monkeypatch, tmp_path):
     assert _idle_subscription(payload) == {
         "count": 1,
         "monthly_fee_usd": 25.0,
-        "people": [{"email": "idle@keep.com", "tool": "codex", "fee": 25.0}],
+        "people": [{"email": "idle@keep.com", "name": "Idle", "tool": "codex", "fee": 25.0,
+                    "start_date": "2026-06-01"}],
     }
 
 
