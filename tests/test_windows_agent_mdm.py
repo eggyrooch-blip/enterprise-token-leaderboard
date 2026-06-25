@@ -81,7 +81,7 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     script = BOOTSTRAP.read_text(encoding="utf-8")
 
     assert "$env:ProgramData" in script
-    assert "[int]$Version = 6" in script
+    assert "[int]$Version = 7" in script
     assert "tok_" not in script
     assert "tokreport.ps1" in script
     assert "/tokreport.ps1" in script
@@ -97,6 +97,7 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     assert ".Repetition.Duration" not in script
     assert "-NonInteractive" in script
     assert "-WindowStyle Hidden" in script
+    assert "-Hidden" in script
     assert ".version" in script
     assert "v1/tokscale/report" in script
     assert "[System.Management.Automation.Language.Parser]::ParseInput" in script
@@ -105,15 +106,47 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     assert "LaunchAgent" not in script
 
 
-def test_windows_bootstrap_starts_existing_task_when_already_current():
+def test_windows_bootstrap_updates_reporter_by_sha_not_manual_version_gate():
     script = BOOTSTRAP.read_text(encoding="utf-8")
-    already_current_block = script[
-        script.index("if ((Test-Path -LiteralPath $versionPath)") :
-        script.index("$fresh = $false")
-    ]
 
-    assert "Start-ScheduledTask -TaskName $TaskName" in already_current_block
-    assert "started existing Scheduled Task" in already_current_block
+    assert ".reporter.sha256" in script
+    assert "Get-FileHash -Algorithm SHA256" in script
+    assert "$installedHash" in script
+    assert "Get-FileHash -Algorithm SHA256 -LiteralPath $script:scriptPath" in script
+    assert "$newHash -eq $installedHash" in script
+    assert "$newHash -eq $oldHash" not in script
+    assert "reporter unchanged" in script
+    assert "version NOT bumped" not in script
+    assert "((Get-Content -LiteralPath $versionPath -Raw).Trim() -eq [string]$Version)" not in script
+
+
+def test_windows_bootstrap_does_not_immediately_collect_when_reporter_unchanged():
+    script = BOOTSTRAP.read_text(encoding="utf-8")
+
+    unchanged_pos = script.index("reporter unchanged")
+    fallback_pos = script.index("下载/校验未成功", unchanged_pos)
+    unchanged_branch = script[unchanged_pos:fallback_pos]
+    assert "Start-ScheduledTask" not in unchanged_branch
+    assert "$runNow" in script
+    assert "if ($runNow)" in script
+    assert script.count("Start-ScheduledTask -TaskName $TaskName") == 1
+
+
+def test_windows_bootstrap_silently_refreshes_task_registration_each_run():
+    script = BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert ".task.sha256" not in script
+    assert "Get-Sha256Text" not in script
+    assert "Test-ReportTaskCurrent" not in script
+    assert "$runNow = $changed" in script
+    assert "$runNow = $changed -or (-not $task)" not in script
+    assert "$taskRefreshed = $false" in script
+    assert "$taskRefreshed = $true" in script
+    assert "if ($taskRefreshed)" in script
+    assert "Register-ReportTask" in script
+    assert "Scheduled Task registered/refreshed" in script
+    assert "Scheduled Task refreshed; immediate collection skipped" in script
+    assert "Scheduled Task refresh failed; immediate collection skipped" in script
 
 
 def test_windows_bootstrap_logs_scheduled_task_diagnostics_after_start():

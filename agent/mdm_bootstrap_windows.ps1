@@ -1,7 +1,7 @@
 param(
     [string]$Collector = $env:COLLECTOR,
     [string]$Token = $env:TOKEN,
-    [int]$Version = 6,
+    [int]$Version = 7,
     [string]$InstallDir = (Join-Path $env:ProgramData "TokReport"),
     [string]$TaskName = "TokReport"
 )
@@ -9,6 +9,11 @@ param(
 # Standalone Windows MDM push/bootstrap script.
 # Run this from MDM as Administrator/SYSTEM. It installs a separate Windows
 # tokreport.ps1 and registers one Scheduled Task that runs as the logged-in user.
+#
+# Reporter updates are driven by validated SHA256 content, not by the human
+# marker Version. If collector /tokreport.ps1 changes, the next MDM run refreshes
+# the local reporter; unchanged reporter + existing task does not trigger an
+# immediate collection run.
 
 $ErrorActionPreference = "Stop"
 
@@ -28,6 +33,28 @@ function Get-TaskIfExists {
     } catch {
         return $null
     }
+}
+
+function Get-ReportTaskActionArg {
+    return "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script:scriptPath`" -ConfigPath `"$script:configPath`" -Via mdm"
+}
+
+function Register-ReportTask {
+    $actionArg = Get-ReportTaskActionArg
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $actionArg
+    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+    $hourlyTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+        -RepetitionInterval (New-TimeSpan -Hours 1) `
+        -RepetitionDuration (New-TimeSpan -Days 9999)
+    $principal = New-ScheduledTaskPrincipal -GroupId "S-1-5-32-545" -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
+        -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -Hidden
+
+    Register-ScheduledTask -TaskName $TaskName -Action $action `
+        -Trigger @($logonTrigger, $hourlyTrigger) `
+        -Principal $principal -Settings $settings -Force | Out-Null
 }
 
 function Log-TaskInfo {
@@ -61,32 +88,19 @@ try {
     }
 
     $collectorBase = $Collector.TrimEnd("/")
-    $scriptPath = Join-Path $InstallDir "tokreport.ps1"
-    $configPath = Join-Path $InstallDir "tokreport.config.json"
+    $script:scriptPath = Join-Path $InstallDir "tokreport.ps1"
+    $script:configPath = Join-Path $InstallDir "tokreport.config.json"
+    $hashPath = Join-Path $InstallDir ".reporter.sha256"
     $versionPath = Join-Path $InstallDir ".version"
     $downloadUrl = "$collectorBase/tokreport.ps1"
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     @{ Collector = $collectorBase; Token = $Token } |
         ConvertTo-Json -Depth 4 |
-        Set-Content -LiteralPath $configPath -Encoding UTF8
+        Set-Content -LiteralPath $script:configPath -Encoding UTF8
 
-    $task = Get-TaskIfExists
-    if ((Test-Path -LiteralPath $versionPath) -and
-        ((Get-Content -LiteralPath $versionPath -Raw).Trim() -eq [string]$Version) -and
-        (Test-Path -LiteralPath $scriptPath) -and
-        $task) {
-        try {
-            Start-ScheduledTask -TaskName $TaskName
-            Log "already v$Version and Scheduled Task exists; started existing Scheduled Task"
-        } catch {
-            Log "already v$Version and Scheduled Task exists; immediate start skipped: $($_.Exception.Message)"
-        }
-        Log-TaskInfo
-        exit 0
-    }
-
-    $fresh = $false
+    $reporterReady = $false
+    $changed = $false
     $tmp = Join-Path $InstallDir (".dl." + [guid]::NewGuid().ToString("N") + ".ps1")
     try {
         Invoke-WebRequest -UseBasicParsing -Uri $downloadUrl -OutFile $tmp -TimeoutSec 30
@@ -99,9 +113,22 @@ try {
                 $first = $parseErrors[0]
                 Log "download rejected: $($parseErrors.Count) parse error(s); first @ line $($first.Extent.StartLineNumber): $($first.Message)"
             } else {
-                Move-Item -LiteralPath $tmp -Destination $scriptPath -Force
-                $fresh = $true
-                Log "downloaded $downloadUrl (content + syntax validated)"
+                $newHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmp).Hash
+                $installedHash = if (Test-Path -LiteralPath $script:scriptPath) { (Get-FileHash -Algorithm SHA256 -LiteralPath $script:scriptPath).Hash } else { "" }
+                $short = $newHash.Substring(0, 12)
+                if (($newHash -eq $installedHash) -and (Test-Path -LiteralPath $script:scriptPath)) {
+                    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                    Set-Content -LiteralPath $hashPath -Encoding ASCII -Value $newHash
+                    $reporterReady = $true
+                    Log "reporter unchanged (sha256 $short...); keeping installed copy"
+                } else {
+                    Move-Item -LiteralPath $tmp -Destination $script:scriptPath -Force
+                    Set-Content -LiteralPath $hashPath -Encoding ASCII -Value $newHash
+                    Set-Content -LiteralPath $versionPath -Encoding ASCII -Value ([string]$Version)
+                    $reporterReady = $true
+                    $changed = $true
+                    Log "reporter updated to sha256 $short... (content + syntax validated)"
+                }
             }
         } else {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -112,38 +139,40 @@ try {
         Log "download failed: $($_.Exception.Message)"
     }
 
-    if (-not (Test-Path -LiteralPath $scriptPath)) {
-        Log "no local reporter script to fall back on; abort"
-        exit 0
+    # 下载/校验未成功时,回退到本地已有 reporter,绝不破坏既有安装。
+    if (-not $reporterReady) {
+        if (Test-Path -LiteralPath $script:scriptPath) {
+            $reporterReady = $true
+            Log "download unavailable; falling back to existing local reporter"
+        } else {
+            Log "no local reporter script to fall back on; abort"
+            exit 0
+        }
     }
 
-    $actionArg = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -ConfigPath `"$configPath`" -Via mdm"
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $actionArg
-    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
-    $hourlyTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
-        -RepetitionInterval (New-TimeSpan -Hours 1) `
-        -RepetitionDuration (New-TimeSpan -Days 9999)
-    $principal = New-ScheduledTaskPrincipal -GroupId "S-1-5-32-545" -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
-        -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-
-    Register-ScheduledTask -TaskName $TaskName -Action $action `
-        -Trigger @($logonTrigger, $hourlyTrigger) `
-        -Principal $principal -Settings $settings -Force | Out-Null
-
+    $runNow = $changed
+    $taskRefreshed = $false
     try {
-        Start-ScheduledTask -TaskName $TaskName
+        Register-ReportTask
+        $taskRefreshed = $true
+        Log "Scheduled Task registered/refreshed"
     } catch {
-        Log "task registered; immediate start skipped: $($_.Exception.Message)"
+        Log "Register-ScheduledTask failed: $($_.Exception.Message)"
     }
-    Log-TaskInfo
 
-    if ($fresh) {
-        Set-Content -LiteralPath $versionPath -Encoding ASCII -Value ([string]$Version)
-        Log "installed v$Version; Scheduled Task active"
+    if ($runNow) {
+        try {
+            Start-ScheduledTask -TaskName $TaskName
+        } catch {
+            Log "immediate start skipped: $($_.Exception.Message)"
+        }
+        Log-TaskInfo
     } else {
-        Log "Scheduled Task active, but script not refreshed; version NOT bumped"
+        if ($taskRefreshed) {
+            Log "Scheduled Task refreshed; immediate collection skipped"
+        } else {
+            Log "Scheduled Task refresh failed; immediate collection skipped"
+        }
     }
 } catch {
     Log "bootstrap failed but exits cleanly: $($_.Exception.Message)"
