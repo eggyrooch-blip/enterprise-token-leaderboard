@@ -92,6 +92,8 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     assert "New-ScheduledTaskTrigger -AtLogOn" in script
     assert "New-ScheduledTaskTrigger -Once" in script
     assert "-RepetitionInterval" in script
+    assert "-RepetitionInterval (New-TimeSpan -Hours 4)" in script
+    assert "-RepetitionInterval (New-TimeSpan -Hours 1)" not in script
     assert "-RepetitionDuration" in script
     assert ".Repetition.Interval" not in script
     assert ".Repetition.Duration" not in script
