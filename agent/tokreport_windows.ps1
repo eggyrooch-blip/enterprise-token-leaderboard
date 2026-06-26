@@ -242,7 +242,7 @@ function Start-CapturedProcess {
         $cmdLine = '"' + (Quote-CmdArg $File) + " " + (($Arguments | ForEach-Object { Quote-CmdArg $_ }) -join " ") + '"'
         return Start-Process -FilePath $cmdExe -ArgumentList @("/d", "/c", $cmdLine) `
             -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath `
-            -NoNewWindow -PassThru
+            -WindowStyle Hidden -PassThru
     }
     if ($ext -eq ".ps1") {
         $psExe = "powershell.exe"
@@ -253,11 +253,11 @@ function Start-CapturedProcess {
         $psArgs = @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ('"' + $File + '"')) + $Arguments
         return Start-Process -FilePath $psExe -ArgumentList $psArgs `
             -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath `
-            -NoNewWindow -PassThru
+            -WindowStyle Hidden -PassThru
     }
     return Start-Process -FilePath $File -ArgumentList $Arguments `
         -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath `
-        -NoNewWindow -PassThru
+        -WindowStyle Hidden -PassThru
 }
 
 function Invoke-TokscaleJson {

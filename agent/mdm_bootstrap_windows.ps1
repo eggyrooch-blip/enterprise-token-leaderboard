@@ -39,9 +39,27 @@ function Get-ReportTaskActionArg {
     return "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script:scriptPath`" -ConfigPath `"$script:configPath`" -Via mdm"
 }
 
+function Get-ReportTaskCommand {
+    return "powershell.exe " + (Get-ReportTaskActionArg)
+}
+
+function ConvertTo-VbsLiteral {
+    param([string]$Value)
+    return '"' + ($Value -replace '"', '""') + '"'
+}
+
+function Write-HiddenLauncher {
+    $command = Get-ReportTaskCommand
+    $vbs = @"
+Set shell = CreateObject("WScript.Shell")
+shell.Run $(ConvertTo-VbsLiteral $command), 0, False
+"@
+    Set-Content -LiteralPath $script:launcherPath -Encoding ASCII -Value $vbs
+}
+
 function Register-ReportTask {
-    $actionArg = Get-ReportTaskActionArg
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $actionArg
+    Write-HiddenLauncher
+    $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$script:launcherPath`""
     $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
     $hourlyTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
         -RepetitionInterval (New-TimeSpan -Hours 4) `
@@ -90,6 +108,7 @@ try {
     $collectorBase = $Collector.TrimEnd("/")
     $script:scriptPath = Join-Path $InstallDir "tokreport.ps1"
     $script:configPath = Join-Path $InstallDir "tokreport.config.json"
+    $script:launcherPath = Join-Path $InstallDir "tokreport-run-hidden.vbs"
     $hashPath = Join-Path $InstallDir ".reporter.sha256"
     $versionPath = Join-Path $InstallDir ".version"
     $downloadUrl = "$collectorBase/tokreport.ps1"

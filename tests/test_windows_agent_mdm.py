@@ -108,6 +108,26 @@ def test_windows_bootstrap_is_standalone_logged_in_user_scheduled_task():
     assert "LaunchAgent" not in script
 
 
+def test_windows_bootstrap_scheduled_task_uses_no_console_launcher():
+    script = BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert "tokreport-run-hidden.vbs" in script
+    assert "WScript.Shell" in script
+    assert ".Run " in script
+    assert ", 0, False" in script
+    assert 'New-ScheduledTaskAction -Execute "wscript.exe"' in script
+    assert 'New-ScheduledTaskAction -Execute "powershell.exe"' not in script
+
+
+def test_windows_reporter_starts_tokscale_children_hidden():
+    script = REPORTER.read_text(encoding="utf-8")
+    start_captured_process = script[script.index("function Start-CapturedProcess") : script.index("function Invoke-TokscaleJson")]
+
+    assert "-WindowStyle Hidden" in start_captured_process
+    assert "-NoNewWindow" not in start_captured_process
+    assert "-RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath" in start_captured_process
+
+
 def test_windows_bootstrap_updates_reporter_by_sha_not_manual_version_gate():
     script = BOOTSTRAP.read_text(encoding="utf-8")
 
