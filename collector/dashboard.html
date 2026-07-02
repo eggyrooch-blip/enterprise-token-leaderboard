@@ -130,6 +130,12 @@
   .fill{height:8px;border-radius:999px;background:var(--green)}
   .fill.stacked{display:flex}
   .seg{height:8px;display:inline-block}
+  #tt{position:fixed;z-index:99;background:#fff;border-radius:12px;box-shadow:0 10px 32px rgba(0,0,0,.16),0 2px 8px rgba(0,0,0,.08);padding:10px 14px;font:12px/1 var(--font);color:#333;pointer-events:none;display:none;min-width:220px}
+  #tt .hd{background:none;padding:0 0 8px;margin:0 0 8px;font-weight:700;font-size:12px;color:#111;border-bottom:1px solid #f0f0f0;display:block;width:auto}
+  #tt .tr{display:flex;justify-content:space-between;align-items:center;gap:18px;line-height:22px}
+  #tt .tr .lb{display:flex;align-items:center;color:#555}
+  #tt .tr i{width:8px;height:8px;border-radius:2px;display:inline-block;margin-right:7px;flex:none}
+  #tt .tr .vl{color:#111;font-weight:600;font-variant-numeric:tabular-nums}
   .legend{display:flex;gap:16px;flex-wrap:wrap;margin:0 0 12px 4px}
   .lg{display:flex;align-items:center;gap:6px;font:500 12px var(--font);color:var(--t2)}
   .lg i{width:10px;height:10px;border-radius:2px;display:inline-block}
@@ -711,7 +717,18 @@ function renderMembersPanel(dept, depth){
   // 用户不希望看到匿名缺口状态(孙可 2026-06-24)。headcount/活跃率分母仍按真实 member_count。
   return out.join('');
 }
+var TTMAP={};
+var _ttEl=null;
+function _ttBox(){if(!_ttEl){_ttEl=document.createElement('div');_ttEl.id='tt';document.body.appendChild(_ttEl);}return _ttEl;}
+function _ttPos(e){var el=_ttBox(),w=el.offsetWidth,h=el.offsetHeight,x=e.clientX+14,y=e.clientY-h-12;
+  if(x+w>innerWidth-8)x=e.clientX-w-14;if(y<8)y=e.clientY+16;el.style.left=x+'px';el.style.top=y+'px';}
+document.addEventListener('mouseover',function(e){var t=e.target&&e.target.closest?e.target.closest('.track[data-tt]'):null;var el=_ttBox();
+  if(!t||TTMAP[t.getAttribute('data-tt')]==null){el.style.display='none';return;}
+  el.innerHTML=TTMAP[t.getAttribute('data-tt')];el.style.display='block';_ttPos(e);});
+document.addEventListener('mousemove',function(e){if(_ttEl&&_ttEl.style.display==='block')_ttPos(e);});
+document.addEventListener('scroll',function(){if(_ttEl)_ttEl.style.display='none';},true);
 function render(){
+  TTMAP={};
   syncSortCtl();
   if(CUR==='governance'){renderGovernance();return;}
   if(CUR==='feishu'){renderFeishu();return;}    // 飞书 AI 权益=额度盘+个人榜,单位「点」,独立渲染
@@ -763,7 +780,7 @@ function render(){
       var top=x.composition[0];
       if(isPersonCost){
         if(x.cost_composition && x.cost_composition.length){
-          var csegs=x.cost_composition.map(function(s){return '<span class="seg" style="width:'+s.pct+'%;background:'+toolColor(s.client)+'" title="'+esc(s.client)+' · '+compact(s.tokens||0)+' token · $'+grp(Math.round(s.cost||0))+'"></span>';}).join('');
+          var csegs=x.cost_composition.map(function(s){return '<span class="seg" style="width:'+s.pct+'%;background:'+toolColor(s.client)+'"></span>';}).join('');
           fillHTML='<div class="fill stacked" style="width:'+pct+'%">'+csegs+'</div>';
         } else {
           fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
@@ -772,9 +789,7 @@ function render(){
         small='总 '+compact(metricTok(x.tokens||0))+' · 主力 '+shortTool(top.client)+' '+top.pct+'% · '+share.toFixed(1)+'%';
       } else {
         // 分色堆叠条表达构成(颜色见顶部图例);右侧只留主力工具一行,不堆长文字
-        // tooltip 费用取当前时间范围的 cost_composition(后端按查询窗口动态算),免费工具无 $ 段
-        var _cc={};(x.cost_composition||[]).forEach(function(c){_cc[c.client]=c.cost;});
-        var segs=x.composition.map(function(s){var _t=esc(s.client)+' · '+compact(s.tokens||0)+' token · '+s.pct+'%';if(_cc[s.client]!=null)_t+=' · $'+grp(Math.round(_cc[s.client]));return '<span class="seg" style="width:'+s.pct+'%;background:'+toolColor(s.client)+'" title="'+_t+'"></span>';}).join('');
+        var segs=x.composition.map(function(s){return '<span class="seg" style="width:'+s.pct+'%;background:'+toolColor(s.client)+'"></span>';}).join('');
         fillHTML='<div class="fill stacked" style="width:'+pct+'%">'+segs+'</div>';
         big=compact(mv(x));                              // 日均模式自动除天数
         // 个人榜 $ = 估算(网关实销 + 订阅席位摊销), 比顶部「网关实付」大; 标清口径
@@ -802,9 +817,21 @@ function render(){
       var __cd=(CUR==='person'?'估算$ ':'$')+grp(Math.round(CUR==='person'?metricCost(x.cost||0):(x.cost||0)));
       big=compact(mv(x)); small=__cd+(x.messages?(' · '+grp(x.messages)+' 条'):'')+' · '+share.toFixed(1)+'%';
     }
+    var ttAttr='';
+    if(CUR==='person' && x.composition && x.composition.length){
+      // 悬浮卡: 悬停条上任意位置, 列出该人全部工具的 token+当期费用(费用随时间窗, 免费工具无 $)
+      var _tc={};(x.cost_composition||[]).forEach(function(c){_tc[c.client]=c.cost;});
+      var _ks=x.composition.map(function(s){return s.client;});
+      (x.cost_composition||[]).forEach(function(c){if(_ks.indexOf(c.client)<0)_ks.push(c.client);});
+      var _tk={};x.composition.forEach(function(s){_tk[s.client]=s.tokens||0;});
+      var _rows=_ks.map(function(c){var _v=(_tk[c]?compact(_tk[c]):'—')+(_tc[c]!=null?' · $'+grp(Math.round(_tc[c])):'');
+        return '<div class="tr"><span class="lb"><i style="background:'+toolColor(c)+'"></i>'+esc(c)+'</span><span class="vl">'+_v+'</span></div>';}).join('');
+      TTMAP[i]='<div class="hd">总 '+compact(x.tokens||0)+' token · 估算$ '+grp(Math.round(x.cost||0))+'</div>'+_rows;
+      ttAttr=' data-tt="'+i+'"';
+    }
     return '<div class="r"><span class="rk num '+(i===0?'first':'')+'">'+(i+1)+'</span>'+av+
       '<div class="nm">'+name+(sub?'<div class="sub">'+sub+'</div>':'')+'</div>'+
-      '<div class="track">'+fillHTML+'</div>'+
+      '<div class="track"'+ttAttr+'>'+fillHTML+'</div>'+
       '<div class="val"><div class="t num">'+big+'</div><div class="s num">'+small+'</div></div></div>';
   }).join('');
   var __lg='';
