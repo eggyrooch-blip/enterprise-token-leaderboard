@@ -146,6 +146,7 @@ def test_agent_owner_summary_keeps_agent_out_of_personal_tokens(monkeypatch, tmp
             "departed": False,
             "composition": [{"client": "Claude Code", "tokens": 100, "pct": 100.0}],
             "subs": [],
+            "cost_composition": [],
         }
     ]
     assert owner_agents == [

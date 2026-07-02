@@ -41,10 +41,19 @@ PAGE_SIZE = int(os.environ.get("CURSOR_PAGE_SIZE", "1000"))
 MAX_PAGES = int(os.environ.get("CURSOR_MAX_PAGES", "200"))
 _AUTH = "Basic " + base64.b64encode((KEY + ":").encode()).decode()
 
+
+def charged_cents(event):
+    """仅 kind=='Usage-based'(真企业账单) 的 chargedCents 计入 on-demand 实付;
+    'User API Key'/'Included in Business'/Free/Errored/Aborted 不是公司账单,返回 0。"""
+    if (event.get("kind") or "") != "Usage-based":
+        return 0.0
+    return float(event.get("chargedCents") or 0)
+
+
 _UPSERT = """INSERT OR REPLACE INTO usage
  (email,dept,period_type,period,source,client,provider,model,
-  input,output,cache_read,cache_write,reasoning,total,cost,messages)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+  input,output,cache_read,cache_write,reasoning,total,cost,charged,messages)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
 
 
 def api(path, method="GET", body=None):
@@ -61,7 +70,7 @@ def main():
     members = {m["email"]: m for m in api("/teams/members").get("teamMembers", []) if m.get("email")}
 
     # 分页拉事件,按 (email, day, model) 聚合
-    agg = {}   # key -> [input,output,cacheRead,cacheWrite,total,costCents,count]
+    agg = {}   # key -> [input,output,cacheRead,cacheWrite,total,costCents,count,chargedCents]
     page = 1
     total_events = 0
     while page <= MAX_PAGES:
@@ -80,12 +89,13 @@ def main():
             day = datetime.datetime.utcfromtimestamp(ts / 1000).strftime("%Y-%m-%d")
             model = e.get("model") or "unknown"
             k = (email, day, model)
-            a = agg.setdefault(k, [0, 0, 0, 0, 0, 0.0, 0])
+            a = agg.setdefault(k, [0, 0, 0, 0, 0, 0.0, 0, 0.0])
             a[0] += int(tu.get("inputTokens") or 0)
             a[1] += int(tu.get("outputTokens") or 0)
             a[2] += int(tu.get("cacheReadTokens") or 0)
             a[3] += int(tu.get("cacheWriteTokens") or 0)
-            a[5] += float(e.get("chargedCents") or tu.get("totalCents") or 0)
+            a[5] += float(tu.get("totalCents") or 0)
+            a[7] += charged_cents(e)
             a[6] += 1
         total_events += len(evs)
         if not resp.get("pagination", {}).get("hasNextPage"):
@@ -137,30 +147,35 @@ def main():
 
     c = sqlite3.connect(DB)
     c.execute("CREATE TABLE IF NOT EXISTS people(email TEXT PRIMARY KEY, name TEXT, avatar TEXT, dept TEXT)")
+    try:
+        c.execute("ALTER TABLE usage ADD COLUMN charged REAL NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # 列已存在或表未建(dev_collector 建表已含 charged)
     # 先清掉本源旧数据(窗口外的日桶 + 旧 lifetime),避免陈旧
     c.execute("DELETE FROM usage WHERE source='cursor'")
 
     # 日桶
-    life = {}  # (email, model) -> [in,out,cr,cw,total,cost,msgs]
+    life = {}  # (email, model) -> [in,out,cr,cw,total,cost,msgs,charged]
     people_seen = {}
     for (email, day, model), a in agg.items():
         ident = resolve(email)
         people_seen[email] = ident
         total = a[0] + a[1] + a[2] + a[3]
         cost = a[5] / 100.0
+        charged = a[7] / 100.0
         c.execute(_UPSERT, (email, ident["dept"], "day", day, "cursor", "Cursor", "", model,
-                            a[0], a[1], a[2], a[3], 0, total, round(cost, 4), a[6]))
+                            a[0], a[1], a[2], a[3], 0, total, round(cost, 4), round(charged, 4), a[6]))
         lk = (email, model)
-        L = life.setdefault(lk, [0, 0, 0, 0, 0, 0.0, 0])
+        L = life.setdefault(lk, [0, 0, 0, 0, 0, 0.0, 0, 0.0])
         L[0] += a[0]; L[1] += a[1]; L[2] += a[2]; L[3] += a[3]
-        L[5] += cost; L[6] += a[6]
+        L[5] += cost; L[6] += a[6]; L[7] += charged
 
     # lifetime(窗口累计)
     for (email, model), L in life.items():
         ident = people_seen.get(email) or resolve(email)
         total = L[0] + L[1] + L[2] + L[3]
         c.execute(_UPSERT, (email, ident["dept"], "lifetime", "all", "cursor", "Cursor", "", model,
-                            L[0], L[1], L[2], L[3], 0, total, round(L[5], 4), L[6]))
+                            L[0], L[1], L[2], L[3], 0, total, round(L[5], 4), round(L[7], 4), L[6]))
 
     # people
     for email, ident in people_seen.items():

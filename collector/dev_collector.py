@@ -255,6 +255,7 @@ CREATE TABLE IF NOT EXISTS usage(
     reasoning    INTEGER NOT NULL DEFAULT 0,
     total        INTEGER NOT NULL DEFAULT 0,
     cost         REAL    NOT NULL DEFAULT 0,
+    charged      REAL    NOT NULL DEFAULT 0,
     messages     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (email, period_type, period, source, client, provider, model)
 )
@@ -277,6 +278,10 @@ def db():
         os.makedirs(parent, exist_ok=True)
     c = sqlite3.connect(DB)
     c.execute(_CREATE_TABLE)
+    try:
+        c.execute("ALTER TABLE usage ADD COLUMN charged REAL NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # 已有 charged 列
     c.execute(_CREATE_LEGACY)
     # 人员档案:email → 中文姓名 + 飞连头像 + 部门(身份反解时落库,看板 join 用)
     c.execute("""CREATE TABLE IF NOT EXISTS people(
@@ -2511,11 +2516,13 @@ def _personal_board_rows(conn, qs, auth_user=None):
     departed = _departed_set(conn)
     cost_start, cost_end = _cost_window(qs)
     today = datetime.date.today()
+    usage_cols = _table_columns(conn, "usage")
+    charged_expr = "SUM(COALESCE(u.charged,0))" if "charged" in usage_cols else "0"
     rows = conn.execute("""
         SELECT u.email, MAX(u.dept),
                SUM(u.input), SUM(u.output), SUM(u.cache_read), SUM(u.cache_write),
                SUM(u.reasoning), SUM(u.total),
-               SUM(CASE WHEN u.source IN ('litellm','api') THEN u.cost ELSE 0 END),
+               SUM(CASE WHEN u.source IN ('litellm','api') THEN u.cost ELSE 0 END) + %s,
                SUM(u.messages),
                MAX(p.name), MAX(p.avatar),
                (SELECT rl.via FROM report_log rl WHERE rl.email = u.email
@@ -2527,7 +2534,7 @@ def _personal_board_rows(conn, qs, auth_user=None):
         GROUP BY u.email
         HAVING SUM(u.total) > 0
         ORDER BY SUM(u.total) DESC
-    """ % (where, dep_clause, ex_clause), params + ex_params).fetchall()
+    """ % (charged_expr, where, dep_clause, ex_clause), params + ex_params).fetchall()
     comp = {}
     for cr in conn.execute("""
         SELECT u.email, u.client, SUM(u.total)
@@ -2537,7 +2544,28 @@ def _personal_board_rows(conn, qs, auth_user=None):
         GROUP BY u.email, u.client
     """ % (where, dep_clause, ex_clause), params + ex_params).fetchall():
         comp.setdefault(cr[0], []).append({"client": cr[1], "tokens": cr[2] or 0})
-    usage_cols = _table_columns(conn, "usage")
+    litellm_cost = {}
+    for e_, cl_, cst_ in conn.execute("""
+        SELECT u.email, u.client, SUM(u.cost)
+        FROM usage u
+        WHERE %s AND u.source IN ('litellm','api')
+          AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s
+        GROUP BY u.email, u.client
+    """ % (where, dep_clause, ex_clause), params + ex_params).fetchall():
+        d = litellm_cost.setdefault((e_ or "").lower(), {})
+        cl = cl_ or "unknown"
+        d[cl] = d.get(cl, 0.0) + float(cst_ or 0)
+    cursor_charged = {}
+    if "charged" in usage_cols:
+        for e_, ch_ in conn.execute("""
+            SELECT u.email, SUM(COALESCE(u.charged,0))
+            FROM usage u
+            WHERE %s AND u.source='cursor'
+              AND u.email NOT LIKE 'litellm-key:%%' AND u.email NOT LIKE 'litellm-user:%%'%s%s
+            GROUP BY u.email
+        """ % (where, dep_clause, ex_clause), params + ex_params).fetchall():
+            lk = (e_ or "").lower()
+            cursor_charged[lk] = cursor_charged.get(lk, 0.0) + float(ch_ or 0)
     people_cols = _table_columns(conn, "people")
     u_raw_expr = "COALESCE(NULLIF(u.raw_dept,''), u.dept)" if "raw_dept" in usage_cols else "u.dept"
     u_eff_expr = "COALESCE(NULLIF(u.effective_dept,''), u.dept)" if "effective_dept" in usage_cols else "u.dept"
@@ -2630,10 +2658,12 @@ def _personal_board_rows(conn, qs, auth_user=None):
             return cost_start, cost_end
         return usage_window_start.get(email) or today, today
 
+    fee_by_tool_by_email = {}
     for row in result:
         win_s, win_e = _fee_window(row["email"])
         kept = []
         fee_total = 0.0
+        tool_fees = {}
         for sub in subs_by_email.get(row["email"], []):
             if cost_start is None and usage_window_start.get(row["email"]) is None and \
                     not sub.get("start") and not sub.get("end"):
@@ -2643,10 +2673,17 @@ def _personal_board_rows(conn, qs, auth_user=None):
             if frac <= 0:
                 continue
             kept.append(sub)
-            fee_total += float(sub.get("fee") or 0) * frac
+            amt = float(sub.get("fee") or 0) * frac
+            fee_total += amt
+            tool = (sub.get("tool") or "").lower()
+            tool_fees[tool] = tool_fees.get(tool, 0.0) + amt
         row["subs"] = _group_subs(kept)
         if not kept:
             continue
+        lk = (row["email"] or "").lower()
+        prev = fee_by_tool_by_email.setdefault(lk, {})
+        for t_, v_ in tool_fees.items():
+            prev[t_] = prev.get(t_, 0.0) + v_
         row["cost"] = round(float(row["cost"] or 0) + fee_total, 4)
 
     # email 本应大小写不敏感: 把同一人(lower(email) 相同)的大小写变体行合并成一行,
@@ -2675,6 +2712,31 @@ def _personal_board_rows(conn, qs, auth_user=None):
         for x in row["composition"]:
             x["pct"] = round(x["tokens"] / tot * 100, 1) if tot else 0
         row["composition"].sort(key=lambda x: x["tokens"], reverse=True)
+        lk = (row["email"] or "").lower()
+        tok_by_client = {}
+        for x in row["composition"]:
+            tok_by_client[x["client"]] = tok_by_client.get(x["client"], 0) + (x.get("tokens") or 0)
+        cost_by_client = {}
+        for cl_, cst_ in (litellm_cost.get(lk) or {}).items():
+            cost_by_client[cl_] = cost_by_client.get(cl_, 0.0) + cst_
+        for t_, v_ in (fee_by_tool_by_email.get(lk) or {}).items():
+            client = _CLIENT_LABELS.get(t_) or (t_.title() if t_ else "Unknown")
+            cost_by_client[client] = cost_by_client.get(client, 0.0) + v_
+        ch = cursor_charged.get(lk, 0.0)
+        if ch:
+            cost_by_client["Cursor"] = cost_by_client.get("Cursor", 0.0) + ch
+        segs = [{"client": cl_, "tokens": tok_by_client.get(cl_, 0), "cost": round(v_, 4)}
+                for cl_, v_ in cost_by_client.items() if v_]
+        row_cost = round(float(row["cost"] or 0), 4)
+        if segs:
+            diff = round(row_cost - round(sum(s["cost"] for s in segs), 4), 4)
+            if abs(diff) >= 0.0001:
+                segs.sort(key=lambda s: s["cost"], reverse=True)
+                segs[0]["cost"] = round(segs[0]["cost"] + diff, 4)
+            for s in segs:
+                s["pct"] = round(s["cost"] / row_cost * 100, 1) if row_cost else 0.0
+            segs.sort(key=lambda s: s["cost"], reverse=True)
+        row["cost_composition"] = segs
         row.pop("visible_dept_paths", None)
     result.sort(key=lambda x: x["tokens"] or 0, reverse=True)
     return result

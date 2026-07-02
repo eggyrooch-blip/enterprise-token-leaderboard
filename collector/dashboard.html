@@ -762,7 +762,12 @@ function render(){
     if(CUR==='person' && x.composition && x.composition.length){
       var top=x.composition[0];
       if(isPersonCost){
-        fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
+        if(x.cost_composition && x.cost_composition.length){
+          var csegs=x.cost_composition.map(function(s){return '<span class="seg" style="width:'+s.pct+'%;background:'+toolColor(s.client)+'" title="'+esc(s.client)+' · '+compact(s.tokens||0)+' token · $'+grp(Math.round(s.cost||0))+'"></span>';}).join('');
+          fillHTML='<div class="fill stacked" style="width:'+pct+'%">'+csegs+'</div>';
+        } else {
+          fillHTML='<div class="fill" style="width:'+pct+'%"></div>';
+        }
         big='$'+grp(Math.round(mv(x)));
         small='总 '+compact(metricTok(x.tokens||0))+' · 主力 '+shortTool(top.client)+' '+top.pct+'% · '+share.toFixed(1)+'%';
       } else {
@@ -802,7 +807,7 @@ function render(){
   }).join('');
   var __lg='';
   if(CUR==='person'){
-    var present={}; rows.forEach(function(r){(r.composition||[]).forEach(function(s){present[s.client]=1;});});
+    var present={}; rows.forEach(function(r){(r.composition||[]).forEach(function(s){present[s.client]=1;});(r.cost_composition||[]).forEach(function(s){present[s.client]=1;});});
     var order=['Claude Code','Codex CLI','Cursor','Gemini CLI','Kimi CLI','OpenCode','LiteLLM','Hermes','hermes'];
     var keys=order.filter(function(c){return present[c];});
     Object.keys(present).forEach(function(c){if(order.indexOf(c)<0)keys.push(c);});
