@@ -1,3 +1,4 @@
+import datetime
 import importlib
 import pathlib
 import sys
@@ -510,9 +511,10 @@ def test_owner_ai_usage_allows_supplier_identity_without_keep_email(monkeypatch,
             effective_dept=target,
             spend_bucket="business_outsourcing",
         )
+        recent = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()  # 钉死日期会滚出30天窗(2026-07-02 腐烂过一次)
         conn.execute(
-            "UPDATE usage SET period_type='day', period='2026-06-01'"
-            " WHERE email='wb-chenliling'"
+            "UPDATE usage SET period_type='day', period=?"
+            " WHERE email='wb-chenliling'", (recent,)
         )
         conn.commit()
         h = _Handler()
@@ -529,7 +531,7 @@ def test_owner_ai_usage_allows_supplier_identity_without_keep_email(monkeypatch,
     assert h.code == 200
     assert h.payload["user"] == "wb-chenliling"
     assert h.payload["total_tokens"] == 100
-    assert h.payload["daily"] == [{"date": "2026-06-01", "total_tokens": 100}]
+    assert h.payload["daily"] == [{"date": recent, "total_tokens": 100}]
 
 
 def test_member_ai_usage_board_is_filtered_to_self(monkeypatch, tmp_path):
