@@ -772,7 +772,9 @@ function render(){
         small='总 '+compact(metricTok(x.tokens||0))+' · 主力 '+shortTool(top.client)+' '+top.pct+'% · '+share.toFixed(1)+'%';
       } else {
         // 分色堆叠条表达构成(颜色见顶部图例);右侧只留主力工具一行,不堆长文字
-        var segs=x.composition.map(function(s){return '<span class="seg" style="width:'+s.pct+'%;background:'+toolColor(s.client)+'" title="'+s.client+' '+s.pct+'%"></span>';}).join('');
+        // tooltip 费用取当前时间范围的 cost_composition(后端按查询窗口动态算),免费工具无 $ 段
+        var _cc={};(x.cost_composition||[]).forEach(function(c){_cc[c.client]=c.cost;});
+        var segs=x.composition.map(function(s){var _t=esc(s.client)+' · '+compact(s.tokens||0)+' token · '+s.pct+'%';if(_cc[s.client]!=null)_t+=' · $'+grp(Math.round(_cc[s.client]));return '<span class="seg" style="width:'+s.pct+'%;background:'+toolColor(s.client)+'" title="'+_t+'"></span>';}).join('');
         fillHTML='<div class="fill stacked" style="width:'+pct+'%">'+segs+'</div>';
         big=compact(mv(x));                              // 日均模式自动除天数
         // 个人榜 $ = 估算(网关实销 + 订阅席位摊销), 比顶部「网关实付」大; 标清口径
